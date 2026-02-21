@@ -76,6 +76,7 @@ env/
 
 # Ignore data
 *.data
+docs/plans/
 *.txt
 *.csv
 *.json
