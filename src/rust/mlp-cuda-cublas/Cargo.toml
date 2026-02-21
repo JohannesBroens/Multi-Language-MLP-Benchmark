@@ -9,3 +9,6 @@ path = "src/main.rs"
 
 [dependencies]
 mlp-common = { path = "../mlp-common" }
+
+[build-dependencies]
+cc = { version = "1.0", features = ["parallel"] }
