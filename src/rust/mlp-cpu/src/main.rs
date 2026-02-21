@@ -24,6 +24,8 @@ const LEARNING_RATE: f32 = 0.01;
 /// C[M,N] = A[M,K] @ B[K,N]  -- cache-friendly i-k-j with optional tiling.
 fn sgemm_nn(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
     let flops = m as i64 * n as i64 * k as i64;
+    // Slice c to exactly m*n to avoid processing extra rows from oversized buffers
+    let c = &mut c[..m * n];
 
     if k <= TILE && n <= TILE {
         // Small matrices: simple loop, compiler auto-vectorizes j-loop.
@@ -116,6 +118,7 @@ fn sgemm_nn(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
 /// C[M,N] = A^T[M,K] @ B[K,N],  A stored as [K,M].
 fn sgemm_tn(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
     let flops = m as i64 * n as i64 * k as i64;
+    let c = &mut c[..m * n];
 
     if flops > OMP_FLOP_THRESHOLD {
         c.par_chunks_mut(n).enumerate().for_each(|(i, ci)| {
@@ -150,6 +153,7 @@ fn sgemm_tn(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
 /// C[M,N] = A[M,K] @ B^T[K,N],  B stored as [N,K].
 fn sgemm_nt(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
     let flops = m as i64 * n as i64 * k as i64;
+    let c = &mut c[..m * n];
 
     if flops > OMP_FLOP_THRESHOLD {
         c.par_chunks_mut(n).enumerate().for_each(|(i, ci)| {
@@ -235,6 +239,10 @@ impl Mlp {
         let inp = self.input_size;
         let hid = self.hidden_size;
         let out = self.output_size;
+
+        // Slice buffers to actual batch size to avoid processing extra rows
+        let hidden = &mut hidden[..bs * hid];
+        let output = &mut output[..bs * out];
 
         // hidden[bs, hid] = X[bs, inp] @ W1[inp, hid]
         sgemm_nn(bs, hid, inp, x, &self.input_weights, hidden);
