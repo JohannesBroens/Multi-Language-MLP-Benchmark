@@ -1,5 +1,3 @@
-// data_loader.c
-
 #include "data_loader.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,11 +7,14 @@
 
 #define MAX_LINE_LENGTH 1024
 
-// Function to load generated data
-int load_generated_data(float **inputs, int **labels, int *num_samples, int *input_size, int *output_size) {
-    *input_size = 2;    // For generated data with x and y
-    *output_size = 2;   // Assuming binary classification
-    *num_samples = 1000;  // Set the number of samples
+/*
+ * Generate synthetic 2D circle classification data.
+ * Points in [-1, 1]^2; label 1 if inside circle of radius 0.5, else 0.
+ */
+int load_generated_data(float **inputs, int **labels, int *num_samples, int *input_size, int *output_size, int num_samples_requested) {
+    *input_size = 2;
+    *output_size = 2;   /* binary classification */
+    *num_samples = (num_samples_requested > 0) ? num_samples_requested : 1000;
 
     *inputs = (float *)malloc((*num_samples) * (*input_size) * sizeof(float));
     *labels = (int *)malloc((*num_samples) * sizeof(int));
@@ -23,7 +24,6 @@ int load_generated_data(float **inputs, int **labels, int *num_samples, int *inp
         return -1;
     }
 
-    // Generate data
     srand((unsigned int)time(NULL));
     for (int i = 0; i < *num_samples; ++i) {
         float x = ((float)rand() / RAND_MAX) * 2 - 1;
@@ -36,7 +36,11 @@ int load_generated_data(float **inputs, int **labels, int *num_samples, int *inp
     return 0;
 }
 
-// Function to load the Iris dataset
+/*
+ * Load Iris dataset from preprocessed file.
+ * Format: comma-separated, 4 float features then float label per line.
+ * File: data/iris_processed.txt (150 samples, 3 classes)
+ */
 int load_iris_data(float **inputs, int **labels, int *num_samples, int *input_size, int *output_size) {
     const char *filename = "data/iris_processed.txt";
     FILE *file = fopen(filename, "r");
@@ -46,9 +50,9 @@ int load_iris_data(float **inputs, int **labels, int *num_samples, int *input_si
     }
 
     *input_size = 4;
-    *output_size = 3; // Iris dataset has 3 classes
+    *output_size = 3;
 
-    // Count the number of samples
+    /* Count lines to determine sample count */
     *num_samples = 0;
     char line[MAX_LINE_LENGTH];
     while (fgets(line, sizeof(line), file)) {
@@ -65,10 +69,59 @@ int load_iris_data(float **inputs, int **labels, int *num_samples, int *input_si
         return -1;
     }
 
-    // Read the data
+    /* Labels are stored as floats in the preprocessed file; round to int */
     for (int i = 0; i < *num_samples; ++i) {
         for (int j = 0; j < *input_size; ++j) {
             fscanf(file, "%f,", &(*inputs)[i * (*input_size) + j]);
+        }
+        float label_f;
+        fscanf(file, "%f", &label_f);
+        (*labels)[i] = (int)(label_f + 0.5f);
+    }
+
+    fclose(file);
+    return 0;
+}
+
+/*
+ * Load UCI Wine Quality dataset.
+ * Format: semicolon-delimited CSV with header row.
+ * 11 float features; last column is quality score (0-10) used as label.
+ * File: data/winequality-red.csv or data/winequality-white.csv
+ */
+int load_wine_quality_data(float **inputs, int **labels, int *num_samples, int *input_size, int *output_size, const char *filename) {
+    FILE *file = fopen(filename, "r");
+    if (!file) {
+        perror("Failed to open Wine Quality dataset file");
+        return -1;
+    }
+
+    *input_size = 11;
+    *output_size = 11;  /* quality scores 0-10 */
+
+    /* Skip header line */
+    char line[MAX_LINE_LENGTH];
+    fgets(line, sizeof(line), file);
+
+    *num_samples = 0;
+    while (fgets(line, sizeof(line), file)) {
+        (*num_samples)++;
+    }
+    rewind(file);
+    fgets(line, sizeof(line), file);  /* skip header again after rewind */
+
+    *inputs = (float *)malloc((*num_samples) * (*input_size) * sizeof(float));
+    *labels = (int *)malloc((*num_samples) * sizeof(int));
+
+    if (!(*inputs) || !(*labels)) {
+        fprintf(stderr, "Memory allocation failed for inputs or labels.\n");
+        fclose(file);
+        return -1;
+    }
+
+    for (int i = 0; i < *num_samples; ++i) {
+        for (int j = 0; j < *input_size; ++j) {
+            fscanf(file, "%f;", &(*inputs)[i * (*input_size) + j]);
         }
         fscanf(file, "%d", &(*labels)[i]);
     }
@@ -77,51 +130,12 @@ int load_iris_data(float **inputs, int **labels, int *num_samples, int *input_si
     return 0;
 }
 
-// Function to load the Wine Quality dataset
-int load_wine_quality_data(float **inputs, int **labels, int *num_samples, int *input_size, int *output_size, const char *filename) {
-    FILE *file = fopen(filename, "r");
-    if (!file) {
-        perror("Failed to open Wine Quality dataset file");
-        return -1;
-    }
-
-    *input_size = 11; // Number of features in Wine Quality dataset
-    *output_size = 11; // Quality scores range from 0 to 10
-
-    // Skip header line
-    char line[MAX_LINE_LENGTH];
-    fgets(line, sizeof(line), file);
-
-    // Count the number of samples
-    *num_samples = 0;
-    while (fgets(line, sizeof(line), file)) {
-        (*num_samples)++;
-    }
-    rewind(file);
-    fgets(line, sizeof(line), file); // Skip header again
-
-    *inputs = (float *)malloc((*num_samples) * (*input_size) * sizeof(float));
-    *labels = (int *)malloc((*num_samples) * sizeof(int));
-
-    if (!(*inputs) || !(*labels)) {
-        fprintf(stderr, "Memory allocation failed for inputs or labels.\n");
-        fclose(file);
-        return -1;
-    }
-
-    // Read the data
-    for (int i = 0; i < *num_samples; ++i) {
-        for (int j = 0; j < *input_size; ++j) {
-            fscanf(file, "%f;", &(*inputs)[i * (*input_size) + j]);
-        }
-        fscanf(file, "%d", &(*labels)[i]); // Quality score as label
-    }
-
-    fclose(file);
-    return 0;
-}
-
-// Function to load the Breast Cancer Wisconsin dataset
+/*
+ * Load Wisconsin Breast Cancer Diagnostic dataset.
+ * Format: id,diagnosis(M/B),30 float features — comma-separated, no header.
+ * M (malignant) = 1, B (benign) = 0.
+ * File: data/wdbc.data (569 samples, 2 classes)
+ */
 int load_breast_cancer_data(float **inputs, int **labels, int *num_samples, int *input_size, int *output_size) {
     const char *filename = "data/wdbc.data";
     FILE *file = fopen(filename, "r");
@@ -130,10 +144,9 @@ int load_breast_cancer_data(float **inputs, int **labels, int *num_samples, int 
         return -1;
     }
 
-    *input_size = 30; // Number of features in the dataset
-    *output_size = 2; // Malignant or Benign
+    *input_size = 30;
+    *output_size = 2;   /* malignant vs benign */
 
-    // Count the number of samples
     *num_samples = 0;
     char line[MAX_LINE_LENGTH];
     while (fgets(line, sizeof(line), file)) {
@@ -150,12 +163,12 @@ int load_breast_cancer_data(float **inputs, int **labels, int *num_samples, int 
         return -1;
     }
 
-    // Read the data
+    /* Parse: id (discarded), diagnosis char, then 30 features */
     for (int i = 0; i < *num_samples; ++i) {
         int id;
         char diagnosis;
         fscanf(file, "%d,%c,", &id, &diagnosis);
-        (*labels)[i] = (diagnosis == 'M') ? 1 : 0; // Malignant:1, Benign:0
+        (*labels)[i] = (diagnosis == 'M') ? 1 : 0;
 
         for (int j = 0; j < *input_size; ++j) {
             fscanf(file, "%f,", &(*inputs)[i * (*input_size) + j]);

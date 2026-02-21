@@ -16,14 +16,26 @@ chmod +x "$SCRIPT_DIR/download_datasets.sh"
 echo "Checking for preprocessed data..."
 python3 "$SCRIPT_DIR/preprocess_iris.py"
 
-# Step 3: Build the project
+# Step 3: Build the project (CPU by default, CUDA if available)
 echo "Building the project..."
-mkdir -p "$PROJECT_ROOT/src/c/build"
-cd "$PROJECT_ROOT/src/c/build"
-cmake .. -DUSE_CUDA=ON
+
+# CPU build
+mkdir -p "$PROJECT_ROOT/src/c/build_cpu"
+cd "$PROJECT_ROOT/src/c/build_cpu"
+cmake .. -DUSE_CUDA=OFF
 make
 
-# Step 4: Run the program
+# CUDA build (attempt, skip if no CUDA)
+if command -v nvcc &> /dev/null; then
+    echo "CUDA detected, building CUDA version..."
+    mkdir -p "$PROJECT_ROOT/src/c/build_cuda"
+    cd "$PROJECT_ROOT/src/c/build_cuda"
+    cmake .. -DUSE_CUDA=ON
+    make
+else
+    echo "CUDA not found, skipping CUDA build."
+fi
+
 # Step 4: Run the program
 echo "Running the program..."
 
@@ -32,13 +44,13 @@ cd "$PROJECT_ROOT"
 if [ $# -eq 1 ]; then
     DATASET=$1
     echo "Running on dataset: $DATASET"
-    ./src/c/build/main --dataset "$DATASET"
+    ./src/c/build_cpu/main --dataset "$DATASET"
 else
     DATASETS=("generated" "iris" "wine-red" "wine-white" "breast-cancer")
     for DATASET in "${DATASETS[@]}"; do
         echo "--------------------------------------------"
         echo "Running on dataset: $DATASET"
-        ./src/c/build/main --dataset "$DATASET"
+        ./src/c/build_cpu/main --dataset "$DATASET"
     done
 fi
 

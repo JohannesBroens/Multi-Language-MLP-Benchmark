@@ -2,16 +2,13 @@ from setuptools import setup, find_packages
 
 setup(
     name='ML-in-C',
-    version='0.1',
+    version='0.2',
     packages=find_packages(),
     install_requires=[
         'numpy',
-        'torch',  # or 'tensorflow' if you prefer
-        # Add other dependencies
+        'matplotlib',
     ],
-    entry_points={
-        'console_scripts': [
-            # Define command-line scripts if needed
-        ],
+    extras_require={
+        'torch': ['torch'],
     },
 )

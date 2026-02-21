@@ -1,296 +1,176 @@
-# ML-in-C
-ML-in-C is a project aimed at enhancing machine learning capabilities using the C programming language. This repository contains implementations of machine learning models, such as Multi-Layer Perceptrons (MLPs) and Convolutional Neural Networks (CNNs), both in C and Python. The project focuses on performance optimization, leveraging CPU and GPU computations using OpenMP, CUDA, and providing benchmarking scripts for performance comparison.
+# ML Benchmark: C vs Python MLP Implementations
 
-## Table of Contents
-- [ML-in-C](#ml-in-c)
-  - [Table of Contents](#table-of-contents)
-  - [Features](#features)
-  - [Folder Structure](#folder-structure)
-  - [Getting Started](#getting-started)
-    - [Prerequisites](#prerequisites)
-    - [Building the Project](#building-the-project)
-    - [Running the Pipeline](#running-the-pipeline)
-  - [Usage](#usage)
-    - [Running on Specific Datasets](#running-on-specific-datasets)
-  - [Benchmarking](#benchmarking)
-  - [Testing](#testing)
-  - [Documentation](#documentation)
-  - [Contributing](#contributing)
-  - [License](#license)
+A multi-language machine learning benchmark comparing MLP (Multi-Layer Perceptron) implementations in C, NumPy, and PyTorch. The same algorithm is implemented identically across languages to enable fair performance comparisons across CPU and GPU backends.
 
-## Features
-- **Machine Learning Models in C**: Implementations of MLP and CNN models optimized for performance.
-- **CUDA Support**: GPU acceleration using CUDA for intensive computations.
-- **Python Implementations**: Equivalent models in Python for ease of use and comparison.
-- **Data Loading and Preprocessing**: Scripts to download and preprocess popular datasets.
-- **Benchmarking Scripts**: Tools to compare performance between CPU and GPU implementations.
-- **Unit Testing**: Testing framework for ensuring code correctness and reliability.
+## MLP Architecture
 
-## Folder Structure
-```scss
-├── data
-│   ├── iris.data
-│   ├── iris_processed.txt
-│   ├── wdbc.data
-│   ├── winequality-red.csv
-│   └── winequality-white.csv
-├── docs
-├── examples
-│   ├── c
-│   └── python
-├── figs
-├── LICENSE
-├── README.md
-└── src
-    ├── c
-    │   ├── CMakeLists.txt
-    │   ├── data_loader.c
-    │   ├── data_loader.h
-    │   ├── main.c
-    │   └── models
-    │       ├── cnn
-    │       └── mlp
-    │           ├── CMakeLists.txt
-    │           ├── mlp_cpu.c
-    │           ├── mlp.cu
-    │           └── mlp.h
-    ├── python
-    │   ├── models
-    │   │   ├── cnn
-    │   │   └── mlp
-    │   │       └── mlp.py
-    │   ├── setup.py
-    │   └── utils
-    ├── scripts
-    │   ├── build_run_c_CPU.sh
-    │   ├── download_datasets.sh
-    │   ├── preprocess_iris.py
-    │   └── run_pipeline.sh
-    └── tests
-        ├── c
-        └── python
-```
-- **data/**: Contains datasets and preprocessed data files.
-- **docs/**: Documentation files.
-- **examples/**: Example programs in C and Python.
-- **figs/**: Figures and images for documentation or results.
-- **src/**: Source code for the project.
-  - **c/**: C implementations.
-    - **models/**: Machine learning models in C.
-      - **mlp/**: Multi-Layer Perceptron implementations.
-      - **cnn/**: Convolutional Neural Network implementations.
-  - **python/**: Python implementations.
-    - **models/**: Machine learning models in Python.
-  - **scripts/**: Helper scripts for building, running, and benchmarking.
-  - **tests/**: Unit tests for C and Python code.
+| Component | Choice | Rationale |
+|-----------|--------|-----------|
+| Hidden layers | 1 (64 neurons) | Simple enough to implement from scratch, sufficient for tabular data |
+| Hidden activation | ReLU | Fast, avoids vanishing gradients |
+| Output activation | Softmax | Produces class probabilities for multi-class classification |
+| Loss | Cross-entropy | Standard for classification; clean gradient with softmax |
+| Initialization | Xavier uniform (sqrt(2/fan_in)) | Keeps activation variance stable across layers |
+| Optimizer | Mini-batch SGD (lr=0.01, batch=32) | Simple, no dependencies, easy to implement identically across languages |
+| Epochs | 1000 | Sufficient convergence for all datasets |
 
+## Implementations
 
-## Getting Started
+| Implementation | File | Description |
+|---------------|------|-------------|
+| C (CPU) | `src/c/models/mlp/mlp_cpu.c` | Manual backprop in C99, compiled with OpenMP parallelization |
+| C (CUDA) | `src/c/models/mlp/mlp.cu` | Same algorithm on GPU, one CUDA thread per sample, atomicAdd for gradients |
+| NumPy (CPU) | `src/python/models/mlp/mlp_numpy.py` | Vectorized NumPy, exact replica of C algorithm |
+| PyTorch (CPU) | `src/python/models/mlp/mlp_pytorch.py` | nn.Module with manual Xavier init to match C, CPU backend |
+| PyTorch (CUDA) | `src/python/models/mlp/mlp_pytorch.py` | Same PyTorch model on GPU via `--device cuda` |
+
+All 5 implementations produce identical standardized output for benchmark parsing.
+
+## Datasets
+
+| Name | Samples | Features | Classes | Source |
+|------|---------|----------|---------|--------|
+| `generated` | 1000 | 2 | 2 | Synthetic 2D circle classification |
+| `iris` | 150 | 4 | 3 | UCI Iris |
+| `wine-red` | 1599 | 11 | 11 | UCI Wine Quality (red) |
+| `wine-white` | 4898 | 11 | 11 | UCI Wine Quality (white) |
+| `breast-cancer` | 569 | 30 | 2 | Wisconsin Diagnostic Breast Cancer |
+
+## Quick Start
+
 ### Prerequisites
-- **C Compiler**: GCC or any C99-compatible compiler.
-- **CUDA Toolkit**: Required for GPU acceleration (if building with CUDA support).
-- **CMake**: Version 3.10 or higher.
-- **Python 3**: For running preprocessing scripts and Python implementations.
-- **Python Packages**: e.g. pytorch etc. (can be installed via requirements.txt). However, I have not made Python versions yet.
 
-### Building the Project
-1. **Clone the Repositiory**: 
+- **C**: GCC (C99), CMake 3.10+, optionally CUDA Toolkit and OpenMP
+- **Python**: Python 3.8+, NumPy, matplotlib
+- **Optional**: PyTorch (for `mlp_pytorch.py`)
+
+### Install Python Dependencies
+
 ```bash
-git clone https://github.com/JohannesBroens/ML-in-C.git
-cd ML-in-C
+pip install -r requirements.txt
 ```
-2. **Install Dependencies**: 
-    - **For C code**:
-      - Ensure that you have a C compiler and CUDA Toolkit installed. 
-    - **For Python code**:
-      - Install required Python packages: 
-        ```bash
-        pip install -r requirements.txt
-        ```
-3. **Build the C Project**:
+
+### Download and Preprocess Datasets
+
 ```bash
-cd src/c
-mkdir build
-cd build
+bash src/scripts/download_datasets.sh
+python3 src/scripts/preprocess_iris.py
+```
+
+### Build C (CPU with OpenMP)
+
+```bash
+cd src/c && mkdir -p build_cpu && cd build_cpu
+cmake .. -DUSE_CUDA=OFF
+make
+```
+
+### Build C (with CUDA)
+
+```bash
+cd src/c && mkdir -p build_cuda && cd build_cuda
 cmake .. -DUSE_CUDA=ON
 make
 ```
-- Set `-DUSE_CUDA=OFF` if you want to build without CUDA support.
-### Running the Pipeline
-A pipeline script is provided to automate the process of downloading datasets, preprocessing, building the project, and running the program.
+
+### Build Both (for benchmarking)
+
+To run the full benchmark comparing all implementations, build both:
+
 ```bash
-cd src/scripts
-./run_pipeline.sh
+cd src/c
+mkdir -p build_cpu && cd build_cpu && cmake .. -DUSE_CUDA=OFF && make && cd ..
+mkdir -p build_cuda && cd build_cuda && cmake .. -DUSE_CUDA=ON && make && cd ..
 ```
-- **Note**: Ensure the script has execute permissions: 
+
+### Run Individual Implementations
+
 ```bash
-chmod +x run_pipeline.sh
+# C (CPU)
+./src/c/build_cpu/main --dataset iris
+
+# C (CUDA)
+./src/c/build_cuda/main --dataset iris
+
+# NumPy
+python3 src/python/models/mlp/mlp_numpy.py --dataset iris
+
+# PyTorch (CPU)
+python3 src/python/models/mlp/mlp_pytorch.py --dataset iris --device cpu
+
+# PyTorch (CUDA)
+python3 src/python/models/mlp/mlp_pytorch.py --dataset iris --device cuda
 ```
-## Usage
-### Running on Specific Datasets
-You can run the program on specific datasets by providing the dataset name as an argument. 
+
+### Run Full Benchmark
+
 ```bash
-./run_pipeline.sh iris
+python3 src/scripts/benchmark.py --datasets generated,iris,breast-cancer --runs 3
 ```
-Supported datasets:
-- `generated`
-- `iris`
-- `wine-red`
-- `wine-white`
-- `breast-cancer`
-## Benchmarking
-Not yet implemented. 
 
-## Testing
-Not yet implemented. 
+This runs all available implementations, prints a markdown results table, and generates bar charts in `figs/`.
 
-## Documentation
-Not fully documented yet. However, it is the plan to do the following: 
-- **Generating Code Documentation**: 
-  - **C Code**: Documentation generated using Doxygen. 
-    ```bash
-    doxygen Doxyfile
-    ```
-  - **Python Code**: Documentation generated using Sphinx. 
-    ```bash
-    cd docs
-    make html
-    ```
-- **README.md**:
-  - Contains instructions on how to build and run the code, including dependencies and prerequisites.
+## Benchmark Results
 
-## Contributing
-Contributions are welcome! Please fork the repository and submit a pull request with your improvements.
-1. Fork the Project
-2. Create your Feature Branch (`git checkout -b feature/YourFeature`)
-3. Commit your Changes (`git commit -m 'Add YourFeature'`)
-4. Push to the Branch (`git push origin feature/YourFeature`)
-5. Open a Pull Request
+Run `python3 src/scripts/benchmark.py` to regenerate. All 5 implementations on an RTX 3070:
 
-## License
-This project is licensed under the Apache License (Version 2.0) - see the [LICENSE](LICENSE) file for details. 
-  
-  
-  
-  
-Feel free to explore the repository, run the models, and contribute to the project. If you encounter any issues or have suggestions, please open an issue on GitHub.
-<!---
+| Dataset | C (CPU) | C (CUDA) | NumPy (CPU) | PyTorch (CPU) | PyTorch (CUDA) |
+|---------|---------|----------|-------------|---------------|----------------|
+| **generated** | 99.0% / 1.53s | 98.0% / 2.06s | 98.0% / 1.30s | 99.5% / 11.5s | 99.0% / 17.3s |
+| **iris** | 100% / 0.36s | 100% / 0.41s | 100% / 0.23s | 96.7% / 2.18s | 93.3% / 3.51s |
+| **breast-cancer** | 98.2% / 4.37s | 96.5% / 4.94s | 97.4% / 0.81s | 96.5% / 6.17s | 95.6% / 10.8s |
 
-# DELETE BELOW
-I wish to improve my  "ML in C" abilities. Hence making a repo without any other pupose than that - for now. 
+*Format: Accuracy / Train time. Results vary between runs due to random initialization and shuffling.*
 
-## Current next steps
-**Test the Updated Code**: Compile and run the program to ensure that it works correctly and efficiently.
+Charts saved to `figs/`:
 
-**Benchmarking**: Measure the performance of both the CPU and GPU implementations under similar conditions to compare their execution times and resource usage.
+- `figs/benchmark_train_time.png` — Training time comparison
+- `figs/benchmark_accuracy.png` — Test accuracy comparison
 
-**Further Optimization**: Explore additional optimization techniques, such as vectorization or using optimized math libraries.
+## Project Structure
 
-## Folder structure
-```scss
-├── LICENSE
-├── README.md
-├── .gitignore
-├── docs/
-│   └── ... (Documentation files)
-├── examples/
-│   ├── c/
-│   │   └── ... (Example C programs)
-│   └── python/
-│       └── ... (Example Python scripts)
+```
+ML-in-C/
+├── data/                          # Datasets (downloaded via scripts)
+├── figs/                          # Generated benchmark charts
 ├── src/
 │   ├── c/
-│   │   ├── CMakeLists.txt
-│   │   ├── models/
-│   │   │   ├── mlp/
-│   │   │   │   ├── mlp.cu
-│   │   │   │   ├── mlp.h
-│   │   │   │   └── ... (Other MLP-related files)
-│   │   │   ├── cnn/
-│   │   │   │   └── ... (CNN implementation in C)
-│   │   │   └── ... (Other models)
-│   │   └── utils/
-│   │       └── ... (Utility functions)
+│   │   ├── CMakeLists.txt         # Top-level CMake config
+│   │   ├── data_loader.c/.h       # Dataset loaders (C)
+│   │   ├── main.c                 # CLI entry point: load, normalize, train, evaluate
+│   │   └── models/mlp/
+│   │       ├── CMakeLists.txt     # MLP library build config
+│   │       ├── mlp.h              # Shared interface and hyperparameters
+│   │       ├── mlp_cpu.c          # CPU implementation (OpenMP)
+│   │       └── mlp.cu             # CUDA implementation
 │   ├── python/
-│   │   ├── setup.py
-│   │   ├── models/
-│   │   │   ├── mlp.py
-│   │   │   ├── cnn.py
-│   │   │   └── ... (Other models)
-│   │   └── utils/
-│   │       └── ... (Utility modules)
-|   └── data/
-|       └── ... (Datasets or data processing scripts)
-├── tests/
-│   ├── c/
-│   │   └── ... (Unit tests for C code)
-│   └── python/
-│       └── ... (Unit tests for Python code)
-├── scripts/
-│   └── ... (Helper scripts, e.g., for building or running benchmarks)
-└── requirements.txt
-```
-update to (add comments and remove some stuff to give idea):
-```scss
-├── data
-│   ├── iris.data
-│   ├── iris_processed.txt
-│   ├── wdbc.data
-│   ├── winequality-red.csv
-│   └── winequality-white.csv
-├── docs
-├── examples
-│   ├── c
-│   └── python
-├── figs
-├── LICENSE
-├── README.md
-└── src
-    ├── c
-    │   ├── CMakeLists.txt
-    │   ├── data_loader.c
-    │   ├── data_loader.h
-    │   ├── main.c
-    │   └── models
-    │       ├── cnn
-    │       └── mlp
-    │           ├── CMakeLists.txt
-    │           ├── mlp_cpu.c
-    │           ├── mlp.cu
-    │           └── mlp.h
-    ├── python
-    │   ├── models
-    │   │   ├── cnn
-    │   │   └── mlp
-    │   │       └── mlp.py
-    │   ├── setup.py
-    │   └── utils
-    ├── scripts
-    │   ├── build_run_c_CPU.sh
-    │   ├── download_datasets.sh
-    │   ├── preprocess_iris.py
-    │   └── run_pipeline.sh
-    └── tests
-        ├── c
-        └── python
+│   │   ├── models/mlp/
+│   │   │   ├── data_utils.py      # Shared data loading (mirrors C data_loader)
+│   │   │   ├── mlp_numpy.py       # NumPy implementation
+│   │   │   └── mlp_pytorch.py     # PyTorch implementation
+│   │   └── setup.py
+│   └── scripts/
+│       ├── benchmark.py           # Benchmark runner with chart generation
+│       ├── download_datasets.sh   # Download UCI datasets
+│       ├── preprocess_iris.py     # Preprocess Iris data
+│       └── run_pipeline.sh        # Full pipeline (download + build + run)
+├── mathematical_foundations.md    # Math derivations for the MLP algorithm
+├── requirements.txt               # Python dependencies
+├── CLAUDE.md                      # AI assistant instructions
+├── LICENSE                        # Apache 2.0
+└── README.md
 ```
 
-## Checklist
-**Benchmark Scripts**: Under `scripts/` create scripts that:
-- Train models with the same data.
-- Measure training time and performance metrics.
-- Generate comparison reports or plots.
+## Mathematical Foundations
 
-**Data Formats**: Standardize data loading and saving formats to ensure consistency.
+See [mathematical_foundations.md](mathematical_foundations.md) for detailed derivations of:
+- Feature normalization (z-score)
+- Xavier weight initialization
+- Forward propagation (ReLU + numerically stable softmax)
+- Cross-entropy loss
+- Backpropagation (including the softmax+CE gradient shortcut)
+- Mini-batch SGD with gradient averaging
 
-### Documentation
-- **README.md**: Update with instructions on how to build and run my code, including dependencies and prerequisites.
-- **Docs Generation**: Use Doxygen for C code and Sphinx for Python code to generate documentation from comments.
+## License
 
-### Testing
-**Unit Tests**: Under `tests/`, write unit tests for both C and Python code.
-
-**C Tests**: Use a testing framework like CUnit or Unity.
-**Python Tests**: Use unittest, pytest, or similar frameworks.
-
--->
+This project is licensed under the Apache License (Version 2.0) — see the [LICENSE](LICENSE) file for details.

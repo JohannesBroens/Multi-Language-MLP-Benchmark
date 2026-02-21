@@ -5,321 +5,412 @@
 #include <time.h>
 
 #include <cuda_runtime.h>
-#include <curand.h>
 #include <curand_kernel.h>
+#include <cublas_v2.h>
 
-// ========================================================
-// CUDA Implementations
-// ========================================================
+#define CUDA_CHECK(call) do { \
+    cudaError_t err = (call); \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+        exit(EXIT_FAILURE); \
+    } \
+} while(0)
 
-// Kernel for initializing weights and biases
-__global__ void init_weights_biases(float *weights, int size, unsigned long seed) {
+#define CUBLAS_CHECK(call) do { \
+    cublasStatus_t stat = (call); \
+    if (stat != CUBLAS_STATUS_SUCCESS) { \
+        fprintf(stderr, "cuBLAS error at %s:%d: %d\n", __FILE__, __LINE__, stat); \
+        exit(EXIT_FAILURE); \
+    } \
+} while(0)
+
+/* Persistent cuBLAS handle */
+static cublasHandle_t cublas_handle = NULL;
+
+/* ------------------------------------------------------------------ */
+/*  cuBLAS GEMM wrappers for row-major data                          */
+/*  Row-major C[M,N] = A[M,K] @ B[K,N] uses the transposition trick: */
+/*  In col-major: C' = B' @ A'  (swap A and B, swap M and N)         */
+/* ------------------------------------------------------------------ */
+
+/* C[M,N] = A[M,K] @ B[K,N] */
+static void sgemm_nn(int M, int N, int K,
+                     const float *A, const float *B, float *C) {
+    const float alpha = 1.0f, beta = 0.0f;
+    CUBLAS_CHECK(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                             N, M, K, &alpha, B, N, A, K, &beta, C, N));
+}
+
+/* C[M,N] = A^T[M,K] @ B[K,N],  A stored as [K,M] */
+static void sgemm_tn(int M, int N, int K,
+                     const float *A, const float *B, float *C) {
+    const float alpha = 1.0f, beta = 0.0f;
+    CUBLAS_CHECK(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_T,
+                             N, M, K, &alpha, B, N, A, M, &beta, C, N));
+}
+
+/* C[M,N] = A[M,K] @ B^T[K,N],  B stored as [N,K] */
+static void sgemm_nt(int M, int N, int K,
+                     const float *A, const float *B, float *C) {
+    const float alpha = 1.0f, beta = 0.0f;
+    CUBLAS_CHECK(cublasSgemm(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                             N, M, K, &alpha, B, K, A, K, &beta, C, N));
+}
+
+/* ------------------------------------------------------------------ */
+/*  Element-wise CUDA kernels                                        */
+/* ------------------------------------------------------------------ */
+
+/* Add bias vector then apply ReLU: hidden[i] = max(0, hidden[i] + bias[i % hid]) */
+__global__ void bias_relu_kernel(float *hidden, const float *bias, int total, int hid) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total) {
+        float v = hidden[idx] + bias[idx % hid];
+        hidden[idx] = (v > 0.0f) ? v : 0.0f;
+    }
+}
+
+/* Add bias then numerically stable softmax per row */
+__global__ void bias_softmax_kernel(float *output, const float *bias, int bs, int out) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= bs) return;
+
+    float *o = output + row * out;
+
+    /* Add bias and find max */
+    float mx = -1e30f;
+    for (int j = 0; j < out; ++j) {
+        o[j] += bias[j];
+        if (o[j] > mx) mx = o[j];
+    }
+
+    /* Exp and sum */
+    float s = 0.0f;
+    for (int j = 0; j < out; ++j) {
+        o[j] = expf(o[j] - mx);
+        s += o[j];
+    }
+
+    /* Normalize */
+    for (int j = 0; j < out; ++j)
+        o[j] /= s;
+}
+
+/* d_output = output - one_hot(targets); also accumulates loss */
+__global__ void ce_grad_kernel(const float *output, const int *targets,
+                               float *d_output, float *losses,
+                               int bs, int out) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= bs) return;
+
+    const float *o = output  + row * out;
+    float       *d = d_output + row * out;
+    int t = targets[row];
+
+    losses[row] = -logf(o[t] + 1e-7f);
+
+    for (int j = 0; j < out; ++j)
+        d[j] = o[j] - ((t == j) ? 1.0f : 0.0f);
+}
+
+/* Apply ReLU mask: d_hidden[i] = (hidden[i] > 0) ? d_hidden[i] : 0 */
+__global__ void relu_mask_kernel(float *d_hidden, const float *hidden, int total) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total)
+        if (hidden[idx] <= 0.0f) d_hidden[idx] = 0.0f;
+}
+
+/* Column sum: out_vec[j] = sum_i(mat[i * cols + j]) */
+__global__ void col_sum_kernel(const float *mat, float *out_vec, int rows, int cols) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= cols) return;
+    float s = 0.0f;
+    for (int i = 0; i < rows; ++i)
+        s += mat[i * cols + j];
+    out_vec[j] = s;
+}
+
+/* SGD update: param[i] -= lr_scaled * grad[i] */
+__global__ void sgd_kernel(float *param, const float *grad, float lr, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n)
+        param[idx] -= lr * grad[idx];
+}
+
+/* Reduce sum of a float array */
+__global__ void reduce_sum_kernel(const float *arr, float *result, int n) {
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    sdata[tid] = (idx < n) ? arr[idx] : 0.0f;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) atomicAdd(result, sdata[0]);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Xavier init kernel                                                */
+/* ------------------------------------------------------------------ */
+
+__global__ void init_weights_kernel(float *weights, int size, float scale, unsigned long seed) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
         curandState state;
         curand_init(seed, idx, 0, &state);
-        weights[idx] = (curand_uniform(&state) - 0.5f) * 0.1f;
+        weights[idx] = (curand_uniform(&state) * 2.0f - 1.0f) * scale;
     }
 }
 
-// Function to initialize the MLP
+/* ------------------------------------------------------------------ */
+/*  Init / Free                                                       */
+/* ------------------------------------------------------------------ */
+
 void mlp_initialize(MLP *mlp, int input_size, int hidden_size, int output_size) {
     mlp->input_size = input_size;
     mlp->hidden_size = hidden_size;
     mlp->output_size = output_size;
 
-    size_t input_w_size = input_size * hidden_size * sizeof(float);
-    size_t output_w_size = hidden_size * output_size * sizeof(float);
-    size_t hidden_b_size = hidden_size * sizeof(float);
-    size_t output_b_size = output_size * sizeof(float);
+    /* Unified memory for weights — accessible from host and device */
+    CUDA_CHECK(cudaMallocManaged(&mlp->input_weights,  input_size  * hidden_size * sizeof(float)));
+    CUDA_CHECK(cudaMallocManaged(&mlp->output_weights, hidden_size * output_size * sizeof(float)));
+    CUDA_CHECK(cudaMallocManaged(&mlp->hidden_biases,  hidden_size * sizeof(float)));
+    CUDA_CHECK(cudaMallocManaged(&mlp->output_biases,  output_size * sizeof(float)));
 
-    // Allocate managed memory
-    cudaMallocManaged(&mlp->input_weights, input_w_size);
-    cudaMallocManaged(&mlp->output_weights, output_w_size);
-    cudaMallocManaged(&mlp->hidden_biases, hidden_b_size);
-    cudaMallocManaged(&mlp->output_biases, output_b_size);
+    cudaMemset(mlp->hidden_biases, 0, hidden_size * sizeof(float));
+    cudaMemset(mlp->output_biases, 0, output_size * sizeof(float));
 
-    // Initialize weights and biases using CUDA kernels
-    int threads_per_block = 256;
-    int blocks_per_grid_input = (input_size * hidden_size + threads_per_block - 1) / threads_per_block;
-    int blocks_per_grid_output = (hidden_size * output_size + threads_per_block - 1) / threads_per_block;
-
+    int threads = 256;
     unsigned long seed = (unsigned long)time(NULL);
 
-    init_weights_biases<<<blocks_per_grid_input, threads_per_block>>>(mlp->input_weights, input_size * hidden_size, seed);
-    init_weights_biases<<<blocks_per_grid_output, threads_per_block>>>(mlp->output_weights, hidden_size * output_size, seed + 1);
+    float scale_ih = sqrtf(2.0f / (float)input_size);
+    int blocks_ih = (input_size * hidden_size + threads - 1) / threads;
+    init_weights_kernel<<<blocks_ih, threads>>>(mlp->input_weights,
+                                                 input_size * hidden_size, scale_ih, seed);
 
-    // Set biases to zero
-    cudaMemset(mlp->hidden_biases, 0, hidden_b_size);
-    cudaMemset(mlp->output_biases, 0, output_b_size);
+    float scale_ho = sqrtf(2.0f / (float)hidden_size);
+    int blocks_ho = (hidden_size * output_size + threads - 1) / threads;
+    init_weights_kernel<<<blocks_ho, threads>>>(mlp->output_weights,
+                                                 hidden_size * output_size, scale_ho, seed + 1);
 
-    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    /* Create cuBLAS handle */
+    if (!cublas_handle)
+        CUBLAS_CHECK(cublasCreate(&cublas_handle));
 }
 
-// Function to free the MLP resources
 void mlp_free(MLP *mlp) {
     cudaFree(mlp->input_weights);
     cudaFree(mlp->output_weights);
     cudaFree(mlp->hidden_biases);
     cudaFree(mlp->output_biases);
-}
 
-// Kernel for training with Mini-Batch Gradient Descent
-__global__ void train_kernel(MLP mlp,
-                             float *inputs, int *targets, int num_samples,
-                             float learning_rate, int input_size, int hidden_size, int output_size) {
-    // Calculate the sample index within the batch
-    int sample_idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (sample_idx >= num_samples)
-        return;
-
-    // Thread-private variables stored in registers/local memory
-    // Using fixed-size arrays might not be ideal for large networks; adjust sizes accordingly
-    const int MAX_HIDDEN_SIZE = 1024;
-    const int MAX_OUTPUT_SIZE = 10;
-
-    float hidden_t[MAX_HIDDEN_SIZE];
-    float output_t[MAX_OUTPUT_SIZE];
-    float d_output_t[MAX_OUTPUT_SIZE];
-    float d_hidden_t[MAX_HIDDEN_SIZE];
-
-    // Load input and target
-    float *input_sample = &inputs[sample_idx * input_size];
-    int target_label = targets[sample_idx];
-
-    // Forward pass
-    for (int i = 0; i < hidden_size; ++i) {
-        float sum = mlp.hidden_biases[i];
-        for (int j = 0; j < input_size; ++j) {
-            sum += input_sample[j] * mlp.input_weights[j * hidden_size + i];
-        }
-        // Activation function (ReLU)
-        hidden_t[i] = fmaxf(0.0f, sum);
-    }
-
-    // Output layer
-    for (int i = 0; i < output_size; ++i) {
-        float sum = mlp.output_biases[i];
-        for (int j = 0; j < hidden_size; ++j) {
-            sum += hidden_t[j] * mlp.output_weights[j * output_size + i];
-        }
-        // Activation function (Sigmoid)
-        output_t[i] = 1.0f / (1.0f + expf(-sum));
-    }
-
-    // Compute error and gradients
-    for (int i = 0; i < output_size; ++i) {
-        float target = (target_label == i) ? 1.0f : 0.0f;  // One-hot encoding
-        float error = target - output_t[i];
-        d_output_t[i] = error * output_t[i] * (1.0f - output_t[i]);  // Derivative of Sigmoid
-    }
-
-    // Hidden layer gradients
-    for (int i = 0; i < hidden_size; ++i) {
-        float sum = 0.0f;
-        for (int j = 0; j < output_size; ++j) {
-            sum += d_output_t[j] * mlp.output_weights[i * output_size + j];
-        }
-        d_hidden_t[i] = sum * ((hidden_t[i] > 0.0f) ? 1.0f : 0.0f);  // Derivative of ReLU
-    }
-
-    // Update weights and biases using atomic operations
-    // Hidden to Output weights and biases
-    for (int i = 0; i < hidden_size; ++i) {
-        for (int j = 0; j < output_size; ++j) {
-            float gradient = d_output_t[j] * hidden_t[i];
-            atomicAdd(&mlp.output_weights[i * output_size + j], learning_rate * gradient);
-        }
-    }
-
-    for (int i = 0; i < output_size; ++i) {
-        float gradient = d_output_t[i];
-        atomicAdd(&mlp.output_biases[i], learning_rate * gradient);
-    }
-
-    // Input to Hidden weights and biases
-    for (int i = 0; i < input_size; ++i) {
-        for (int j = 0; j < hidden_size; ++j) {
-            float gradient = d_hidden_t[j] * input_sample[i];
-            atomicAdd(&mlp.input_weights[i * hidden_size + j], learning_rate * gradient);
-        }
-    }
-
-    for (int i = 0; i < hidden_size; ++i) {
-        float gradient = d_hidden_t[i];
-        atomicAdd(&mlp.hidden_biases[i], learning_rate * gradient);
+    if (cublas_handle) {
+        cublasDestroy(cublas_handle);
+        cublas_handle = NULL;
     }
 }
 
-// Function to train the MLP using Mini-Batch Gradient Descent
-void mlp_train(MLP *mlp, float *inputs, int *targets, int num_samples, int batch_size) {
-    // Copy inputs and targets to device memory
+/* ------------------------------------------------------------------ */
+/*  Training: cuBLAS GEMM + elementwise kernels                      */
+/* ------------------------------------------------------------------ */
+
+void mlp_train(MLP *mlp, float *inputs, int *targets, int num_samples,
+               int batch_size, int num_epochs, float learning_rate) {
+    int in  = mlp->input_size;
+    int hid = mlp->hidden_size;
+    int out = mlp->output_size;
+
+    /* Copy training data to device */
     float *d_inputs;
-    int *d_targets;
-    size_t input_size_bytes = num_samples * mlp->input_size * sizeof(float);
-    size_t target_size_bytes = num_samples * sizeof(int);
-    cudaMalloc(&d_inputs, input_size_bytes);
-    cudaMalloc(&d_targets, target_size_bytes);
+    int   *d_targets;
+    CUDA_CHECK(cudaMalloc(&d_inputs,  (size_t)num_samples * in * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_targets, (size_t)num_samples * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(d_inputs,  inputs,  (size_t)num_samples * in * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_targets, targets, (size_t)num_samples * sizeof(int),        cudaMemcpyHostToDevice));
 
-    cudaMemcpy(d_inputs, inputs, input_size_bytes, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_targets, targets, target_size_bytes, cudaMemcpyHostToDevice);
+    /* Workspace buffers on device */
+    float *d_hidden, *d_output, *d_d_output, *d_d_hidden;
+    float *d_grad_W1, *d_grad_W2, *d_grad_b1, *d_grad_b2;
+    float *d_losses, *d_loss_sum;
 
-    // Training parameters
+    CUDA_CHECK(cudaMalloc(&d_hidden,    (size_t)batch_size * hid * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_output,    (size_t)batch_size * out * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_d_output,  (size_t)batch_size * out * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_d_hidden,  (size_t)batch_size * hid * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_grad_W1,   (size_t)in  * hid * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_grad_W2,   (size_t)hid * out * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_grad_b1,   (size_t)hid * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_grad_b2,   (size_t)out * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_losses,    (size_t)batch_size * sizeof(float)));
+    CUDA_CHECK(cudaMallocManaged(&d_loss_sum, sizeof(float)));
+
+    int threads = 256;
     int num_batches = (num_samples + batch_size - 1) / batch_size;
-    int threads_per_block = 256; // Adjust based on your GPU's capabilities
-    int max_threads_per_block = threads_per_block;
 
-    for (int epoch = 0; epoch < NUM_EPOCHS; ++epoch) {
+    for (int epoch = 0; epoch < num_epochs; ++epoch) {
+        *d_loss_sum = 0.0f;
+
         for (int batch = 0; batch < num_batches; ++batch) {
-            int batch_start = batch * batch_size;
-            int current_batch_size = min(batch_size, num_samples - batch_start);
+            int start = batch * batch_size;
+            int bs = batch_size;
+            if (start + bs > num_samples) bs = num_samples - start;
 
-            int blocks_per_grid = (current_batch_size + threads_per_block - 1) / threads_per_block;
+            float *X = d_inputs  + start * in;
+            int   *Y = d_targets + start;
 
-            // Launch kernel for the current batch
-            train_kernel<<<blocks_per_grid, threads_per_block>>>(
-                *mlp,
-                d_inputs + batch_start * mlp->input_size,
-                d_targets + batch_start,
-                current_batch_size,
-                LEARNING_RATE,
-                mlp->input_size, mlp->hidden_size, mlp->output_size
-            );
+            /* ---- Forward: hidden = ReLU(X @ W1 + b1) ---- */
+            sgemm_nn(bs, hid, in, X, mlp->input_weights, d_hidden);
+            int n_hid = bs * hid;
+            bias_relu_kernel<<<(n_hid + threads - 1) / threads, threads>>>(
+                d_hidden, mlp->hidden_biases, n_hid, hid);
 
-            cudaDeviceSynchronize();
+            /* ---- Forward: output = softmax(hidden @ W2 + b2) ---- */
+            sgemm_nn(bs, out, hid, d_hidden, mlp->output_weights, d_output);
+            bias_softmax_kernel<<<(bs + threads - 1) / threads, threads>>>(
+                d_output, mlp->output_biases, bs, out);
+
+            /* ---- Loss + d_output gradient ---- */
+            ce_grad_kernel<<<(bs + threads - 1) / threads, threads>>>(
+                d_output, Y, d_d_output, d_losses, bs, out);
+
+            /* Accumulate batch loss */
+            reduce_sum_kernel<<<(bs + threads - 1) / threads, threads, threads * sizeof(float)>>>(
+                d_losses, d_loss_sum, bs);
+
+            /* ---- Backward: GEMM for gradients ---- */
+
+            /* grad_W2 = hidden^T @ d_output */
+            sgemm_tn(hid, out, bs, d_hidden, d_d_output, d_grad_W2);
+
+            /* grad_b2 = colsum(d_output) */
+            col_sum_kernel<<<(out + threads - 1) / threads, threads>>>(
+                d_d_output, d_grad_b2, bs, out);
+
+            /* d_hidden = d_output @ W2^T */
+            sgemm_nt(bs, hid, out, d_d_output, mlp->output_weights, d_d_hidden);
+
+            /* Apply ReLU mask */
+            relu_mask_kernel<<<(n_hid + threads - 1) / threads, threads>>>(
+                d_d_hidden, d_hidden, n_hid);
+
+            /* grad_W1 = X^T @ d_hidden */
+            sgemm_tn(in, hid, bs, X, d_d_hidden, d_grad_W1);
+
+            /* grad_b1 = colsum(d_hidden) */
+            col_sum_kernel<<<(hid + threads - 1) / threads, threads>>>(
+                d_d_hidden, d_grad_b1, bs, hid);
+
+            /* ---- SGD update ---- */
+            float lr_s = learning_rate / (float)bs;
+            int n_iw = in * hid;
+            int n_ow = hid * out;
+            sgd_kernel<<<(n_iw + threads - 1) / threads, threads>>>(
+                mlp->input_weights, d_grad_W1, lr_s, n_iw);
+            sgd_kernel<<<(n_ow + threads - 1) / threads, threads>>>(
+                mlp->output_weights, d_grad_W2, lr_s, n_ow);
+            sgd_kernel<<<(hid + threads - 1) / threads, threads>>>(
+                mlp->hidden_biases, d_grad_b1, lr_s, hid);
+            sgd_kernel<<<(out + threads - 1) / threads, threads>>>(
+                mlp->output_biases, d_grad_b2, lr_s, out);
         }
 
         if (epoch % 100 == 0) {
-            printf("Epoch %d completed.\n", epoch);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            printf("  Epoch %4d  loss: %.4f\n", epoch, *d_loss_sum / num_samples);
         }
     }
 
-    // Free device memory
-    cudaFree(d_inputs);
-    cudaFree(d_targets);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    cudaFree(d_inputs);   cudaFree(d_targets);
+    cudaFree(d_hidden);   cudaFree(d_output);
+    cudaFree(d_d_output); cudaFree(d_d_hidden);
+    cudaFree(d_grad_W1);  cudaFree(d_grad_W2);
+    cudaFree(d_grad_b1);  cudaFree(d_grad_b2);
+    cudaFree(d_losses);   cudaFree(d_loss_sum);
 }
 
-// Kernel for evaluation
-__global__ void evaluate_kernel(MLP mlp,
-                                float *inputs, int *targets, int num_samples,
-                                float *loss, int *correct_count,
-                                int input_size, int hidden_size, int output_size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+/* ------------------------------------------------------------------ */
+/*  Evaluation: cuBLAS batched forward                               */
+/* ------------------------------------------------------------------ */
 
-    if (idx >= num_samples)
-        return;
+/* Evaluate kernel: compute loss + argmax per sample */
+__global__ void eval_metrics_kernel(const float *output, const int *targets,
+                                    float *losses, int *correct,
+                                    int bs, int out) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= bs) return;
 
-    // Thread-private variables
-    const int MAX_HIDDEN_SIZE = 1024;
-    const int MAX_OUTPUT_SIZE = 10;
+    const float *o = output + row * out;
+    int t = targets[row];
 
-    float hidden_t[MAX_HIDDEN_SIZE];
-    float output_t[MAX_OUTPUT_SIZE];
+    losses[row] = -logf(o[t] + 1e-7f);
 
-    // Load input and target
-    float *input_sample = &inputs[idx * input_size];
-    int target_label = targets[idx];
-
-    // Forward pass
-    for (int i = 0; i < hidden_size; ++i) {
-        float sum = mlp.hidden_biases[i];
-        for (int j = 0; j < input_size; ++j) {
-            sum += input_sample[j] * mlp.input_weights[j * hidden_size + i];
-        }
-        // Activation function (ReLU)
-        hidden_t[i] = fmaxf(0.0f, sum);
+    int pred = 0;
+    float mx = o[0];
+    for (int j = 1; j < out; ++j) {
+        if (o[j] > mx) { mx = o[j]; pred = j; }
     }
-
-    // Output layer
-    for (int i = 0; i < output_size; ++i) {
-        float sum = mlp.output_biases[i];
-        for (int j = 0; j < hidden_size; ++j) {
-            sum += hidden_t[j] * mlp.output_weights[j * output_size + i];
-        }
-        // Activation function (Sigmoid)
-        output_t[i] = 1.0f / (1.0f + expf(-sum));
-    }
-
-    // Compute loss (Cross-Entropy) and accuracy
-    float sample_loss = 0.0f;
-    float target_vector = (float)(target_label);
-    for (int i = 0; i < output_size; ++i) {
-        float t = (target_label == i) ? 1.0f : 0.0f;
-        sample_loss -= t * logf(output_t[i] + 1e-7f);  // Add epsilon to prevent log(0)
-    }
-
-    // Accumulate loss
-    atomicAdd(loss, sample_loss);
-
-    // Determine if the prediction is correct
-    int predicted_label = 0;
-    float max_output = output_t[0];
-    for (int i = 1; i < output_size; ++i) {
-        if (output_t[i] > max_output) {
-            max_output = output_t[i];
-            predicted_label = i;
-        }
-    }
-    if (predicted_label == target_label) {
-        atomicAdd(correct_count, 1);
-    }
+    if (pred == t) atomicAdd(correct, 1);
 }
 
-// Function to evaluate the MLP
-void mlp_evaluate(MLP *mlp, float *inputs, int *targets, int num_samples, float *loss, float *accuracy) {
-    // Copy inputs and targets to device memory
+void mlp_evaluate(MLP *mlp, float *inputs, int *targets, int num_samples,
+                  float *loss, float *accuracy) {
+    int in  = mlp->input_size;
+    int hid = mlp->hidden_size;
+    int out = mlp->output_size;
+
     float *d_inputs;
-    int *d_targets;
-    float *d_loss;
-    int *d_correct_count;
-    size_t input_size_bytes = num_samples * mlp->input_size * sizeof(float);
-    size_t target_size_bytes = num_samples * sizeof(int);
-    cudaMalloc(&d_inputs, input_size_bytes);
-    cudaMalloc(&d_targets, target_size_bytes);
-    cudaMallocManaged(&d_loss, sizeof(float));
-    cudaMallocManaged(&d_correct_count, sizeof(int));
+    int   *d_targets;
+    CUDA_CHECK(cudaMalloc(&d_inputs,  (size_t)num_samples * in * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_targets, (size_t)num_samples * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(d_inputs,  inputs,  (size_t)num_samples * in * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_targets, targets, (size_t)num_samples * sizeof(int),        cudaMemcpyHostToDevice));
 
-    cudaMemcpy(d_inputs, inputs, input_size_bytes, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_targets, targets, target_size_bytes, cudaMemcpyHostToDevice);
-    *d_loss = 0.0f;
-    *d_correct_count = 0;
+    float *d_hidden, *d_output, *d_losses;
+    float *d_loss_sum;
+    int   *d_correct;
+    CUDA_CHECK(cudaMalloc(&d_hidden, (size_t)num_samples * hid * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_output, (size_t)num_samples * out * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_losses, (size_t)num_samples * sizeof(float)));
+    CUDA_CHECK(cudaMallocManaged(&d_loss_sum, sizeof(float)));
+    CUDA_CHECK(cudaMallocManaged(&d_correct,  sizeof(int)));
 
-    // Evaluation parameters
-    int threads_per_block = 256;
-    int blocks_per_grid = (num_samples + threads_per_block - 1) / threads_per_block;
+    *d_loss_sum = 0.0f;
+    *d_correct  = 0;
 
-    evaluate_kernel<<<blocks_per_grid, threads_per_block>>>(
-        *mlp,
-        d_inputs, d_targets, num_samples,
-        d_loss, d_correct_count,
-        mlp->input_size, mlp->hidden_size, mlp->output_size
-    );
-    cudaDeviceSynchronize();
+    int threads = 256;
 
-    *loss = *d_loss / num_samples;
-    *accuracy = (float)(*d_correct_count) / num_samples * 100.0f;
+    /* Forward: hidden = ReLU(X @ W1 + b1) */
+    sgemm_nn(num_samples, hid, in, d_inputs, mlp->input_weights, d_hidden);
+    int n_hid = num_samples * hid;
+    bias_relu_kernel<<<(n_hid + threads - 1) / threads, threads>>>(
+        d_hidden, mlp->hidden_biases, n_hid, hid);
 
-    // Free device memory
-    cudaFree(d_inputs);
-    cudaFree(d_targets);
-    cudaFree(d_loss);
-    cudaFree(d_correct_count);
-}
+    /* Forward: output = softmax(hidden @ W2 + b2) */
+    sgemm_nn(num_samples, out, hid, d_hidden, mlp->output_weights, d_output);
+    bias_softmax_kernel<<<(num_samples + threads - 1) / threads, threads>>>(
+        d_output, mlp->output_biases, num_samples, out);
 
-// ========================================================
-// Common Functions (Optional)
-// ========================================================
+    /* Metrics */
+    eval_metrics_kernel<<<(num_samples + threads - 1) / threads, threads>>>(
+        d_output, d_targets, d_losses, d_correct, num_samples, out);
 
-// Function to generate data points (if needed)
-void mlp_generate_data(float *inputs, int *targets, int num_samples) {
-    srand((unsigned int)time(NULL));
-    for (int i = 0; i < num_samples; ++i) {
-        float x = ((float)rand() / RAND_MAX) * 2 - 1;  // Random value between -1 and 1
-        float y = ((float)rand() / RAND_MAX) * 2 - 1;
-        inputs[i * 2] = x;
-        inputs[i * 2 + 1] = y;
-        // Simple function: target = 1 if inside circle of radius 0.5
-        targets[i] = (x * x + y * y < 0.25f) ? 1 : 0;
-    }
+    reduce_sum_kernel<<<(num_samples + threads - 1) / threads, threads,
+                        threads * sizeof(float)>>>(
+        d_losses, d_loss_sum, num_samples);
+
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    *loss = *d_loss_sum / num_samples;
+    *accuracy = (float)(*d_correct) / num_samples * 100.0f;
+
+    cudaFree(d_inputs);   cudaFree(d_targets);
+    cudaFree(d_hidden);   cudaFree(d_output);
+    cudaFree(d_losses);   cudaFree(d_loss_sum);
+    cudaFree(d_correct);
 }
