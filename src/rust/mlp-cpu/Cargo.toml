@@ -1,0 +1,13 @@
+[package]
+name = "mlp-cpu"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mlp-cpu"
+path = "src/main.rs"
+
+[dependencies]
+mlp-common = { path = "../mlp-common" }
+rayon = "1.10"
+num_cpus = "1.16"

@@ -1,0 +1,11 @@
+[package]
+name = "mlp-cuda-cublas"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mlp-cuda-cublas"
+path = "src/main.rs"
+
+[dependencies]
+mlp-common = { path = "../mlp-common" }

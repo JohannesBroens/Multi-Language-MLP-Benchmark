@@ -19,6 +19,8 @@ main
 # Ignore logs and temporary files
 *.log
 *.tmp
+.CLAUDE.md
+
 
 # Ignore backup files
 *~
@@ -33,12 +35,11 @@ main
 losses.txt
 test_loss.txt
 
-# Ignore plot images
-*.png
-*.jpg
-*.jpeg
-*.svg
-*.pdf
+# Ignore generated benchmark figures (keep figs/ directory via .gitkeep)
+figs/*.png
+figs/*.jpg
+figs/*.svg
+figs/*.pdf
 
 # Ignore Python bytecode and cache directories
 __pycache__/
@@ -53,6 +54,9 @@ __pycache__/
 /build/
 build/
 dist/
+
+# Rust build artifacts
+src/rust/target/
 
 # Ignore system files
 .DS_Store

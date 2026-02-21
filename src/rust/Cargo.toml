@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "mlp-common",
+    "mlp-cpu",
+    "mlp-cuda-cublas",
+    "mlp-cuda-kernels",
+]
+resolver = "2"
