@@ -20,13 +20,14 @@ set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -march=native -ffast-math")
 set(CMAKE_CUDA_FLAGS_RELEASE "${CMAKE_CUDA_FLAGS_RELEASE} --use_fast_math")
 
 # Add subdirectories
+add_subdirectory(nn_ops)
 add_subdirectory(models/mlp)
 
 # Add the executable
 add_executable(main main.c data_loader.c)
 
-# Link the mlp library and math library
-target_link_libraries(main PRIVATE mlp m)
+# Link the mlp library, nn_ops, and math library
+target_link_libraries(main PRIVATE mlp nn_ops m)
 
 # Include directories
 target_include_directories(main PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -36,8 +37,4 @@ if(USE_CUDA)
     target_compile_definitions(main PRIVATE USE_CUDA)
 else()
     message(STATUS "Building without CUDA support")
-    find_package(OpenMP)
-    if(OPENMP_FOUND)
-        target_link_libraries(main PUBLIC OpenMP::OpenMP_C)
-    endif()
 endif()
