@@ -3,6 +3,8 @@
 
 #ifdef __cplusplus
 extern "C" {
+/* CUDA/C++ does not support C99 restrict -- use __restrict__ instead */
+#define restrict __restrict__
 #endif
 
 /*
