@@ -163,7 +163,17 @@ When combining softmax activation with cross-entropy loss, the gradient simplifi
 \delta^{(2)} = \hat{\mathbf{y}} - \mathbf{y}
 ```
 
-This avoids computing separate softmax and cross-entropy derivatives. **Proof**: By the chain rule, $\frac{\partial L}{\partial z_i^{(2)}} = \sum_j \frac{\partial L}{\partial \hat{y}_j} \frac{\partial \hat{y}_j}{\partial z_i^{(2)}}$. For cross-entropy loss and softmax, using $\frac{\partial \hat{y}_j}{\partial z_i} = \hat{y}_i(\delta_{ij} - \hat{y}_j)$, this reduces to $\hat{y}_i - y_i$.
+This avoids computing separate softmax and cross-entropy derivatives. 
+
+**Proof**: By the chain rule, 
+```math
+\frac{\partial L}{\partial z_i^{(2)}} = \sum_j \frac{\partial L}{\partial \hat{y}_j} \frac{\partial \hat{y}_j}{\partial z_i^{(2)}}
+```
+For cross-entropy loss and softmax, using
+```math
+\frac{\partial \hat{y}_j}{\partial z_i}=\hat{y}_i(\delta_{ij}-\hat{y}_j),
+```
+this reduces to $\hat{y}_i - y_i$. 
 
 ### Hidden Layer Gradient (Backprop through ReLU)
 
