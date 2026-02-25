@@ -92,14 +92,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6800badb6cb2082ffd7b6a67e6125bb39f18782f793520caee8cb8846be06112"
 
 [[package]]
-name = "mlp-common"
-version = "0.1.0"
-
-[[package]]
 name = "mlp-cpu"
 version = "0.1.0"
 dependencies = [
- "mlp-common",
+ "nn-common",
  "num_cpus",
  "rayon",
 ]
@@ -109,7 +105,7 @@ name = "mlp-cuda-cublas"
 version = "0.1.0"
 dependencies = [
  "cc",
- "mlp-common",
+ "nn-common",
 ]
 
 [[package]]
@@ -117,7 +113,15 @@ name = "mlp-cuda-kernels"
 version = "0.1.0"
 dependencies = [
  "cc",
- "mlp-common",
+ "nn-common",
+]
+
+[[package]]
+name = "nn-common"
+version = "0.1.0"
+dependencies = [
+ "num_cpus",
+ "rayon",
 ]
 
 [[package]]

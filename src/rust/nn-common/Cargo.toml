@@ -1,6 +1,8 @@
 [package]
-name = "mlp-common"
+name = "nn-common"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+rayon = "1.10"
+num_cpus = "1.16"

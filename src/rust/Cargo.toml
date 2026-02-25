@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "mlp-common",
+    "nn-common",
     "mlp-cpu",
     "mlp-cuda-cublas",
     "mlp-cuda-kernels",

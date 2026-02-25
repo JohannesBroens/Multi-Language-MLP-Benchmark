@@ -1,4 +1,4 @@
-use mlp_common::{load_dataset, normalize_features, parse_args, shuffle_data};
+use nn_common::{load_dataset, normalize_features, parse_args, shuffle_data};
 use std::time::Instant;
 
 const LEARNING_RATE: f32 = 0.01;
