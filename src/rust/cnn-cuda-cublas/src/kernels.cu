@@ -1,0 +1,350 @@
+#include <cuda_runtime.h>
+#include <curand_kernel.h>
+#include <math.h>
+
+/* ------------------------------------------------------------------ */
+/*  CNN-specific kernels: im2col, col2im, avg_pool, add_bias          */
+/* ------------------------------------------------------------------ */
+
+__global__ void im2col_kernel(const float *input, float *col,
+                               int C, int H, int W,
+                               int kH, int kW, int stride,
+                               int OH, int OW) {
+    int total = C * kH * kW * OH * OW;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int col_cols = OH * OW;
+    int col_row = idx / col_cols;
+    int col_col = idx % col_cols;
+
+    int kw_idx = col_row % kW;
+    int tmp = col_row / kW;
+    int kh_idx = tmp % kH;
+    int c = tmp / kH;
+
+    int oh = col_col / OW;
+    int ow = col_col % OW;
+
+    int h = oh * stride + kh_idx;
+    int w = ow * stride + kw_idx;
+
+    col[idx] = input[c * H * W + h * W + w];
+}
+
+extern "C" void launch_im2col(const float *input, float *col,
+                                int C, int H, int W,
+                                int kH, int kW, int stride,
+                                int OH, int OW) {
+    int total = C * kH * kW * OH * OW;
+    int threads = 256;
+    im2col_kernel<<<(total + threads - 1) / threads, threads>>>(
+        input, col, C, H, W, kH, kW, stride, OH, OW);
+}
+
+__global__ void col2im_kernel(const float *col, float *output,
+                               int C, int H, int W,
+                               int kH, int kW, int stride,
+                               int OH, int OW) {
+    int total = C * kH * kW * OH * OW;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int col_cols = OH * OW;
+    int col_row = idx / col_cols;
+    int col_col = idx % col_cols;
+
+    int kw_idx = col_row % kW;
+    int tmp = col_row / kW;
+    int kh_idx = tmp % kH;
+    int c = tmp / kH;
+
+    int oh = col_col / OW;
+    int ow = col_col % OW;
+
+    int h = oh * stride + kh_idx;
+    int w = ow * stride + kw_idx;
+
+    atomicAdd(&output[c * H * W + h * W + w], col[idx]);
+}
+
+extern "C" void launch_col2im(const float *col, float *output,
+                                int C, int H, int W,
+                                int kH, int kW, int stride,
+                                int OH, int OW) {
+    int total = C * kH * kW * OH * OW;
+    int threads = 256;
+    col2im_kernel<<<(total + threads - 1) / threads, threads>>>(
+        col, output, C, H, W, kH, kW, stride, OH, OW);
+}
+
+__global__ void avg_pool_forward_kernel(const float *input, float *output,
+                                         int C, int H, int W,
+                                         int pool_size, int OH, int OW) {
+    int total = C * OH * OW;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int ow = idx % OW;
+    int tmp = idx / OW;
+    int oh = tmp % OH;
+    int c = tmp / OH;
+
+    float scale = 1.0f / (pool_size * pool_size);
+    float sum = 0.0f;
+    for (int ph = 0; ph < pool_size; ph++) {
+        for (int pw = 0; pw < pool_size; pw++) {
+            int h = oh * pool_size + ph;
+            int w = ow * pool_size + pw;
+            sum += input[c * H * W + h * W + w];
+        }
+    }
+    output[idx] = sum * scale;
+}
+
+extern "C" void launch_avg_pool_forward(const float *input, float *output,
+                                          int C, int H, int W,
+                                          int pool_size, int OH, int OW) {
+    int total = C * OH * OW;
+    int threads = 256;
+    avg_pool_forward_kernel<<<(total + threads - 1) / threads, threads>>>(
+        input, output, C, H, W, pool_size, OH, OW);
+}
+
+__global__ void avg_pool_backward_kernel(const float *grad_output, float *grad_input,
+                                          int C, int H, int W,
+                                          int pool_size, int OH, int OW) {
+    int total = C * H * W;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int w = idx % W;
+    int tmp = idx / W;
+    int h = tmp % H;
+    int c = tmp / H;
+
+    int oh = h / pool_size;
+    int ow = w / pool_size;
+
+    if (oh < OH && ow < OW) {
+        float scale = 1.0f / (pool_size * pool_size);
+        grad_input[idx] = grad_output[c * OH * OW + oh * OW + ow] * scale;
+    }
+}
+
+extern "C" void launch_avg_pool_backward(const float *grad_output, float *grad_input,
+                                           int C, int H, int W,
+                                           int pool_size, int OH, int OW) {
+    int total = C * H * W;
+    int threads = 256;
+    avg_pool_backward_kernel<<<(total + threads - 1) / threads, threads>>>(
+        grad_output, grad_input, C, H, W, pool_size, OH, OW);
+}
+
+/* Add bias to [channels, spatial] matrix */
+__global__ void add_bias_kernel(float *x, const float *bias, int channels, int spatial) {
+    int total = channels * spatial;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total) {
+        int c = idx / spatial;
+        x[idx] += bias[c];
+    }
+}
+
+extern "C" void launch_add_bias(float *x, const float *bias, int channels, int spatial) {
+    int total = channels * spatial;
+    int threads = 256;
+    add_bias_kernel<<<(total + threads - 1) / threads, threads>>>(x, bias, channels, spatial);
+}
+
+/* Bias gradient for conv: sum spatial dims per channel */
+__global__ void bias_grad_kernel(const float *grad, float *grad_bias, int channels, int spatial) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    float sum = 0.0f;
+    const float *gc = grad + c * spatial;
+    for (int j = 0; j < spatial; j++)
+        sum += gc[j];
+    grad_bias[c] = sum;
+}
+
+extern "C" void launch_bias_grad(const float *grad, float *grad_bias, int channels, int spatial) {
+    int threads = 256;
+    bias_grad_kernel<<<(channels + threads - 1) / threads, threads>>>(grad, grad_bias, channels, spatial);
+}
+
+/* Copy flat from workspace */
+__global__ void copy_flat_kernel(const float *ws_all, float *flat,
+                                  int ws_size, int ws_pool2_offset,
+                                  int flat_size, int bs) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= bs * flat_size) return;
+    int b = idx / flat_size;
+    int j = idx % flat_size;
+    flat[idx] = ws_all[b * ws_size + ws_pool2_offset + j];
+}
+
+extern "C" void launch_copy_flat(const float *ws_all, float *flat,
+                                   int ws_size, int ws_pool2_offset,
+                                   int flat_size, int bs) {
+    int total = bs * flat_size;
+    int threads = 256;
+    copy_flat_kernel<<<(total + threads - 1) / threads, threads>>>(
+        ws_all, flat, ws_size, ws_pool2_offset, flat_size, bs);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Shared elementwise kernels (same as MLP crates)                   */
+/* ------------------------------------------------------------------ */
+
+__global__ void bias_relu_kernel(float *hidden, const float *bias, int total, int hid) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total) {
+        float v = hidden[idx] + bias[idx % hid];
+        hidden[idx] = (v > 0.0f) ? v : 0.0f;
+    }
+}
+
+extern "C" void launch_bias_relu(float *hidden, const float *bias, int total, int hid) {
+    int threads = 256;
+    bias_relu_kernel<<<(total + threads - 1) / threads, threads>>>(hidden, bias, total, hid);
+}
+
+__global__ void relu_forward_kernel(float *x, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n)
+        if (x[idx] < 0.0f) x[idx] = 0.0f;
+}
+
+extern "C" void launch_relu_forward(float *x, int n) {
+    int threads = 256;
+    relu_forward_kernel<<<(n + threads - 1) / threads, threads>>>(x, n);
+}
+
+__global__ void bias_softmax_kernel(float *output, const float *bias, int bs, int out) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= bs) return;
+    float *o = output + row * out;
+    float mx = -1e30f;
+    for (int j = 0; j < out; ++j) {
+        o[j] += bias[j];
+        if (o[j] > mx) mx = o[j];
+    }
+    float s = 0.0f;
+    for (int j = 0; j < out; ++j) {
+        o[j] = expf(o[j] - mx);
+        s += o[j];
+    }
+    for (int j = 0; j < out; ++j) o[j] /= s;
+}
+
+extern "C" void launch_bias_softmax(float *output, const float *bias, int bs, int out) {
+    int threads = 256;
+    bias_softmax_kernel<<<(bs + threads - 1) / threads, threads>>>(output, bias, bs, out);
+}
+
+__global__ void ce_grad_kernel(const float *output, const int *targets,
+                               float *d_output, float *losses, int bs, int out) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= bs) return;
+    const float *o = output + row * out;
+    float *d = d_output + row * out;
+    int t = targets[row];
+    losses[row] = -logf(o[t] + 1e-7f);
+    for (int j = 0; j < out; ++j)
+        d[j] = o[j] - ((t == j) ? 1.0f : 0.0f);
+}
+
+extern "C" void launch_ce_grad(const float *output, const int *targets,
+                                float *d_output, float *losses, int bs, int out) {
+    int threads = 256;
+    ce_grad_kernel<<<(bs + threads - 1) / threads, threads>>>(output, targets, d_output, losses, bs, out);
+}
+
+__global__ void relu_mask_kernel(float *d_hidden, const float *hidden, int total) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total)
+        if (hidden[idx] <= 0.0f) d_hidden[idx] = 0.0f;
+}
+
+extern "C" void launch_relu_mask(float *d_hidden, const float *hidden, int total) {
+    int threads = 256;
+    relu_mask_kernel<<<(total + threads - 1) / threads, threads>>>(d_hidden, hidden, total);
+}
+
+__global__ void col_sum_kernel(const float *mat, float *out_vec, int rows, int cols) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= cols) return;
+    float s = 0.0f;
+    for (int i = 0; i < rows; ++i)
+        s += mat[i * cols + j];
+    out_vec[j] = s;
+}
+
+extern "C" void launch_col_sum(const float *mat, float *out_vec, int rows, int cols) {
+    int threads = 256;
+    col_sum_kernel<<<(cols + threads - 1) / threads, threads>>>(mat, out_vec, rows, cols);
+}
+
+__global__ void sgd_kernel(float *param, const float *grad, float lr, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) param[idx] -= lr * grad[idx];
+}
+
+extern "C" void launch_sgd(float *param, const float *grad, float lr, int n) {
+    int threads = 256;
+    sgd_kernel<<<(n + threads - 1) / threads, threads>>>(param, grad, lr, n);
+}
+
+__global__ void reduce_sum_kernel(const float *arr, float *result, int n) {
+    extern __shared__ float sdata[];
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    sdata[tid] = (idx < n) ? arr[idx] : 0.0f;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) atomicAdd(result, sdata[0]);
+}
+
+extern "C" void launch_reduce_sum(const float *arr, float *result, int n) {
+    int threads = 256;
+    reduce_sum_kernel<<<(n + threads - 1) / threads, threads, threads * sizeof(float)>>>(arr, result, n);
+}
+
+__global__ void init_weights_kernel(float *weights, int size, float scale, unsigned long seed) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        curandState state;
+        curand_init(seed, idx, 0, &state);
+        weights[idx] = (curand_uniform(&state) * 2.0f - 1.0f) * scale;
+    }
+}
+
+extern "C" void launch_init_weights(float *weights, int size, float scale, unsigned long seed) {
+    int threads = 256;
+    init_weights_kernel<<<(size + threads - 1) / threads, threads>>>(weights, size, scale, seed);
+}
+
+__global__ void eval_metrics_kernel(const float *output, const int *targets,
+                                    float *losses, int *correct, int bs, int out) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= bs) return;
+    const float *o = output + row * out;
+    int t = targets[row];
+    losses[row] = -logf(o[t] + 1e-7f);
+    int pred = 0;
+    float mx = o[0];
+    for (int j = 1; j < out; ++j) {
+        if (o[j] > mx) { mx = o[j]; pred = j; }
+    }
+    if (pred == t) atomicAdd(correct, 1);
+}
+
+extern "C" void launch_eval_metrics(const float *output, const int *targets,
+                                     float *losses, int *correct, int bs, int out) {
+    int threads = 256;
+    eval_metrics_kernel<<<(bs + threads - 1) / threads, threads>>>(output, targets, losses, correct, bs, out);
+}

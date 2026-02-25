@@ -5,5 +5,7 @@ members = [
     "mlp-cuda-cublas",
     "mlp-cuda-kernels",
     "cnn-cpu",
+    "cnn-cuda-cublas",
+    "cnn-cuda-kernels",
 ]
 resolver = "2"
