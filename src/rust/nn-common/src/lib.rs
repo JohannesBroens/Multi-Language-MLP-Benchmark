@@ -557,24 +557,27 @@ pub fn sgemm_nn(m: usize, n: usize, k: usize, a: &[f32], b: &[f32], c: &mut [f32
             }
         }
     } else {
-        for val in c[..m * n].iter_mut() { *val = 0.0; }
+        c[..m * n].fill(0.0);
 
         if flops > OMP_FLOP_THRESHOLD {
-            let num_i_tiles = (m + TILE - 1) / TILE;
-            let tiles: Vec<usize> = (0..num_i_tiles).collect();
-            tiles.into_par_iter().for_each(|it| {
+            // Split output rows into TILE-sized chunks for parallel processing.
+            // Each chunk gets exclusive &mut access, enabling autovectorization
+            // (equivalent to C's restrict pointer guarantee).
+            c[..m * n].par_chunks_mut(TILE * n).enumerate().for_each(|(it, c_chunk)| {
                 let i0 = it * TILE;
                 let imax = (i0 + TILE).min(m);
-                let c_ptr = c.as_ptr() as *mut f32;
+                let chunk_rows = imax - i0;
                 for k0 in (0..k).step_by(TILE) {
                     let kmax = (k0 + TILE).min(k);
                     for j0 in (0..n).step_by(TILE) {
                         let jmax = (j0 + TILE).min(n);
-                        for i in i0..imax {
+                        for ii in 0..chunk_rows {
+                            let ci = &mut c_chunk[ii * n..];
                             for kk in k0..kmax {
-                                let a_ik = a[i * k + kk];
+                                let a_ik = a[(i0 + ii) * k + kk];
+                                let bk = &b[kk * n..];
                                 for j in j0..jmax {
-                                    unsafe { *c_ptr.add(i * n + j) += a_ik * b[kk * n + j]; }
+                                    ci[j] += a_ik * bk[j];
                                 }
                             }
                         }
