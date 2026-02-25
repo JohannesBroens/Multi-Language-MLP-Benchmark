@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
@@ -47,7 +47,7 @@ pub struct Args {
 
 fn print_usage(prog: &str) {
     eprintln!(
-        "Usage: {} --dataset [generated|iris|wine-red|wine-white|breast-cancer]",
+        "Usage: {} --dataset [generated|iris|wine-red|wine-white|breast-cancer|mnist]",
         prog
     );
     eprintln!("  --batch-size N    Mini-batch size (default: 32)");
@@ -420,6 +420,62 @@ pub fn shuffle_data(
     }
 }
 
+/// Read big-endian u32 from a reader.
+fn read_be_u32(reader: &mut impl Read) -> u32 {
+    let mut buf = [0u8; 4];
+    reader.read_exact(&mut buf).expect("Failed to read IDX header");
+    u32::from_be_bytes(buf)
+}
+
+/// Load MNIST handwritten digits (IDX binary format).
+/// Pixel values normalized to [0, 1].
+/// If is_test is true, loads the 10K test set instead of the 60K training set.
+pub fn load_mnist_data(is_test: bool) -> Dataset {
+    let img_path = if is_test { "data/t10k-images-idx3-ubyte" } else { "data/train-images-idx3-ubyte" };
+    let lbl_path = if is_test { "data/t10k-labels-idx1-ubyte" } else { "data/train-labels-idx1-ubyte" };
+
+    // Read images
+    let mut fimg = File::open(img_path).unwrap_or_else(|e| {
+        eprintln!("Cannot open {}: {}", img_path, e);
+        std::process::exit(1);
+    });
+
+    let magic = read_be_u32(&mut fimg);
+    assert_eq!(magic, 2051, "Invalid MNIST image file magic number");
+
+    let n = read_be_u32(&mut fimg) as usize;
+    let rows = read_be_u32(&mut fimg) as usize;
+    let cols = read_be_u32(&mut fimg) as usize;
+    let pixels = rows * cols;
+
+    let mut img_buf = vec![0u8; n * pixels];
+    fimg.read_exact(&mut img_buf).expect("Failed to read MNIST image data");
+
+    let inputs: Vec<f32> = img_buf.iter().map(|&b| b as f32 / 255.0).collect();
+
+    // Read labels
+    let mut flbl = File::open(lbl_path).unwrap_or_else(|e| {
+        eprintln!("Cannot open {}: {}", lbl_path, e);
+        std::process::exit(1);
+    });
+
+    let _magic = read_be_u32(&mut flbl);
+    let _count = read_be_u32(&mut flbl);
+
+    let mut lbl_buf = vec![0u8; n];
+    flbl.read_exact(&mut lbl_buf).expect("Failed to read MNIST label data");
+
+    let labels: Vec<i32> = lbl_buf.iter().map(|&b| b as i32).collect();
+
+    Dataset {
+        inputs,
+        labels,
+        num_samples: n,
+        input_size: pixels,
+        output_size: 10,
+    }
+}
+
 /// Dispatch to the right loader based on dataset name.
 pub fn load_dataset(args: &Args) -> Dataset {
     match args.dataset.as_str() {
@@ -428,6 +484,7 @@ pub fn load_dataset(args: &Args) -> Dataset {
         "wine-red" => load_wine_data("data/winequality-red.csv"),
         "wine-white" => load_wine_data("data/winequality-white.csv"),
         "breast-cancer" => load_breast_cancer_data(),
+        "mnist" => load_mnist_data(false),
         other => {
             eprintln!("Unknown dataset: {}", other);
             std::process::exit(1);

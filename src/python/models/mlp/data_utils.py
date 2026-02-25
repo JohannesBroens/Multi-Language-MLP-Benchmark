@@ -5,6 +5,7 @@ same train/test split logic for fair benchmark comparisons.
 """
 
 import os
+import struct
 import sys
 import numpy as np
 
@@ -32,6 +33,8 @@ def load_dataset(name, data_dir="data", num_samples=0):
         return load_wine_quality_data(os.path.join(data_dir, "winequality-white.csv"))
     elif name == "breast-cancer":
         return load_breast_cancer_data(data_dir)
+    elif name == "mnist":
+        return load_mnist_data(data_dir)
     else:
         print(f"Unknown dataset: {name}", file=sys.stderr)
         sys.exit(1)
@@ -97,6 +100,28 @@ def load_breast_cancer_data(data_dir="data"):
     X = np.array(X_list, dtype=np.float32)
     y = np.array(y_list, dtype=np.int32)
     return X, y, 2
+
+
+def load_mnist_data(data_dir="data", is_test=False):
+    """Load MNIST IDX binary format. Returns (X, y, 10).
+
+    Reads the IDX binary format directly -- no external dependencies needed.
+    Pixel values normalized to [0, 1] by dividing by 255.
+    """
+    prefix = "t10k" if is_test else "train"
+    img_path = os.path.join(data_dir, f"{prefix}-images-idx3-ubyte")
+    lbl_path = os.path.join(data_dir, f"{prefix}-labels-idx1-ubyte")
+
+    with open(img_path, "rb") as f:
+        magic, n, rows, cols = struct.unpack(">IIII", f.read(16))
+        X = np.frombuffer(f.read(n * rows * cols), dtype=np.uint8)
+        X = X.reshape(n, rows * cols).astype(np.float32) / 255.0
+
+    with open(lbl_path, "rb") as f:
+        magic, n = struct.unpack(">II", f.read(8))
+        y = np.frombuffer(f.read(n), dtype=np.uint8).astype(np.int32)
+
+    return X, y, 10
 
 
 def normalize_features(X):

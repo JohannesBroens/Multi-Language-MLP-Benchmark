@@ -7,6 +7,69 @@
 
 #define MAX_LINE_LENGTH 1024
 
+/* Read big-endian 32-bit integer from file */
+static int read_be_int32(FILE *f) {
+    unsigned char buf[4];
+    if (fread(buf, 1, 4, f) != 4) return -1;
+    return (buf[0] << 24) | (buf[1] << 16) | (buf[2] << 8) | buf[3];
+}
+
+int load_mnist_data(float **inputs, int **labels, int *num_samples,
+                    int *input_size, int *output_size, int is_test) {
+    const char *img_path = is_test ? "data/t10k-images-idx3-ubyte"
+                                    : "data/train-images-idx3-ubyte";
+    const char *lbl_path = is_test ? "data/t10k-labels-idx1-ubyte"
+                                    : "data/train-labels-idx1-ubyte";
+
+    /* Read images */
+    FILE *fimg = fopen(img_path, "rb");
+    if (!fimg) { fprintf(stderr, "Cannot open %s\n", img_path); return -1; }
+
+    int magic = read_be_int32(fimg);
+    if (magic != 2051) { fclose(fimg); return -1; }
+
+    int n = read_be_int32(fimg);
+    int rows = read_be_int32(fimg);
+    int cols = read_be_int32(fimg);
+    int pixels = rows * cols;  /* 784 */
+
+    *inputs = (float *)malloc(n * pixels * sizeof(float));
+    if (!*inputs) { fclose(fimg); return -1; }
+
+    /* Read pixels and normalize to [0, 1] */
+    unsigned char *buf = (unsigned char *)malloc(n * pixels);
+    if (!buf) { free(*inputs); fclose(fimg); return -1; }
+    fread(buf, 1, n * pixels, fimg);
+    fclose(fimg);
+
+    for (int i = 0; i < n * pixels; i++)
+        (*inputs)[i] = buf[i] / 255.0f;
+    free(buf);
+
+    /* Read labels */
+    FILE *flbl = fopen(lbl_path, "rb");
+    if (!flbl) { free(*inputs); return -1; }
+
+    read_be_int32(flbl); /* magic */
+    read_be_int32(flbl); /* count */
+
+    *labels = (int *)malloc(n * sizeof(int));
+    if (!*labels) { free(*inputs); fclose(flbl); return -1; }
+
+    unsigned char *lbuf = (unsigned char *)malloc(n);
+    fread(lbuf, 1, n, flbl);
+    fclose(flbl);
+
+    for (int i = 0; i < n; i++)
+        (*labels)[i] = (int)lbuf[i];
+    free(lbuf);
+
+    *num_samples = n;
+    *input_size = pixels;
+    *output_size = 10;
+    return 0;
+}
+
 /*
  * Generate synthetic 2D circle classification data.
  * Points in [-1, 1]^2; label 1 if inside circle of radius 0.5, else 0.

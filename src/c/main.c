@@ -7,7 +7,7 @@
 #include "data_loader.h"
 
 static void print_usage(const char *prog) {
-    printf("Usage: %s --dataset [generated|iris|wine-red|wine-white|breast-cancer]\n", prog);
+    printf("Usage: %s --dataset [generated|iris|wine-red|wine-white|breast-cancer|mnist]\n", prog);
     printf("  --batch-size N    Mini-batch size (default: 32)\n");
     printf("  --num-samples N   Number of samples for generated dataset (default: 1000)\n");
     printf("  --hidden-size N   Hidden layer size (default: 64)\n");
@@ -110,6 +110,8 @@ int main(int argc, char *argv[]) {
         err = load_wine_quality_data(&inputs, &labels, &num_samples, &input_size, &output_size, "data/winequality-white.csv");
     } else if (strcmp(dataset_name, "breast-cancer") == 0) {
         err = load_breast_cancer_data(&inputs, &labels, &num_samples, &input_size, &output_size);
+    } else if (strcmp(dataset_name, "mnist") == 0) {
+        err = load_mnist_data(&inputs, &labels, &num_samples, &input_size, &output_size, 0);
     } else {
         fprintf(stderr, "Unknown dataset: %s\n", dataset_name);
         print_usage(argv[0]);
@@ -124,7 +126,9 @@ int main(int argc, char *argv[]) {
     printf("Dataset: %s  (%d samples, %d features, %d classes)\n",
            dataset_name, num_samples, input_size, output_size);
 
-    normalize_features(inputs, num_samples, input_size);
+    /* Skip z-score normalization for MNIST (pixels already [0,1]) */
+    if (strcmp(dataset_name, "mnist") != 0)
+        normalize_features(inputs, num_samples, input_size);
 
     /* Shuffle then split 80/20 — test set is a pointer offset (zero-copy) */
     srand((unsigned int)time(NULL));

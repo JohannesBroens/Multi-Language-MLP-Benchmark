@@ -25,6 +25,12 @@ int load_wine_quality_data(float **inputs, int **labels, int *num_samples, int *
 /* Wisconsin Breast Cancer Diagnostic (data/wdbc.data — 30 features, 2 classes) */
 int load_breast_cancer_data(float **inputs, int **labels, int *num_samples, int *input_size, int *output_size);
 
+/* MNIST handwritten digits (data/train-images-idx3-ubyte — 60K images, 28x28, 10 classes)
+ * Reads IDX binary format. Pixel values normalized to [0, 1].
+ * If is_test != 0, loads the 10K test set instead. */
+int load_mnist_data(float **inputs, int **labels, int *num_samples,
+                    int *input_size, int *output_size, int is_test);
+
 #ifdef __cplusplus
 }
 #endif
