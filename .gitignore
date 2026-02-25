@@ -35,8 +35,7 @@ main
 losses.txt
 test_loss.txt
 
-# Ignore generated benchmark figures (keep figs/ directory via .gitkeep)
-figs/*.png
+# Ignore non-PNG benchmark figures
 figs/*.jpg
 figs/*.svg
 figs/*.pdf

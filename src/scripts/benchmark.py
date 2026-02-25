@@ -109,7 +109,7 @@ def is_available(label):
 
 
 def run_implementation(label, cmd_template, dataset, batch_size=32,
-                       num_samples=0, hidden_size=64, epochs=1000):
+                       num_samples=0, hidden_size=512, epochs=1000):
     """Run a single implementation and parse its output."""
     cmd = (cmd_template
            .replace("{dataset}", dataset)
@@ -273,7 +273,7 @@ def _collect_throughput(available, runs, vary_param, vary_values, fixed_params):
                     label, cmd_template, "generated",
                     batch_size=params.get("batch_size", 2048),
                     num_samples=params.get("num_samples", 100000),
-                    hidden_size=params.get("hidden_size", 64),
+                    hidden_size=params.get("hidden_size", 512),
                     epochs=params.get("epochs", 500),
                 )
                 if r and "throughput" in r:
@@ -613,10 +613,10 @@ def main():
     parser.add_argument("--runs", type=int, default=1)
 
     # Scaling parameters -- all power-of-2 by default
-    parser.add_argument("--scaling-epochs", type=int, default=500)
-    parser.add_argument("--scaling-fixed-bs", type=int, default=2048)
-    parser.add_argument("--scaling-fixed-ns", type=int, default=131072,
-                        help="Fixed num_samples (default: 2^17 = 131072)")
+    parser.add_argument("--scaling-epochs", type=int, default=200)
+    parser.add_argument("--scaling-fixed-bs", type=int, default=4096)
+    parser.add_argument("--scaling-fixed-ns", type=int, default=262144,
+                        help="Fixed num_samples (default: 2^18 = 262144)")
     parser.add_argument("--scaling-dataset-sizes", type=str, default=None,
                         help="Comma-separated (default: 2^12..2^20)")
     parser.add_argument("--scaling-batch-sizes", type=str, default=None,
@@ -638,13 +638,13 @@ def main():
             "fixed_num_samples": args.scaling_fixed_ns,
             "dataset_sizes": ([int(x) for x in args.scaling_dataset_sizes.split(",")]
                               if args.scaling_dataset_sizes
-                              else [2**n for n in range(12, 21)]),     # 4K .. 1M
+                              else [2**n for n in range(13, 23)]),     # 8K .. 4M
             "batch_sizes": ([int(x) for x in args.scaling_batch_sizes.split(",")]
                             if args.scaling_batch_sizes
-                            else [2**n for n in range(7, 15)]),        # 128 .. 16384
+                            else [2**n for n in range(8, 16)]),        # 256 .. 32K
             "hidden_sizes": ([int(x) for x in args.scaling_hidden_sizes.split(",")]
                              if args.scaling_hidden_sizes
-                             else [2**n for n in range(5, 11)]),       # 32 .. 1024
+                             else [2**n for n in range(6, 13)]),       # 64 .. 4096
         }
         run_scaling_experiment(available, args.runs, figs_dir, cfg)
     else:
