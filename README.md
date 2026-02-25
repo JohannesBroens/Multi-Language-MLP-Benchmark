@@ -1,6 +1,6 @@
-# ML Language Playground: Multi-Language MLP Benchmark
+# ML Language Playground: Multi-Language Neural Network Benchmark
 
-A multi-language machine learning benchmark comparing MLP (Multi-Layer Perceptron) implementations across C, Rust, and Python. The same algorithm is implemented identically in 8 variants spanning CPU and GPU backends to measure throughput scaling across dataset sizes, batch sizes, and hidden layer widths.
+A multi-language machine learning benchmark comparing neural network implementations across C, Rust, and Python. Two model families --- MLP and CNN (LeNet-5) --- are each implemented identically in 8 variants spanning CPU and GPU backends to measure throughput scaling.
 
 ## MLP Architecture
 
@@ -26,7 +26,36 @@ A multi-language machine learning benchmark comparing MLP (Multi-Layer Perceptro
 | PyTorch (CPU) | `src/python/models/mlp/mlp_pytorch.py` | nn.Module with manual Xavier init to match C, CPU backend |
 | PyTorch (CUDA) | `src/python/models/mlp/mlp_pytorch.py` | Same PyTorch model on GPU via `--device cuda` |
 
-All 8 implementations produce identical standardized output for benchmark parsing, including throughput in samples/s.
+All 8 MLP implementations produce identical standardized output for benchmark parsing, including throughput in samples/s.
+
+## CNN Architecture (LeNet-5)
+
+| Component | Choice | Rationale |
+|-----------|--------|-----------|
+| Conv1 | 1->6 channels, 5x5 kernel | Classic LeNet-5 first layer for edge/texture detection |
+| Conv2 | 6->16 channels, 5x5 kernel | Learns higher-level feature combinations |
+| Pooling | 2x2 average pooling (stride 2) | Spatial downsampling, matches original LeNet-5 |
+| Convolution method | im2col + GEMM | Converts convolution to matrix multiply, reuses optimized tiled GEMM |
+| FC layers | 256->120->84->10 | Standard LeNet-5 classifier (16x4x4 = 256 after two pool layers) |
+| Activations | ReLU (all layers) | Modern replacement for LeNet-5's original sigmoid/tanh |
+| Output | Softmax + Cross-entropy | Same as MLP for consistent loss computation |
+| Initialization | Xavier uniform | Same sqrt(2/fan_in) scale as MLP, adapted for conv fan_in = C_in x kH x kW |
+| Optimizer | Mini-batch SGD (lr=0.01) | Identical to MLP for fair comparison |
+
+### CNN Implementations
+
+| Implementation | File | Description |
+|---------------|------|-------------|
+| C (CPU) | `src/c/models/cnn/cnn_cpu.c` | im2col + OpenMP-parallelized tiled GEMM, shared nn_ops library |
+| C (CUDA) | `src/c/models/cnn/cnn.cu` | GPU im2col + cuBLAS GEMM, custom elementwise CUDA kernels |
+| Rust (CPU) | `src/rust/cnn-cpu/src/main.rs` | im2col + Rayon threadpool with cache-tiled GEMM (TILE=64) |
+| Rust (cuBLAS) | `src/rust/cnn-cuda-cublas/src/main.rs` | cuBLAS GEMM + custom CUDA kernels for conv/pool/activations |
+| Rust (CUDA Kernels) | `src/rust/cnn-cuda-kernels/src/main.rs` | All custom CUDA kernels including shared-memory tiled matmul |
+| NumPy (CPU) | `src/python/models/cnn/cnn_numpy.py` | Vectorized im2col + NumPy matmul, manual backprop |
+| PyTorch (CPU) | `src/python/models/cnn/cnn_pytorch.py` | nn.Module with manual Xavier init, CPU backend |
+| PyTorch (CUDA) | `src/python/models/cnn/cnn_pytorch.py` | Same model on GPU via `--device cuda` |
+
+All CNN implementations train on MNIST (60K training / 10K test, 28x28 grayscale digits, 10 classes).
 
 ## Datasets
 
@@ -37,6 +66,7 @@ All 8 implementations produce identical standardized output for benchmark parsin
 | `wine-red` | 1599 | 11 | 11 | UCI Wine Quality (red) |
 | `wine-white` | 4898 | 11 | 11 | UCI Wine Quality (white) |
 | `breast-cancer` | 569 | 30 | 2 | Wisconsin Diagnostic Breast Cancer |
+| `mnist` | 70,000 | 784 (28x28) | 10 | Handwritten digits (CNN only) |
 
 ## Quick Start
 
@@ -110,16 +140,29 @@ python3 src/python/models/mlp/mlp_pytorch.py --dataset iris --device cpu
 
 # PyTorch (CUDA)
 python3 src/python/models/mlp/mlp_pytorch.py --dataset iris --device cuda
+
+# --- CNN (LeNet-5 on MNIST) ---
+# C (CPU)
+./src/c/build_cpu/cnn_main --dataset mnist
+
+# Rust (CPU)
+./src/rust/target/release/cnn-cpu --dataset mnist
+
+# PyTorch (CUDA)
+python3 src/python/models/cnn/cnn_pytorch.py --dataset mnist --device cuda
 ```
 
 ### Run Benchmarks
 
 ```bash
-# Standard mode: accuracy + train time on real datasets
+# MLP: standard mode — accuracy + train time on real datasets
 python3 src/scripts/benchmark.py --mode standard --datasets generated,iris,breast-cancer --runs 3
 
-# Scaling mode: throughput vs dataset size, batch size, and hidden size
+# MLP: scaling mode — throughput vs dataset size, batch size, and hidden size
 python3 src/scripts/benchmark.py --mode scaling --runs 1
+
+# CNN: scaling mode — throughput vs batch size on MNIST
+python3 src/scripts/benchmark.py --mode scaling --model cnn --runs 1
 ```
 
 ## Scaling Benchmark Analysis
@@ -208,28 +251,36 @@ ML-in-C/
 │   ├── c/
 │   │   ├── CMakeLists.txt         # Top-level CMake config
 │   │   ├── data_loader.c/.h       # Dataset loaders (C)
-│   │   ├── main.c                 # CLI entry point: load, normalize, train, evaluate
-│   │   └── models/mlp/
-│   │       ├── CMakeLists.txt     # MLP library build config
-│   │       ├── mlp.h              # Shared interface and hyperparameters
-│   │       ├── mlp_cpu.c          # CPU implementation (OpenMP)
-│   │       └── mlp.cu             # CUDA implementation
+│   │   ├── main.c                 # MLP CLI entry point
+│   │   ├── cnn_main.c             # CNN CLI entry point
+│   │   ├── nn_ops/                # Shared neural network operations
+│   │   │   ├── nn_ops.h           # GEMM, activations, loss, softmax interface
+│   │   │   ├── nn_ops_cpu.c       # CPU implementations (OpenMP)
+│   │   │   └── nn_ops.cu          # CUDA implementations
+│   │   ├── models/mlp/            # MLP model (mlp.h, mlp_cpu.c, mlp.cu)
+│   │   └── models/cnn/            # CNN model (cnn.h, cnn_cpu.c, cnn.cu)
 │   ├── rust/
 │   │   ├── Cargo.toml             # Workspace root
-│   │   ├── mlp-common/            # Shared data loading, CLI, normalization
-│   │   ├── mlp-cpu/               # CPU: Rayon + tiled GEMM
-│   │   ├── mlp-cuda-cublas/       # GPU: cuBLAS FFI + custom CUDA kernels
-│   │   └── mlp-cuda-kernels/      # GPU: all custom CUDA kernels (no cuBLAS)
+│   │   ├── nn-common/             # Shared data loading, CLI, normalization
+│   │   ├── mlp-cpu/               # MLP CPU: Rayon + tiled GEMM
+│   │   ├── mlp-cuda-cublas/       # MLP GPU: cuBLAS FFI + custom CUDA kernels
+│   │   ├── mlp-cuda-kernels/      # MLP GPU: all custom CUDA kernels
+│   │   ├── cnn-cpu/               # CNN CPU: im2col + Rayon tiled GEMM
+│   │   ├── cnn-cuda-cublas/       # CNN GPU: cuBLAS GEMM + CUDA kernels
+│   │   └── cnn-cuda-kernels/      # CNN GPU: all custom CUDA kernels
 │   ├── python/
 │   │   ├── models/mlp/
 │   │   │   ├── data_utils.py      # Shared data loading (mirrors C data_loader)
-│   │   │   ├── mlp_numpy.py       # NumPy implementation
-│   │   │   └── mlp_pytorch.py     # PyTorch implementation (CPU + CUDA)
+│   │   │   ├── mlp_numpy.py       # NumPy MLP implementation
+│   │   │   └── mlp_pytorch.py     # PyTorch MLP (CPU + CUDA)
+│   │   ├── models/cnn/
+│   │   │   ├── cnn_numpy.py       # NumPy CNN with im2col
+│   │   │   └── cnn_pytorch.py     # PyTorch CNN (CPU + CUDA)
 │   │   └── setup.py
 │   └── scripts/
-│       ├── benchmark.py           # Benchmark runner (standard + scaling modes)
+│       ├── benchmark.py           # Benchmark runner (MLP + CNN, standard + scaling)
 │       ├── tune_benchmark.py      # OMP threshold tuning script
-│       ├── download_datasets.sh   # Download UCI datasets
+│       ├── download_datasets.sh   # Download UCI + MNIST datasets
 │       ├── preprocess_iris.py     # Preprocess Iris data
 │       └── run_pipeline.sh        # Full pipeline (download + build + run)
 ├── mathematical_foundations.md    # Math derivations for the MLP algorithm
