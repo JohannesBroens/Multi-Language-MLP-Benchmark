@@ -22,7 +22,16 @@ import os
 import re
 import subprocess
 import sys
+import time
+import warnings
 from collections import defaultdict
+
+# Suppress sklearn GP convergence warnings (noisy with few data points)
+try:
+    from sklearn.exceptions import ConvergenceWarning
+    warnings.filterwarnings("ignore", category=ConvergenceWarning)
+except ImportError:
+    pass
 
 import numpy as np
 
@@ -136,14 +145,38 @@ CNN_SPEEDUP_PAIRS = [
 CACHE_FILE = os.path.join(PROJECT_ROOT, "figs", "benchmark_cache.json")
 
 
+def _migrate_cache_entry(value):
+    """Migrate a legacy cache value (bare float or None) to the new format.
+
+    New format: {"samples": [val], "wall_times": []}
+    If already in new format, return as-is.
+    """
+    if isinstance(value, dict) and "samples" in value:
+        return value
+    # Legacy format: bare float or None
+    if value is None:
+        return {"samples": [], "wall_times": []}
+    return {"samples": [value], "wall_times": []}
+
+
 def _load_cache():
-    """Load cached benchmark results from JSON."""
+    """Load cached benchmark results from JSON, migrating legacy entries."""
     if os.path.isfile(CACHE_FILE):
         try:
             with open(CACHE_FILE, "r") as f:
-                return json.load(f)
+                raw = json.load(f)
         except (json.JSONDecodeError, IOError):
-            pass
+            return {}
+        # Walk the cache and migrate any legacy float entries
+        for exp_key, exp_data in raw.items():
+            if not isinstance(exp_data, dict):
+                continue
+            for label, label_data in exp_data.items():
+                if not isinstance(label_data, dict):
+                    continue
+                for val_str, entry in label_data.items():
+                    label_data[val_str] = _migrate_cache_entry(entry)
+        return raw
     return {}
 
 
@@ -310,14 +343,107 @@ def _format_x_samples(ax):
     ax.xaxis.set_major_formatter(ticker.FuncFormatter(fmt))
 
 
-def _plot_throughput(ax, xs, throughput_data, available_labels, title, xlabel):
-    """Plot throughput lines with implementation-specific styling."""
+def _fit_gp(cache, cache_key, label, x_values=None):
+    """Fit a Gaussian Process in log-log space for a single implementation.
+
+    Returns (x_dense, y_mean, y_lower, y_upper, x_obs, y_obs_mean) or None
+    if fewer than 2 data points are available.
+
+    Works in log2 for x, log10 for y.
+    """
+    try:
+        from sklearn.gaussian_process import GaussianProcessRegressor
+        from sklearn.gaussian_process.kernels import ConstantKernel, RBF, WhiteKernel
+    except ImportError:
+        return None
+
+    if cache is None or cache_key is None:
+        return None
+
+    exp_data = cache.get(cache_key, {}).get(label, {})
+    if not exp_data:
+        return None
+
+    # Collect all raw samples per x value
+    x_obs_list = []
+    y_obs_means = []
+    x_all = []
+    y_all = []
+    for val_str, entry in sorted(exp_data.items(), key=lambda kv: float(kv[0])):
+        samples = entry.get("samples", [])
+        if not samples:
+            continue
+        x_val = float(val_str)
+        mean_val = float(np.mean(samples))
+        if mean_val <= 0 or x_val <= 0:
+            continue
+        x_obs_list.append(x_val)
+        y_obs_means.append(mean_val)
+        for s in samples:
+            if s > 0:
+                x_all.append(np.log2(x_val))
+                y_all.append(np.log10(s))
+
+    if len(x_obs_list) < 2:
+        return None
+
+    X_train = np.array(x_all).reshape(-1, 1)
+    y_train = np.array(y_all)
+
+    kernel = ConstantKernel(1.0) * RBF(length_scale=1.0) + WhiteKernel(noise_level=0.1)
+    gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=3, alpha=1e-6)
+    try:
+        gp.fit(X_train, y_train)
+    except Exception:
+        return None
+
+    # Dense prediction grid
+    x_log_min = np.log2(min(x_obs_list))
+    x_log_max = np.log2(max(x_obs_list))
+    X_dense_log = np.linspace(x_log_min, x_log_max, 200).reshape(-1, 1)
+    y_pred, y_std = gp.predict(X_dense_log, return_std=True)
+
+    x_dense = 2 ** X_dense_log.ravel()
+    y_mean = 10 ** y_pred
+    y_lower = 10 ** (y_pred - 1.96 * y_std)
+    y_upper = 10 ** (y_pred + 1.96 * y_std)
+
+    return (x_dense, y_mean, y_lower, y_upper,
+            np.array(x_obs_list), np.array(y_obs_means))
+
+
+def _plot_throughput(ax, xs, throughput_data, available_labels, title, xlabel,
+                     cache=None, cache_key=None):
+    """Plot throughput lines with implementation-specific styling.
+
+    When cache/cache_key are provided, attempts GP regression for smooth curves
+    with confidence bands. Falls back to direct line plot if GP fails.
+    """
     for label in available_labels:
         vals = throughput_data.get(label, [])
         xf = [xs[i] for i, v in enumerate(vals) if v is not None]
         yf = [v for v in vals if v is not None]
-        if yf:
-            s = IMPL_STYLES.get(label, {"color": "gray", "marker": ".", "linewidth": 1.5, "markersize": 6, "zorder": 1})
+        if not yf:
+            continue
+
+        s = IMPL_STYLES.get(label, {"color": "gray", "marker": ".", "linewidth": 1.5, "markersize": 6, "zorder": 1})
+
+        gp_result = _fit_gp(cache, cache_key, label) if cache is not None else None
+
+        if gp_result is not None:
+            x_dense, y_mean, y_lower, y_upper, x_obs, y_obs_mean = gp_result
+            # Smooth GP curve
+            ax.plot(x_dense, y_mean, color=s["color"],
+                    linewidth=s["linewidth"], zorder=s["zorder"], label=label)
+            # Confidence band
+            ax.fill_between(x_dense, y_lower, y_upper,
+                            color=s["color"], alpha=0.15, zorder=s["zorder"] - 1)
+            # Scatter for observed means
+            ax.scatter(x_obs, y_obs_mean, marker=s["marker"], color=s["color"],
+                       s=s["markersize"] ** 2, edgecolors="white", linewidths=0.8,
+                       zorder=s["zorder"] + 1)
+        else:
+            # Fallback: direct line plot
             ax.plot(xf, yf, marker=s["marker"], color=s["color"],
                     linewidth=s["linewidth"], markersize=s["markersize"],
                     zorder=s["zorder"], label=label)
@@ -332,6 +458,103 @@ def _plot_throughput(ax, xs, throughput_data, available_labels, title, xlabel):
     _ranked_legend(ax, throughput_data, available_labels)
 
 
+def _speedup_with_ci(cache, cache_key, gpu_label, cpu_label):
+    """Compute speedup with confidence interval using separate GP fits.
+
+    Returns (x_points, speedup_mean, speedup_lower, speedup_upper) or None.
+    Speedup = 10^(gpu_log_mean - cpu_log_mean).
+    CI via diff_std = sqrt(gpu_std^2 + cpu_std^2).
+    """
+    try:
+        from sklearn.gaussian_process import GaussianProcessRegressor
+        from sklearn.gaussian_process.kernels import ConstantKernel, RBF, WhiteKernel
+    except ImportError:
+        return None
+
+    if cache is None or cache_key is None:
+        return None
+
+    gpu_data = cache.get(cache_key, {}).get(gpu_label, {})
+    cpu_data = cache.get(cache_key, {}).get(cpu_label, {})
+    if not gpu_data or not cpu_data:
+        return None
+
+    def _build_training_data(impl_data):
+        x_all, y_all = [], []
+        for val_str, entry in impl_data.items():
+            samples = entry.get("samples", [])
+            x_val = float(val_str)
+            if x_val <= 0:
+                continue
+            for s in samples:
+                if s > 0:
+                    x_all.append(np.log2(x_val))
+                    y_all.append(np.log10(s))
+        return np.array(x_all), np.array(y_all)
+
+    X_gpu, y_gpu = _build_training_data(gpu_data)
+    X_cpu, y_cpu = _build_training_data(cpu_data)
+    if len(X_gpu) < 2 or len(X_cpu) < 2:
+        return None
+
+    kernel = ConstantKernel(1.0) * RBF(length_scale=1.0) + WhiteKernel(noise_level=0.1)
+
+    gp_gpu = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=3, alpha=1e-6)
+    gp_cpu = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=3, alpha=1e-6)
+    try:
+        gp_gpu.fit(X_gpu.reshape(-1, 1), y_gpu)
+        gp_cpu.fit(X_cpu.reshape(-1, 1), y_cpu)
+    except Exception:
+        return None
+
+    # Common x range: intersection of both domains
+    x_min = max(X_gpu.min(), X_cpu.min())
+    x_max = min(X_gpu.max(), X_cpu.max())
+    if x_min >= x_max:
+        return None
+
+    X_dense = np.linspace(x_min, x_max, 200).reshape(-1, 1)
+    gpu_mean, gpu_std = gp_gpu.predict(X_dense, return_std=True)
+    cpu_mean, cpu_std = gp_cpu.predict(X_dense, return_std=True)
+
+    # Speedup in log10 space: log10(speedup) = gpu_log - cpu_log
+    diff_mean = gpu_mean - cpu_mean
+    diff_std = np.sqrt(gpu_std ** 2 + cpu_std ** 2)
+
+    x_points = 2 ** X_dense.ravel()
+    speedup_mean = 10 ** diff_mean
+    speedup_lower = 10 ** (diff_mean - 1.96 * diff_std)
+    speedup_upper = 10 ** (diff_mean + 1.96 * diff_std)
+
+    return x_points, speedup_mean, speedup_lower, speedup_upper
+
+
+# ---------------------------------------------------------------------------
+#  Cache-to-throughput reconstruction
+# ---------------------------------------------------------------------------
+
+def _reconstruct_throughput(cache, cache_key, x_values, labels):
+    """Rebuild {label: [mean_or_None]} from cache for plotting.
+
+    For each label and x_value, computes the mean of cached samples,
+    or None if no samples exist.
+    """
+    throughput = {label: [] for label in labels}
+    exp_data = cache.get(cache_key, {}) if cache else {}
+
+    for val in x_values:
+        val_str = str(val)
+        for label in labels:
+            entry = exp_data.get(label, {}).get(val_str, {})
+            samples = entry.get("samples", []) if isinstance(entry, dict) else []
+            if samples:
+                throughput[label].append(float(np.mean(samples)))
+            else:
+                throughput[label].append(None)
+
+    return throughput
+
+
 # ---------------------------------------------------------------------------
 #  Data collection helper
 # ---------------------------------------------------------------------------
@@ -340,8 +563,9 @@ def _collect_throughput(available, runs, vary_param, vary_values, fixed_params,
                         cache=None, cache_key=None):
     """Run benchmarks varying one parameter, return {label: [throughputs]}.
 
-    If cache is provided, skip implementations/values that already have cached
-    results. New results are merged into cache in-place.
+    Cache format per entry: {"samples": [float, ...], "wall_times": [float, ...]}
+    If cache is provided, cached entries are used (mean of samples). New runs
+    append to the cache entry rather than overwriting.
     """
     labels = [l for l, _ in available]
     throughput = {l: [] for l in labels}
@@ -360,15 +584,32 @@ def _collect_throughput(available, runs, vary_param, vary_values, fixed_params,
         for label, cmd_template in available:
             # Check cache first
             if label in cached_exp and val_str in cached_exp[label]:
-                tp = cached_exp[label][val_str]
-                print(f"  {label}... cached ({tp:.0f} samples/s)" if tp else f"  {label}... cached (None)")
-                throughput[label].append(tp)
-                continue
+                entry = cached_exp[label][val_str]
+                samples = entry.get("samples", [])
+                if samples:
+                    mean_tp = float(np.mean(samples))
+                    n = len(samples)
+                    cv = float(np.std(samples) / mean_tp * 100) if n > 1 and mean_tp > 0 else 0.0
+                    # Converged: CV < 3% with at least 3 samples — skip
+                    if n >= 3 and cv < 3.0:
+                        print(f"  {label}... converged ({mean_tp:.0f} samples/s, n={n}, CV={cv:.1f}%)")
+                        throughput[label].append(mean_tp)
+                        continue
+                    # Not converged — use cached mean for throughput but fall through to re-run
+                    cv_str = f", CV={cv:.1f}%" if n > 1 else ""
+                    print(f"  {label}... n={n}{cv_str}, running again...")
+                    # Fall through to run more samples
+                else:
+                    print(f"  {label}... cached (None)")
+                    throughput[label].append(None)
+                    continue
 
             runs_tp = []
+            wall_times = []
             for run_idx in range(runs):
                 tag = f" (run {run_idx+1}/{runs})" if runs > 1 else ""
                 print(f"  {label}{tag}...")
+                t0 = time.monotonic()
                 r = run_implementation(
                     label, cmd_template, "generated",
                     batch_size=params.get("batch_size", 2048),
@@ -376,20 +617,165 @@ def _collect_throughput(available, runs, vary_param, vary_values, fixed_params,
                     hidden_size=params.get("hidden_size", 512),
                     epochs=params.get("epochs", 500),
                 )
+                elapsed = time.monotonic() - t0
                 if r and "throughput" in r:
                     runs_tp.append(r["throughput"])
+                    wall_times.append(elapsed)
+
             result = float(np.mean(runs_tp)) if runs_tp else None
             throughput[label].append(result)
 
-            # Store in cache
+            # Store in cache (append, not overwrite)
             if cache is not None and cache_key is not None:
                 if cache_key not in cache:
                     cache[cache_key] = {}
                 if label not in cache[cache_key]:
                     cache[cache_key][label] = {}
-                cache[cache_key][label][val_str] = result
+                if val_str not in cache[cache_key][label]:
+                    cache[cache_key][label][val_str] = {"samples": [], "wall_times": []}
+                cache[cache_key][label][val_str]["samples"].extend(runs_tp)
+                cache[cache_key][label][val_str]["wall_times"].extend(wall_times)
+                # Print CV info
+                all_samples = cache[cache_key][label][val_str]["samples"]
+                n = len(all_samples)
+                if n > 1 and result and result > 0:
+                    cv = float(np.std(all_samples) / np.mean(all_samples) * 100)
+                    print(f"    -> stored n={n}, CV={cv:.1f}%")
+                elif n > 0:
+                    print(f"    -> stored n={n}")
+
+        # Save cache after each x_value completes (ctrl-C safe)
+        if cache is not None and cache_key is not None:
+            _save_cache(cache)
 
     return throughput
+
+
+# ---------------------------------------------------------------------------
+#  Variance-weighted scheduler
+# ---------------------------------------------------------------------------
+
+def _build_schedule(cache, experiments, available, budget_seconds):
+    """Build a greedy schedule of runs prioritized by CV / sqrt(n).
+
+    Args:
+        cache: the loaded cache dict
+        experiments: list of (cache_key, vary_param, vary_values, fixed_params)
+        available: list of (label, cmd_template)
+        budget_seconds: total wall-time budget
+
+    Returns list of dicts with keys:
+        label, cmd_template, params, cache_key, val_str, est_wall
+    """
+    # Gather all (impl, x_value) configs with priority scores
+    candidates = []
+    for cache_key, vary_param, vary_values, fixed_params in experiments:
+        exp_data = cache.get(cache_key, {})
+        for label, cmd_template in available:
+            for val in vary_values:
+                val_str = str(val)
+                entry = exp_data.get(label, {}).get(val_str, {})
+                samples = entry.get("samples", []) if isinstance(entry, dict) else []
+                wall_times = entry.get("wall_times", []) if isinstance(entry, dict) else []
+                n = len(samples)
+                mean_tp = float(np.mean(samples)) if samples else 0.0
+
+                # Skip converged configs (CV < 3%)
+                if n >= 2 and mean_tp > 0:
+                    cv = float(np.std(samples) / mean_tp * 100)
+                    if cv < 3.0:
+                        continue
+                    priority = cv / np.sqrt(n)
+                elif n == 0:
+                    priority = float("inf")
+                else:
+                    # n=1, no CV yet — high priority
+                    priority = 100.0
+
+                # Estimate wall time from past runs, or default 60s
+                est_wall = float(np.mean(wall_times)) if wall_times else 60.0
+
+                params = dict(fixed_params)
+                params[vary_param] = val
+
+                candidates.append({
+                    "label": label,
+                    "cmd_template": cmd_template,
+                    "params": params,
+                    "cache_key": cache_key,
+                    "val_str": val_str,
+                    "est_wall": est_wall,
+                    "priority": priority,
+                })
+
+    # Sort by priority descending (highest priority first)
+    candidates.sort(key=lambda c: c["priority"], reverse=True)
+
+    # Greedy fill within budget
+    schedule = []
+    remaining = budget_seconds
+    for c in candidates:
+        if c["est_wall"] <= remaining:
+            schedule.append(c)
+            remaining -= c["est_wall"]
+        if remaining <= 0:
+            break
+
+    return schedule
+
+
+def _run_scheduled(schedule, cache):
+    """Execute scheduled runs, appending results to cache after each run.
+
+    Args:
+        schedule: list of schedule items from _build_schedule
+        cache: the cache dict (modified in-place)
+    """
+    total = len(schedule)
+    for idx, item in enumerate(schedule, 1):
+        label = item["label"]
+        params = item["params"]
+        cache_key = item["cache_key"]
+        val_str = item["val_str"]
+
+        # Current stats
+        entry = cache.get(cache_key, {}).get(label, {}).get(val_str, {})
+        n_before = len(entry.get("samples", []) if isinstance(entry, dict) else [])
+
+        print(f"\n  [{idx}/{total}] {label} {val_str} (n={n_before})...")
+
+        t0 = time.monotonic()
+        r = run_implementation(
+            label, item["cmd_template"], "generated",
+            batch_size=params.get("batch_size", 2048),
+            num_samples=params.get("num_samples", 100000),
+            hidden_size=params.get("hidden_size", 512),
+            epochs=params.get("epochs", 500),
+        )
+        elapsed = time.monotonic() - t0
+
+        if r and "throughput" in r:
+            tp = r["throughput"]
+            # Ensure cache structure exists
+            if cache_key not in cache:
+                cache[cache_key] = {}
+            if label not in cache[cache_key]:
+                cache[cache_key][label] = {}
+            if val_str not in cache[cache_key][label]:
+                cache[cache_key][label][val_str] = {"samples": [], "wall_times": []}
+            cache[cache_key][label][val_str]["samples"].append(tp)
+            cache[cache_key][label][val_str]["wall_times"].append(elapsed)
+
+            all_samples = cache[cache_key][label][val_str]["samples"]
+            n = len(all_samples)
+            mean_tp = float(np.mean(all_samples))
+            cv = float(np.std(all_samples) / mean_tp * 100) if n > 1 and mean_tp > 0 else 0.0
+            print(f"    -> {tp:.0f} samples/s, n={n}, CV={cv:.1f}%")
+        else:
+            print(f"    -> FAILED")
+
+        # Save cache after every run (ctrl-C safe)
+        _save_cache(cache)
 
 
 # ---------------------------------------------------------------------------
@@ -423,9 +809,101 @@ def run_scaling_experiment(available, runs, figs_dir, cfg, model="mlp",
 
     epochs = cfg["epochs"]
     labels = [l for l, _ in available]
+    budget_seconds = cfg.get("budget_seconds", None)
+
+    # ================================================================
+    #  Budget mode: variance-weighted scheduler
+    # ================================================================
+    if budget_seconds is not None:
+        print(f"\n  Budget mode: {budget_seconds}s wall-time budget")
+        print("=" * 70)
+
+        # Build experiment descriptors
+        budget_experiments = []
+        if model == "cnn":
+            batch_sizes = cfg.get("batch_sizes", [2**n for n in range(4, 11)])
+            budget_experiments.append((
+                _cache_key(model, "batch_size"), "batch_size", batch_sizes,
+                {"epochs": epochs}))
+        else:
+            dataset_sizes = cfg["dataset_sizes"]
+            batch_sizes = cfg["batch_sizes"]
+            hidden_sizes = cfg["hidden_sizes"]
+            fixed_bs = cfg["fixed_batch_size"]
+            fixed_ns = cfg["fixed_num_samples"]
+
+            budget_experiments.append((
+                _cache_key(model, "dataset_size"), "num_samples", dataset_sizes,
+                {"batch_size": fixed_bs, "epochs": epochs}))
+            budget_experiments.append((
+                _cache_key(model, "batch_size"), "batch_size", batch_sizes,
+                {"num_samples": fixed_ns, "epochs": epochs}))
+            budget_experiments.append((
+                _cache_key(model, "hidden_size"), "hidden_size", hidden_sizes,
+                {"num_samples": fixed_ns, "batch_size": fixed_bs, "epochs": epochs}))
+
+        schedule = _build_schedule(cache, budget_experiments, available, budget_seconds)
+        print(f"  Scheduled {len(schedule)} runs (est. {sum(s['est_wall'] for s in schedule):.0f}s)")
+        _run_scheduled(schedule, cache)
+
+        # Reconstruct throughput for plotting
+        if model == "cnn":
+            tp_ds = None
+            tp_hs = None
+            tp_bs = _reconstruct_throughput(
+                cache, _cache_key(model, "batch_size"), batch_sizes, labels)
+            dataset_sizes = batch_sizes
+            fixed_bs = batch_sizes[-1]
+            fixed_ns = 60000
+        else:
+            tp_ds = _reconstruct_throughput(
+                cache, _cache_key(model, "dataset_size"), dataset_sizes, labels)
+            tp_bs = _reconstruct_throughput(
+                cache, _cache_key(model, "batch_size"), batch_sizes, labels)
+            tp_hs = _reconstruct_throughput(
+                cache, _cache_key(model, "hidden_size"), hidden_sizes, labels)
+
+        # Jump to plotting (skip the normal collection flow)
+        # -- individual throughput plots --
+        if tp_ds is not None:
+            fig, ax = plt.subplots(figsize=(12, 7))
+            _plot_throughput(ax, dataset_sizes, tp_ds, labels,
+                             f"Throughput vs Dataset Size\nbatch_size={fixed_bs}, epochs={epochs}",
+                             "Dataset Size (samples)",
+                             cache=cache, cache_key=_cache_key(model, "dataset_size"))
+            _format_x_samples(ax)
+            plt.tight_layout()
+            p = os.path.join(figs_dir, f"{file_prefix}scaling_dataset_size.png")
+            plt.savefig(p); plt.close()
+            print(f"\nSaved: {p}")
+
+        fig, ax = plt.subplots(figsize=(12, 7))
+        bs_title = (f"{prefix}Throughput vs Batch Size\nMNIST (60K samples), epochs={epochs}"
+                     if model == "cnn"
+                     else f"Throughput vs Batch Size\nnum_samples={fixed_ns:,}, epochs={epochs}")
+        _plot_throughput(ax, batch_sizes, tp_bs, labels, bs_title, "Batch Size",
+                         cache=cache, cache_key=_cache_key(model, "batch_size"))
+        plt.tight_layout()
+        p = os.path.join(figs_dir, f"{file_prefix}scaling_batch_size.png")
+        plt.savefig(p); plt.close()
+        print(f"\nSaved: {p}")
+
+        if tp_hs is not None:
+            fig, ax = plt.subplots(figsize=(12, 7))
+            _plot_throughput(ax, hidden_sizes, tp_hs, labels,
+                             f"Throughput vs Hidden Layer Size\nsamples={fixed_ns:,}, batch={fixed_bs}, epochs={epochs}",
+                             "Hidden Size",
+                             cache=cache, cache_key=_cache_key(model, "hidden_size"))
+            plt.tight_layout()
+            p = os.path.join(figs_dir, f"{file_prefix}scaling_hidden_size.png")
+            plt.savefig(p); plt.close()
+            print(f"\nSaved: {p}")
+
+        # Fall through to speedup plots, overview, and summary below
+        # (they use tp_ds, tp_bs, tp_hs which are now set)
 
     # For CNN, only batch size scaling makes sense (fixed MNIST dataset, fixed architecture)
-    if model == "cnn":
+    elif model == "cnn":
         batch_sizes = cfg.get("batch_sizes", [2**n for n in range(4, 11)])  # 16 .. 1024
         tp_ds = None
         tp_hs = None
@@ -442,7 +920,8 @@ def run_scaling_experiment(available, runs, figs_dir, cfg, model="mlp",
         fig, ax = plt.subplots(figsize=(12, 7))
         _plot_throughput(ax, batch_sizes, tp_bs, labels,
                          f"{prefix}Throughput vs Batch Size\nMNIST (60K samples), epochs={epochs}",
-                         "Batch Size")
+                         "Batch Size",
+                         cache=cache, cache_key=_cache_key(model, "batch_size"))
         plt.tight_layout()
         p = os.path.join(figs_dir, f"{file_prefix}scaling_batch_size.png")
         plt.savefig(p)
@@ -473,7 +952,8 @@ def run_scaling_experiment(available, runs, figs_dir, cfg, model="mlp",
         fig, ax = plt.subplots(figsize=(12, 7))
         _plot_throughput(ax, dataset_sizes, tp_ds, labels,
                          f"Throughput vs Dataset Size\nbatch_size={fixed_bs}, epochs={epochs}",
-                         "Dataset Size (samples)")
+                         "Dataset Size (samples)",
+                         cache=cache, cache_key=_cache_key(model, "dataset_size"))
         _format_x_samples(ax)
         plt.tight_layout()
         p = os.path.join(figs_dir, f"{file_prefix}scaling_dataset_size.png")
@@ -499,7 +979,8 @@ def run_scaling_experiment(available, runs, figs_dir, cfg, model="mlp",
         fig, ax = plt.subplots(figsize=(12, 7))
         _plot_throughput(ax, batch_sizes, tp_bs, labels,
                          f"Throughput vs Batch Size\nnum_samples={fixed_ns:,}, epochs={epochs}",
-                         "Batch Size")
+                         "Batch Size",
+                         cache=cache, cache_key=_cache_key(model, "batch_size"))
         plt.tight_layout()
         p = os.path.join(figs_dir, f"{file_prefix}scaling_batch_size.png")
         plt.savefig(p)
@@ -523,7 +1004,8 @@ def run_scaling_experiment(available, runs, figs_dir, cfg, model="mlp",
         fig, ax = plt.subplots(figsize=(12, 7))
         _plot_throughput(ax, hidden_sizes, tp_hs, labels,
                          f"Throughput vs Hidden Layer Size\nsamples={fixed_ns:,}, batch={fixed_bs}, epochs={epochs}",
-                         "Hidden Size")
+                         "Hidden Size",
+                         cache=cache, cache_key=_cache_key(model, "hidden_size"))
         plt.tight_layout()
         p = os.path.join(figs_dir, f"{file_prefix}scaling_hidden_size.png")
         plt.savefig(p)
@@ -547,6 +1029,7 @@ def run_scaling_experiment(available, runs, figs_dir, cfg, model="mlp",
 
     for exp_name, xs, tp_data, xlabel, use_sample_fmt in experiments:
         fig, ax = plt.subplots(figsize=(12, 7))
+        sp_cache_key = _cache_key(model, exp_name)
 
         any_plotted = False
         for gpu_label, cpu_label, color, legend_name in speedup_pairs:
@@ -555,12 +1038,24 @@ def run_scaling_experiment(available, runs, figs_dir, cfg, model="mlp",
             if not gpu_vals or not cpu_vals:
                 continue
 
+            # Raw ratios for scatter overlay
             xf, yf = [], []
             for i in range(min(len(gpu_vals), len(cpu_vals))):
                 if gpu_vals[i] is not None and cpu_vals[i] is not None and cpu_vals[i] > 0:
                     xf.append(xs[i])
                     yf.append(gpu_vals[i] / cpu_vals[i])
-            if yf:
+
+            # Try GP-based speedup with CI
+            sp_result = _speedup_with_ci(cache, sp_cache_key, gpu_label, cpu_label) if cache else None
+
+            if sp_result is not None and yf:
+                x_pts, sp_mean, sp_lower, sp_upper = sp_result
+                ax.plot(x_pts, sp_mean, color=color, linewidth=2.5, label=legend_name)
+                ax.fill_between(x_pts, sp_lower, sp_upper, color=color, alpha=0.15)
+                ax.scatter(xf, yf, color=color, marker="o", s=64,
+                           edgecolors="white", linewidths=0.8, zorder=10)
+                any_plotted = True
+            elif yf:
                 ax.plot(xf, yf, marker="o", color=color, linewidth=2.5,
                         markersize=8, label=legend_name)
                 any_plotted = True
@@ -606,7 +1101,8 @@ def run_scaling_experiment(available, runs, figs_dir, cfg, model="mlp",
         fig, axes = plt.subplots(1, 2, figsize=(18, 7))
 
         _plot_throughput(axes[0], batch_sizes, tp_bs, labels,
-                         "Batch Size Scaling (MNIST)", "Batch Size")
+                         "Batch Size Scaling (MNIST)", "Batch Size",
+                         cache=cache, cache_key=_cache_key(model, "batch_size"))
 
         for gpu_label, cpu_label, color, legend_name in speedup_pairs[:3]:
             gpu_vals = tp_bs.get(gpu_label, [])
@@ -636,14 +1132,17 @@ def run_scaling_experiment(available, runs, figs_dir, cfg, model="mlp",
         fig, axes = plt.subplots(2, 2, figsize=(18, 14))
 
         _plot_throughput(axes[0, 0], dataset_sizes, tp_ds, labels,
-                         f"Dataset Size Scaling (batch={fixed_bs})", "Dataset Size")
+                         f"Dataset Size Scaling (batch={fixed_bs})", "Dataset Size",
+                         cache=cache, cache_key=_cache_key(model, "dataset_size"))
         _format_x_samples(axes[0, 0])
 
         _plot_throughput(axes[0, 1], batch_sizes, tp_bs, labels,
-                         f"Batch Size Scaling (samples={fixed_ns:,})", "Batch Size")
+                         f"Batch Size Scaling (samples={fixed_ns:,})", "Batch Size",
+                         cache=cache, cache_key=_cache_key(model, "batch_size"))
 
         _plot_throughput(axes[1, 0], hidden_sizes, tp_hs, labels,
-                         f"Hidden Size Scaling (batch={fixed_bs})", "Hidden Size")
+                         f"Hidden Size Scaling (batch={fixed_bs})", "Hidden Size",
+                         cache=cache, cache_key=_cache_key(model, "hidden_size"))
 
         for gpu_label, cpu_label, color, legend_name in speedup_pairs[:3]:
             gpu_vals = tp_hs.get(gpu_label, [])
@@ -817,6 +1316,9 @@ def main():
     parser.add_argument("--datasets", default="generated,iris,breast-cancer",
                         help="Comma-separated dataset names (standard mode, MLP only)")
     parser.add_argument("--runs", type=int, default=1)
+    parser.add_argument("--budget", type=int, default=None, metavar="MINUTES",
+                        help="Time budget in minutes for variance-weighted scheduling "
+                             "(scaling mode only, mutually exclusive with --runs > 1)")
     parser.add_argument("--no-cache", action="store_true",
                         help="Disable result caching (re-run everything)")
 
@@ -833,6 +1335,9 @@ def main():
                         help="Comma-separated (default: 2^5..2^10)")
     args = parser.parse_args()
 
+    if args.budget is not None and args.runs > 1:
+        parser.error("--budget and --runs > 1 are mutually exclusive")
+
     figs_dir = os.path.join(PROJECT_ROOT, "figs")
 
     # Select implementation list based on model
@@ -841,7 +1346,10 @@ def main():
     print(f"Model: {args.model.upper()}")
     print(f"Available implementations: {[l for l, _ in available]}")
     print(f"Mode: {args.mode}")
-    print(f"Runs per config: {args.runs}")
+    if args.budget is not None:
+        print(f"Budget: {args.budget}s (variance-weighted scheduling)")
+    else:
+        print(f"Runs per config: {args.runs}")
     if not args.no_cache:
         print(f"Cache: {CACHE_FILE}")
     print()
@@ -870,6 +1378,8 @@ def main():
                                  if args.scaling_hidden_sizes
                                  else [2**n for n in range(6, 13)]),       # 64 .. 4096
             }
+        if args.budget is not None:
+            cfg["budget_seconds"] = args.budget * 60 if args.budget else None
         run_scaling_experiment(available, args.runs, figs_dir, cfg,
                                model=args.model, use_cache=not args.no_cache)
     else:
