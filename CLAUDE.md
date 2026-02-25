@@ -60,7 +60,11 @@ python3 src/python/models/mlp/mlp_pytorch.py --dataset <name> --device cpu|cuda
 
 ### Run Benchmark
 ```bash
-python3 src/scripts/benchmark.py --datasets generated,iris,breast-cancer --runs 3
+# Standard mode: accuracy + timing on real datasets
+python3 src/scripts/benchmark.py --mode standard --datasets generated,iris,breast-cancer --runs 3
+
+# Scaling mode: throughput scaling (dataset size, batch size, hidden size)
+python3 src/scripts/benchmark.py --mode scaling --runs 1
 ```
 
 ### Full Pipeline (download data, preprocess, build, run)
@@ -101,6 +105,8 @@ Cargo workspace at `src/rust/` with a shared `mlp-common` crate (data loading, C
 Single hidden layer with ReLU activation, softmax output with cross-entropy loss. Xavier weight initialization: `Uniform(-sqrt(2/fan_in), sqrt(2/fan_in))`. Mini-batch SGD with gradient averaging (`lr_scaled = lr / batch_size`).
 
 **Hyperparameters** are defined as macros in `mlp.h` (`NUM_EPOCHS=1000`, `LEARNING_RATE=0.01`). Hidden size (64) and batch size (32) are set in `main.c` and matched in Python scripts.
+
+**Scaling benchmark defaults:** hidden_size=512 (fixed), batch_size=4096 (fixed), num_samples=262144 (fixed), epochs=200. Dataset sizes 8K-4M, batch sizes 256-32K, hidden sizes 64-4096.
 
 ### Output Format
 
