@@ -1,0 +1,11 @@
+[package]
+name = "cnn-cpu"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "cnn-cpu"
+path = "src/main.rs"
+
+[dependencies]
+nn-common = { path = "../nn-common" }
