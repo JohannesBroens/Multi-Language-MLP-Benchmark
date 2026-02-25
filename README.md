@@ -72,45 +72,20 @@ All CNN implementations train on MNIST (60K training / 10K test, 28x28 grayscale
 
 ### Prerequisites
 
-- **C**: GCC (C99), CMake 3.10+, optionally CUDA Toolkit and OpenMP
-- **Rust**: Cargo (2021 edition), optionally CUDA Toolkit for GPU crates
-- **Python**: Python 3.8+, NumPy, matplotlib
-- **Optional**: PyTorch (for `mlp_pytorch.py`)
+- **C**: GCC (C99), CMake 3.10+, OpenMP
+- **CUDA**: NVIDIA CUDA Toolkit (for GPU implementations in C and Rust)
+- **Rust**: Cargo (2021 edition)
+- **Python**: Python 3.8+, NumPy, matplotlib, PyTorch
 
-### Install Python Dependencies
+### Build Everything
 
-```bash
-pip install -r requirements.txt
-```
-
-### Download and Preprocess Datasets
+The build script detects available toolchains and builds all possible targets:
 
 ```bash
-bash src/scripts/download_datasets.sh
-python3 src/scripts/preprocess_iris.py
+./build.sh
 ```
 
-### Build C
-
-```bash
-# CPU with OpenMP
-cd src/c && mkdir -p build_cpu && cd build_cpu
-cmake .. -DUSE_CUDA=OFF && make
-
-# CUDA
-cd src/c && mkdir -p build_cuda && cd build_cuda
-cmake .. -DUSE_CUDA=ON && make
-```
-
-### Build Rust
-
-```bash
-# All targets (CPU + cuBLAS + CUDA Kernels)
-cd src/rust && cargo build --release
-
-# CPU only (no CUDA needed)
-cd src/rust && cargo build --release -p mlp-cpu
-```
+This downloads datasets, installs Python dependencies, and builds all C, Rust, and CUDA targets. Targets whose toolchains are missing are skipped with a warning.
 
 ### Run Individual Implementations
 
@@ -283,9 +258,9 @@ ML-in-C/
 │       ├── download_datasets.sh   # Download UCI + MNIST datasets
 │       ├── preprocess_iris.py     # Preprocess Iris data
 │       └── run_pipeline.sh        # Full pipeline (download + build + run)
+├── build.sh                       # One-command build (detects toolchains)
 ├── mathematical_foundations.md    # Math derivations for the MLP algorithm
 ├── requirements.txt               # Python dependencies
-├── CLAUDE.md                      # AI assistant instructions
 ├── LICENSE                        # Apache 2.0
 └── README.md
 ```
