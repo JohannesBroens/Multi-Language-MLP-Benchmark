@@ -439,7 +439,7 @@ def _plot_throughput(ax, xs, throughput_data, available_labels, title, xlabel,
                     linewidth=s["linewidth"], zorder=s["zorder"], label=label)
             # Confidence band
             ax.fill_between(x_dense, y_lower, y_upper,
-                            color=s["color"], alpha=0.08, zorder=s["zorder"] - 1)
+                            color=s["color"], alpha=0.18, zorder=s["zorder"] - 1)
             # Scatter for observed means
             ax.scatter(x_obs, y_obs_mean, marker=s["marker"], color=s["color"],
                        s=s["markersize"] ** 2, edgecolors="white", linewidths=0.8,
@@ -1156,7 +1156,7 @@ def run_scaling_experiment(available, runs, figs_dir, cfg, model="mlp",
             if sp_result is not None:
                 x_pts, sp_mean, sp_lower, sp_upper = sp_result
                 ax.plot(x_pts, sp_mean, color=color, linewidth=2.5, label=legend_name)
-                ax.fill_between(x_pts, sp_lower, sp_upper, color=color, alpha=0.10)
+                ax.fill_between(x_pts, sp_lower, sp_upper, color=color, alpha=0.20)
                 if yf:
                     ax.scatter(xf, yf, color=color, marker="o", s=64,
                                edgecolors="white", linewidths=0.8, zorder=10)
@@ -1210,18 +1210,13 @@ def run_scaling_experiment(available, runs, figs_dir, cfg, model="mlp",
                          "Batch Size Scaling (MNIST)", "Batch Size",
                          cache=cache, cache_key=_cache_key(model, "batch_size"))
 
+        bs_cache_key = _cache_key(model, "batch_size")
         for gpu_label, cpu_label, color, legend_name in speedup_pairs[:3]:
-            gpu_vals = tp_bs.get(gpu_label, [])
-            cpu_vals = tp_bs.get(cpu_label, [])
-            if not gpu_vals or not cpu_vals:
-                continue
-            xf, yf = [], []
-            for i in range(min(len(gpu_vals), len(cpu_vals))):
-                if gpu_vals[i] and cpu_vals[i] and cpu_vals[i] > 0:
-                    xf.append(batch_sizes[i])
-                    yf.append(gpu_vals[i] / cpu_vals[i])
-            if yf:
-                axes[1].plot(xf, yf, marker="o", color=color, linewidth=2.5, markersize=8, label=legend_name)
+            sp_result = _speedup_with_ci(cache, bs_cache_key, gpu_label, cpu_label) if cache else None
+            if sp_result is not None:
+                x_pts, sp_mean, sp_lower, sp_upper = sp_result
+                axes[1].plot(x_pts, sp_mean, color=color, linewidth=2.5, label=legend_name)
+                axes[1].fill_between(x_pts, sp_lower, sp_upper, color=color, alpha=0.15)
 
         axes[1].axhline(y=1.0, color="#e74c3c", linestyle="--", alpha=0.7, linewidth=1.5)
         axes[1].set_xscale("log", base=2)
@@ -1229,7 +1224,9 @@ def run_scaling_experiment(available, runs, figs_dir, cfg, model="mlp",
         axes[1].set_ylabel("Speedup (x)")
         axes[1].set_title("GPU Speedup vs Batch Size", fontweight="bold")
         axes[1].grid(True, which="both", alpha=0.3)
-        axes[1].legend(loc="best")
+        handles, leg_labels = axes[1].get_legend_handles_labels()
+        if handles:
+            axes[1].legend(loc="best")
 
         fig.suptitle("CNN Benchmark: GPU Scaling Analysis (LeNet-5 / MNIST)",
                       fontsize=18, fontweight="bold", y=0.98)
@@ -1257,18 +1254,13 @@ def run_scaling_experiment(available, runs, figs_dir, cfg, model="mlp",
                              f"Hidden Size Scaling (batch={fixed_bs})", "Hidden Size",
                              cache=cache, cache_key=_cache_key(model, "hidden_size"))
 
+            hs_cache_key = _cache_key(model, "hidden_size")
             for gpu_label, cpu_label, color, legend_name in speedup_pairs[:3]:
-                gpu_vals = tp_hs.get(gpu_label, [])
-                cpu_vals = tp_hs.get(cpu_label, [])
-                if not gpu_vals or not cpu_vals:
-                    continue
-                xf, yf = [], []
-                for i in range(min(len(gpu_vals), len(cpu_vals))):
-                    if gpu_vals[i] and cpu_vals[i] and cpu_vals[i] > 0:
-                        xf.append(hidden_sizes[i])
-                        yf.append(gpu_vals[i] / cpu_vals[i])
-                if yf:
-                    axes[1, 1].plot(xf, yf, marker="o", color=color, linewidth=2.5, markersize=8, label=legend_name)
+                sp_result = _speedup_with_ci(cache, hs_cache_key, gpu_label, cpu_label) if cache else None
+                if sp_result is not None:
+                    x_pts, sp_mean, sp_lower, sp_upper = sp_result
+                    axes[1, 1].plot(x_pts, sp_mean, color=color, linewidth=2.5, label=legend_name)
+                    axes[1, 1].fill_between(x_pts, sp_lower, sp_upper, color=color, alpha=0.15)
 
             axes[1, 1].axhline(y=1.0, color="#e74c3c", linestyle="--", alpha=0.7, linewidth=1.5)
             axes[1, 1].set_xscale("log", base=2)

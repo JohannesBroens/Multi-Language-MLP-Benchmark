@@ -136,21 +136,30 @@ python3 src/scripts/benchmark.py --mode standard --datasets generated,iris,breas
 # MLP: scaling mode — throughput vs dataset size, batch size, and hidden size
 python3 src/scripts/benchmark.py --mode scaling --runs 1
 
+# MLP: budget mode — accumulate benchmark samples with variance-weighted scheduling
+# Runs can be repeated; results accumulate in figs/benchmark_cache.json
+python3 src/scripts/benchmark.py --mode scaling --budget 60   # 60 minutes
+
+# Replot from cached data without running any benchmarks
+python3 src/scripts/benchmark.py --mode scaling --budget 0
+
 # CNN: scaling mode — throughput vs batch size on MNIST
 python3 src/scripts/benchmark.py --mode scaling --model cnn --runs 1
 ```
 
 ## Scaling Benchmark Analysis
 
-All measurements were collected on an NVIDIA RTX 3070 (46 SMs, 5888 CUDA cores, 8 GB GDDR6) paired with an Intel Core i9-10900F (10 cores, 20 threads, 2.80 GHz). The benchmark sweeps three independent axes --- dataset size, mini-batch size, and hidden-layer width --- while holding the other two fixed. Each configuration trains the full MLP for 200 epochs and reports end-to-end throughput in samples per second. Implementations that exceeded the 600-second timeout at extreme scales are shown as missing data points. Run `python3 src/scripts/benchmark.py --mode scaling` to regenerate all plots.
+All measurements were collected on an NVIDIA RTX 3070 (46 SMs, 5888 CUDA cores, 8 GB GDDR6) paired with an Intel Core i9-10900F (10 cores, 20 threads, 2.80 GHz). The benchmark sweeps three independent axes --- dataset size, mini-batch size, and hidden-layer width --- while holding the other two fixed. Each configuration trains the full MLP for 200 epochs and reports end-to-end throughput in samples per second.
+
+Throughput curves are fitted using Gaussian Process regression in log-log space, with 95% confidence bands derived from the GP posterior. Data points are sampled from continuous log-uniform distributions (not a fixed grid) using a gap-filling strategy that ensures even coverage. Results accumulate across runs via `--budget`, and the variance-weighted scheduler prioritizes under-sampled regions. Run `python3 src/scripts/benchmark.py --mode scaling --budget 60` to extend the dataset, or `--budget 0` to replot from cache.
 
 ### Peak Throughput Summary
 
-| Experiment | Rust (cuBLAS) | C (CUDA) | PyTorch (CUDA) | Rust (Kernels) | C (CPU) | PyTorch (CPU) | NumPy | Rust (CPU) |
+| Experiment | C (CUDA) | Rust (cuBLAS) | PyTorch (CUDA) | Rust (Kernels) | C (CPU) | PyTorch (CPU) | NumPy | Rust (CPU) |
 |---|---|---|---|---|---|---|---|---|
-| Dataset Size | **9.99M** | 9.73M | 6.11M | 5.45M | 650K | 516K | 380K | 472K |
-| Batch Size | 10.24M | 10.19M | **13.00M** | 6.28M | 1.04M | 1.24M | 1.04M | 711K |
-| Hidden Size | **15.58M** | 15.52M | 6.82M | 11.41M | 6.81M | 4.45M | 4.73M | 4.00M |
+| Dataset Size | **9.90M** | 9.89M | 6.94M | 5.46M | 1.30M | 1.18M | 749K | 865K |
+| Batch Size | 9.77M | 10.08M | **12.76M** | 6.52M | 1.15M | 1.52M | 1.06M | 762K |
+| Hidden Size | 13.48M | **14.22M** | 6.19M | 10.41M | 3.89M | 3.66M | 4.34M | 3.61M |
 
 ---
 
@@ -160,15 +169,13 @@ Fixed parameters: batch\_size = 4096, hidden\_size = 512, epochs = 200.
 
 ![Throughput vs Dataset Size](figs/scaling_dataset_size.png)
 
-The dataset-size sweep shows that throughput is largely independent of dataset size for both CPU and GPU implementations. Both tiers maintain roughly constant throughput across two orders of magnitude (8K to 4M samples). The GPU implementations --- Rust cuBLAS, C CUDA, PyTorch CUDA, and Rust CUDA Kernels --- sustain approximately 5--10M samples/s throughout, with Rust cuBLAS and C CUDA at the top (~10M) and PyTorch CUDA consistently lower (~6M), the gap attributable to Python dispatch overhead and autograd bookkeeping. The CPU implementations cluster between 100K and 1M samples/s, also largely flat across the sweep.
+The dataset-size sweep shows that throughput is largely independent of dataset size for both CPU and GPU implementations. Both tiers maintain roughly constant throughput across two orders of magnitude (8K to 4M samples). The GPU implementations --- C CUDA, Rust cuBLAS, PyTorch CUDA, and Rust CUDA Kernels --- sustain approximately 5--10M samples/s throughout, with C CUDA and Rust cuBLAS at the top (~10M) and PyTorch CUDA consistently lower (~7M), the gap attributable to Python dispatch overhead and autograd bookkeeping. The CPU implementations cluster between 700K and 1.3M samples/s, also largely flat across the sweep.
 
-This flat scaling is expected: with a fixed batch size of 4096, each mini-batch GEMM has the same dimensions regardless of how many total samples exist. More data simply means more mini-batches per epoch, and throughput (samples per second) stays constant because the per-batch cost is unchanged. The Rust (CPU) implementation shows an anomalous dip around 262K samples that is likely a bug in that specific implementation rather than a fundamental CPU limitation.
-
-At the extreme end (2M--4M samples), some CPU implementations begin timing out (exceeding the 600-second limit) simply because constant throughput over a much larger dataset takes proportionally longer wall time.
+This flat scaling is expected: with a fixed batch size of 4096, each mini-batch GEMM has the same dimensions regardless of how many total samples exist. More data simply means more mini-batches per epoch, and throughput (samples per second) stays constant because the per-batch cost is unchanged.
 
 ![GPU Speedup vs Dataset Size](figs/gpu_speedup_dataset_size.png)
 
-The GPU speedup plot shows a roughly constant ratio across dataset sizes --- typically 10--25x depending on the pair --- confirming that the GPU advantage comes from faster per-batch computation, not from better scaling behavior. The speedup ratios are noisier at small dataset sizes due to measurement variance when runtimes are short. The Rust cuBLAS / C CUDA ratio (orange line) hovers near 1.0x throughout, confirming that the Rust FFI bindings to cuBLAS introduce negligible overhead compared to calling CUDA APIs directly from C.
+The GPU speedup plot shows a roughly constant ratio across dataset sizes --- typically 5--15x depending on the pair --- confirming that the GPU advantage comes from faster per-batch computation, not from better scaling behavior. The confidence bands are wider at the extremes of the range where fewer data points constrain the GP fit. The Rust cuBLAS / C CUDA ratio (orange line) hovers near 1.0x throughout, confirming that the Rust FFI bindings to cuBLAS introduce negligible overhead compared to calling CUDA APIs directly from C.
 
 ---
 
@@ -180,13 +187,13 @@ Fixed parameters: num\_samples = 262,144, hidden\_size = 512, epochs = 200.
 
 Batch size is the primary lever for GPU utilization because it determines how many threads can execute in parallel during a single GEMM call. The RTX 3070 has 46 streaming multiprocessors, each capable of scheduling up to 2048 threads, for a total of approximately 94K concurrent threads at full occupancy. A batch size of 256 produces GEMM dimensions of (256 x 512) and (512 x 512) --- enough work to partially fill the GPU, but not enough to fully hide memory latency through thread-level parallelism.
 
-The GPU throughput curves rise steeply from batch size 256 through 4096, with each doubling of batch size yielding a near-proportional throughput increase. PyTorch CUDA demonstrates the most dramatic scaling in this regime, climbing from roughly 2M samples/s at batch 256 to 13M samples/s at batch 32K --- making it the overall winner for this experiment. PyTorch's batched tensor operations benefit particularly from large batch sizes because the relative cost of its Python-level dispatch and autograd graph construction decreases as more computation is packed into each kernel launch. Rust cuBLAS and C CUDA track each other closely, both reaching approximately 10.2M samples/s at the largest batch sizes.
+The GPU throughput curves rise steeply from batch size 256 through 4096, with each doubling of batch size yielding a near-proportional throughput increase. PyTorch CUDA demonstrates the most dramatic scaling, climbing to 12.8M samples/s at the largest batch sizes --- making it the overall winner for this experiment. PyTorch's batched tensor operations benefit particularly from large batch sizes because the relative cost of its Python-level dispatch and autograd graph construction decreases as more computation is packed into each kernel launch. Rust cuBLAS and C CUDA track each other closely, both reaching approximately 10M samples/s. The custom CUDA kernel implementation (Rust CUDA Kernels) shows steadier growth, reaching 6.5M samples/s --- its shared-memory tiled matmul (TILE\_DIM=16) is less optimized than cuBLAS's auto-tuned kernels but still benefits cleanly from increased parallelism.
 
-The CPU implementations exhibit a different pattern. Throughput initially increases with batch size --- larger batches improve data locality in the tiled GEMM, reduce per-batch loop overhead, and allow OpenMP/Rayon thread pools to amortize scheduling costs. However, beyond batch sizes of 1024--2048, CPU throughput peaks and then declines. C (CPU), NumPy, and PyTorch (CPU) all show a moderate decline at the largest batch sizes, likely caused by increased memory pressure: a (32768 x 512) batch matrix occupies 64 MB in single precision, exceeding L3 cache capacity and forcing the tiled GEMM to spill to main memory on every tile access. Rust (CPU) suffers the steepest decline of any CPU implementation, dropping well below the others at large batch sizes --- this is consistent with the GEMM performance issues discussed in the dataset-size section and suggests the Rust CPU tiling strategy handles large matrices less efficiently than C's OpenMP-parallelized equivalent. The custom CUDA kernel implementation (Rust CUDA Kernels) shows steadier growth than the cuBLAS paths, reaching 6.3M samples/s --- its shared-memory tiled matmul (TILE\_DIM=16) is less optimized than cuBLAS's auto-tuned kernels but still benefits cleanly from increased parallelism.
+The CPU implementations exhibit a different pattern. Throughput initially increases with batch size --- larger batches improve data locality in the tiled GEMM, reduce per-batch loop overhead, and allow OpenMP/Rayon thread pools to amortize scheduling costs. However, beyond batch sizes of 1024--2048, CPU throughput peaks and then declines. This is likely caused by increased memory pressure: large batch matrices exceed L3 cache capacity, forcing the tiled GEMM to spill to main memory on every tile access. Rust (CPU) suffers the steepest decline of any CPU implementation at large batch sizes, suggesting the Rust CPU tiling strategy handles large matrices less efficiently than C's OpenMP-parallelized equivalent.
 
 ![GPU Speedup vs Batch Size](figs/gpu_speedup_batch_size.png)
 
-The batch-size speedup plot illustrates a textbook GPU scaling curve. At batch size 256, GPU speedup over the corresponding CPU implementation ranges from 3--8x. By batch size 32K, the ratios reach 20--35x across most pairs. This monotonic increase demonstrates that GPUs are fundamentally throughput machines: they need large amounts of data-parallel work to justify the fixed costs of kernel launches and memory transfers. The Rust cuBLAS / C CUDA ratio remains flat near 1.0x, once again confirming zero FFI overhead in the hot path.
+The batch-size speedup plot illustrates a textbook GPU scaling curve. At batch size 256, GPU speedup over the corresponding CPU implementation ranges from 5--10x. By the largest batch sizes, the ratios reach 20--35x across most pairs. This monotonic increase demonstrates that GPUs are fundamentally throughput machines: they need large amounts of data-parallel work to justify the fixed costs of kernel launches and memory transfers. The Rust cuBLAS / C CUDA ratio remains flat near 1.0x, once again confirming zero FFI overhead in the hot path.
 
 ---
 
@@ -198,17 +205,15 @@ Fixed parameters: num\_samples = 262,144, batch\_size = 4096, epochs = 200.
 
 The hidden-size sweep is the most revealing experiment because it directly controls the arithmetic intensity of the workload. The dominant GEMM operations have dimensions (batch x hidden) and (hidden x hidden), so FLOPs per sample scale as O(hidden^2). This makes hidden-size scaling the clearest test of compute-bound versus memory-bound behavior.
 
-At hidden size 64, the computation per sample is trivial --- a (4096 x 64) matrix multiply requires only 0.5M FLOPs. All implementations cluster between 3M and 15M samples/s, and the CPU implementations are competitive because the tiny weight matrices fit entirely in L1 cache. C CPU achieves 6.8M samples/s, within striking distance of the GPU implementations. This is the memory-bound regime: the GPU's massive compute throughput goes largely unused because the matrices are too small to saturate the arithmetic pipelines.
+At small hidden sizes (~64), the computation per sample is trivial --- a (4096 x 64) matrix multiply requires only 0.5M FLOPs. All implementations cluster between 3M and 15M samples/s, and the CPU implementations are competitive because the tiny weight matrices fit entirely in L1 cache. This is the memory-bound regime: the GPU's massive compute throughput goes largely unused because the matrices are too small to saturate the arithmetic pipelines.
 
-As hidden size increases to 256 and beyond, the GPU implementations pull away dramatically. Rust cuBLAS and C CUDA maintain remarkably high throughput even at hidden size 2048, where each forward-backward pass involves (4096 x 2048) and (2048 x 2048) matrix multiplications --- workloads that perfectly match cuBLAS's optimized tiling strategies. At hidden size 2048, Rust cuBLAS peaks at 15.6M samples/s and C CUDA at 15.5M samples/s. The custom Rust CUDA kernels achieve 11.4M samples/s --- impressive for hand-written shared-memory kernels, but roughly 27% below cuBLAS, reflecting the gap between a 16x16 fixed tile size and cuBLAS's auto-tuned tile dimensions that adapt to the matrix shape.
+As hidden size increases to 256 and beyond, the GPU implementations pull away dramatically. Rust cuBLAS and C CUDA maintain remarkably high throughput, with Rust cuBLAS peaking at 14.2M samples/s and C CUDA at 13.5M samples/s. The custom Rust CUDA kernels achieve 10.4M samples/s --- impressive for hand-written shared-memory kernels, but roughly 27% below cuBLAS, reflecting the gap between a 16x16 fixed tile size and cuBLAS's auto-tuned tile dimensions that adapt to the matrix shape.
 
-The CPU implementations suffer severely at large hidden sizes. With hidden size 4096, the weight matrices alone occupy (4096 x 4096 x 4 bytes) = 64 MB per layer --- far exceeding any CPU cache. Every tile access in the GEMM results in cache misses to main memory, and the O(hidden^2) compute ensures that even OpenMP parallelism cannot compensate. Among the CPU implementations, Rust (CPU) is consistently the slowest across all hidden sizes, trailing C (CPU) by a noticeable margin --- the same GEMM efficiency gap observed in the batch-size experiment. All four CPU implementations (C, Rust, NumPy, PyTorch) time out at hidden size 4096, unable to complete 200 epochs within the 600-second budget.
+The CPU implementations suffer severely at large hidden sizes. Large weight matrices far exceed CPU cache capacity, and the O(hidden^2) compute ensures that even OpenMP parallelism cannot compensate. All four CPU implementations converge toward similar throughput at the largest hidden sizes, with Rust (CPU) consistently the slowest --- the same GEMM efficiency gap observed in the batch-size experiment.
 
 ![GPU Speedup vs Hidden Size](figs/gpu_speedup_hidden_size.png)
 
-The hidden-size speedup plot shows the most dramatic GPU advantage of any experiment. At hidden size 64, speedups are modest (2--4x), reflecting the kernel launch overhead on small matrices. By hidden size 2048, the C CUDA / C CPU ratio exceeds 33x. The curve is super-linear in hidden size because the GPU's throughput degrades more slowly than the CPU's --- the GPU has enough on-chip SRAM (shared memory plus register file) to tile large matrix multiplies efficiently, while the CPU's cache hierarchy is overwhelmed. The Rust cuBLAS / Rust CPU and Rust Kernels / Rust CPU curves demonstrate that the GPU advantage is not language-dependent but architecture-dependent: the same Rust codebase shows a 21--33x speedup simply by switching the GEMM backend from CPU tiling to GPU execution.
-
-At hidden size 4096, CPU implementations timed out, so speedup ratios could not be computed for that data point --- but the trend is unambiguous. For compute-bound MLP training at realistic hidden layer widths, GPU acceleration delivers one to two orders of magnitude improvement.
+The hidden-size speedup plot shows the most dramatic GPU advantage of any experiment. At small hidden sizes, speedups are modest (2--4x), reflecting the kernel launch overhead on small matrices. As hidden size grows, the speedup curves rise super-linearly because the GPU's throughput degrades more slowly than the CPU's --- the GPU has enough on-chip SRAM (shared memory plus register file) to tile large matrix multiplies efficiently, while the CPU's cache hierarchy is overwhelmed. The Rust Kernels / Rust CPU curve demonstrates that the GPU advantage is architecture-dependent, not language-dependent: the same Rust codebase shows an order-of-magnitude speedup simply by switching the GEMM backend from CPU tiling to GPU execution.
 
 ---
 
