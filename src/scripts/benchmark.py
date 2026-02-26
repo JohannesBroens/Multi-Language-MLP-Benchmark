@@ -383,7 +383,10 @@ def _fit_gp(cache, cache_key, label, x_values=None):
                 x_all.append(np.log2(x_val))
                 y_all.append(np.log10(s))
 
-    if len(x_obs_list) < 2:
+    # Need at least 3 distinct x-values for a meaningful GP fit.
+    # With only 2 points, the GP produces flat lines with huge bands —
+    # a direct line plot is more honest.
+    if len(x_obs_list) < 3:
         return None
 
     X_train = np.array(x_all).reshape(-1, 1)
@@ -436,7 +439,7 @@ def _plot_throughput(ax, xs, throughput_data, available_labels, title, xlabel,
                     linewidth=s["linewidth"], zorder=s["zorder"], label=label)
             # Confidence band
             ax.fill_between(x_dense, y_lower, y_upper,
-                            color=s["color"], alpha=0.15, zorder=s["zorder"] - 1)
+                            color=s["color"], alpha=0.08, zorder=s["zorder"] - 1)
             # Scatter for observed means
             ax.scatter(x_obs, y_obs_mean, marker=s["marker"], color=s["color"],
                        s=s["markersize"] ** 2, edgecolors="white", linewidths=0.8,
@@ -493,7 +496,8 @@ def _speedup_with_ci(cache, cache_key, gpu_label, cpu_label):
 
     X_gpu, y_gpu = _build_training_data(gpu_data)
     X_cpu, y_cpu = _build_training_data(cpu_data)
-    if len(X_gpu) < 2 or len(X_cpu) < 2:
+    # Need at least 3 distinct x-values per implementation for meaningful GP
+    if len(set(X_gpu)) < 3 or len(set(X_cpu)) < 3:
         return None
 
     kernel = ConstantKernel(1.0) * RBF(length_scale=1.0) + WhiteKernel(noise_level=0.1)
@@ -1050,7 +1054,7 @@ def run_scaling_experiment(available, runs, figs_dir, cfg, model="mlp",
             if sp_result is not None and yf:
                 x_pts, sp_mean, sp_lower, sp_upper = sp_result
                 ax.plot(x_pts, sp_mean, color=color, linewidth=2.5, label=legend_name)
-                ax.fill_between(x_pts, sp_lower, sp_upper, color=color, alpha=0.15)
+                ax.fill_between(x_pts, sp_lower, sp_upper, color=color, alpha=0.10)
                 ax.scatter(xf, yf, color=color, marker="o", s=64,
                            edgecolors="white", linewidths=0.8, zorder=10)
                 any_plotted = True
