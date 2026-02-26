@@ -1153,12 +1153,13 @@ def run_scaling_experiment(available, runs, figs_dir, cfg, model="mlp",
             # Try GP-based speedup with CI
             sp_result = _speedup_with_ci(cache, sp_cache_key, gpu_label, cpu_label) if cache else None
 
-            if sp_result is not None and yf:
+            if sp_result is not None:
                 x_pts, sp_mean, sp_lower, sp_upper = sp_result
                 ax.plot(x_pts, sp_mean, color=color, linewidth=2.5, label=legend_name)
                 ax.fill_between(x_pts, sp_lower, sp_upper, color=color, alpha=0.10)
-                ax.scatter(xf, yf, color=color, marker="o", s=64,
-                           edgecolors="white", linewidths=0.8, zorder=10)
+                if yf:
+                    ax.scatter(xf, yf, color=color, marker="o", s=64,
+                               edgecolors="white", linewidths=0.8, zorder=10)
                 any_plotted = True
             elif yf:
                 ax.plot(xf, yf, marker="o", color=color, linewidth=2.5,
@@ -1433,9 +1434,9 @@ def main():
     parser.add_argument("--datasets", default="generated,iris,breast-cancer",
                         help="Comma-separated dataset names (standard mode, MLP only)")
     parser.add_argument("--runs", type=int, default=1)
-    parser.add_argument("--budget", type=int, default=None, metavar="MINUTES",
+    parser.add_argument("--budget", type=float, default=None, metavar="MINUTES",
                         help="Time budget in minutes for variance-weighted scheduling "
-                             "(scaling mode only, mutually exclusive with --runs > 1)")
+                             "(scaling mode only; use 0 to just replot from cache)")
     parser.add_argument("--no-cache", action="store_true",
                         help="Disable result caching (re-run everything)")
 
@@ -1496,7 +1497,7 @@ def main():
                                  else [2**n for n in range(6, 13)]),       # 64 .. 4096
             }
         if args.budget is not None:
-            cfg["budget_seconds"] = args.budget * 60 if args.budget else None
+            cfg["budget_seconds"] = args.budget * 60 if args.budget is not None else None
         run_scaling_experiment(available, args.runs, figs_dir, cfg,
                                model=args.model, use_cache=not args.no_cache)
     else:
