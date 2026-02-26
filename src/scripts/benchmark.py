@@ -558,6 +558,23 @@ def _reconstruct_throughput(cache, cache_key, x_values, labels):
     return throughput
 
 
+def _discover_x_values(cache, cache_key):
+    """Discover all unique x-values from cache for a given experiment.
+
+    Returns sorted list of integer x-values found across all implementations.
+    """
+    exp_data = cache.get(cache_key, {}) if cache else {}
+    x_set = set()
+    for impl_data in exp_data.values():
+        if isinstance(impl_data, dict):
+            for val_str in impl_data.keys():
+                try:
+                    x_set.add(int(val_str))
+                except ValueError:
+                    pass
+    return sorted(x_set)
+
+
 # ---------------------------------------------------------------------------
 #  Data collection helper
 # ---------------------------------------------------------------------------
@@ -658,70 +675,150 @@ def _collect_throughput(available, runs, vary_param, vary_values, fixed_params,
 #  Variance-weighted scheduler
 # ---------------------------------------------------------------------------
 
+def _sample_from_gaps(lo_exp, hi_exp, existing_log2_vals, sample_counts=None):
+    """Sample a new x-value, balancing spatial coverage with variance reduction.
+
+    Phase 1 (largest gap > 1.0 in log2 space): Gap-fill — sample from the
+    widest unexplored region so the GP gets spread-out training data.
+
+    Phase 2 (range well-covered): Resample near existing points that have
+    the fewest observations, so the GP can better estimate noise/variance
+    at each location.  Adds a small jitter (±0.2 in log2) so the GP sees
+    *nearby* points rather than exact duplicates.
+
+    Args:
+        lo_exp, hi_exp: log2 boundaries of the x-range
+        existing_log2_vals: list of log2(x) for all cached x-values
+        sample_counts: dict mapping log2_val -> number of samples at that point.
+            If provided, used to prioritize under-sampled points in phase 2.
+
+    Returns: int, the sampled x-value (round(2^x))
+    """
+    import random
+
+    if not existing_log2_vals:
+        return int(round(2 ** random.uniform(lo_exp, hi_exp)))
+
+    # Build sorted unique points including boundaries
+    points = sorted(set([lo_exp] + list(existing_log2_vals) + [hi_exp]))
+    gaps = [(points[i + 1] - points[i], points[i], points[i + 1])
+            for i in range(len(points) - 1)]
+    max_gap = max(g[0] for g in gaps)
+
+    if max_gap > 1.0:
+        # Phase 1: Gap-fill — largest gap is > 1 octave (factor of 2)
+        gaps.sort(reverse=True)
+        gap_size, gap_lo, gap_hi = gaps[0]
+        inset = min(0.05, gap_size * 0.1)
+        x_exp = random.uniform(gap_lo + inset, gap_hi - inset)
+    else:
+        # Phase 2: Range is well-covered — resample near the point with
+        # fewest observations to reduce variance there.
+        if sample_counts:
+            # Pick the existing point with fewest samples
+            min_n = min(sample_counts.values())
+            candidates = [v for v, n in sample_counts.items() if n == min_n]
+            target = random.choice(candidates)
+        else:
+            # No count info — pick a random existing point
+            target = random.choice(list(existing_log2_vals))
+        # Jitter ±0.2 in log2 (factor of ~1.15x) — close enough for GP
+        # noise estimation but avoids exact duplicates
+        jitter = random.uniform(-0.2, 0.2)
+        x_exp = target + jitter
+
+    x_exp = max(lo_exp, min(hi_exp, x_exp))
+    return int(round(2 ** x_exp))
+
+
 def _build_schedule(cache, experiments, available, budget_seconds):
-    """Build a greedy schedule of runs prioritized by CV / sqrt(n).
+    """Build a round-robin schedule that samples continuous x-values.
+
+    Instead of a fixed grid, each (experiment, implementation) group gets
+    x-values sampled from the largest gap in its existing data (gap-filling).
+    Groups with fewer cached points are prioritized, ensuring every impl and
+    experiment gets coverage.  Running --budget 1 sixty times produces similar
+    coverage to --budget 60 once.
 
     Args:
         cache: the loaded cache dict
-        experiments: list of (cache_key, vary_param, vary_values, fixed_params)
+        experiments: list of (cache_key, vary_param, (lo_exp, hi_exp), fixed_params)
+            where lo_exp/hi_exp define the log2 range, e.g. (13, 22) → 8K..4M
         available: list of (label, cmd_template)
         budget_seconds: total wall-time budget
 
     Returns list of dicts with keys:
         label, cmd_template, params, cache_key, val_str, est_wall
     """
-    # Gather all (impl, x_value) configs with priority scores
-    candidates = []
-    for cache_key, vary_param, vary_values, fixed_params in experiments:
+    # Build group info for each (experiment, implementation) pair
+    groups = []
+    for cache_key, vary_param, x_range, fixed_params in experiments:
+        lo_exp, hi_exp = x_range
         exp_data = cache.get(cache_key, {})
         for label, cmd_template in available:
-            for val in vary_values:
-                val_str = str(val)
-                entry = exp_data.get(label, {}).get(val_str, {})
-                samples = entry.get("samples", []) if isinstance(entry, dict) else []
-                wall_times = entry.get("wall_times", []) if isinstance(entry, dict) else []
-                n = len(samples)
-                mean_tp = float(np.mean(samples)) if samples else 0.0
+            impl_data = exp_data.get(label, {})
+            # Collect existing x-values in log2 space, sample counts, and wall times
+            existing_log2 = []
+            sample_counts = {}  # log2_val -> number of samples
+            wall_times = []
+            n_cached = 0
+            for val_str, entry in impl_data.items():
+                if isinstance(entry, dict):
+                    ns = len(entry.get("samples", []))
+                    n_cached += ns
+                    wall_times.extend(entry.get("wall_times", []))
+                    try:
+                        log2_val = np.log2(float(val_str))
+                        existing_log2.append(log2_val)
+                        sample_counts[log2_val] = ns
+                    except (ValueError, ZeroDivisionError):
+                        pass
+            est_wall = float(np.mean(wall_times)) if wall_times else 10.0
+            groups.append({
+                "cache_key": cache_key,
+                "label": label,
+                "cmd_template": cmd_template,
+                "vary_param": vary_param,
+                "lo_exp": lo_exp,
+                "hi_exp": hi_exp,
+                "fixed_params": fixed_params,
+                "n_cached": n_cached,
+                "est_wall": est_wall,
+                "existing_log2": existing_log2,
+                "sample_counts": sample_counts,
+            })
 
-                # Skip converged configs (CV < 3%)
-                if n >= 2 and mean_tp > 0:
-                    cv = float(np.std(samples) / mean_tp * 100)
-                    if cv < 3.0:
-                        continue
-                    priority = cv / np.sqrt(n)
-                elif n == 0:
-                    priority = float("inf")
-                else:
-                    # n=1, no CV yet — high priority
-                    priority = 100.0
-
-                # Estimate wall time from past runs, or default 60s
-                est_wall = float(np.mean(wall_times)) if wall_times else 60.0
-
-                params = dict(fixed_params)
-                params[vary_param] = val
-
-                candidates.append({
-                    "label": label,
-                    "cmd_template": cmd_template,
-                    "params": params,
-                    "cache_key": cache_key,
-                    "val_str": val_str,
-                    "est_wall": est_wall,
-                    "priority": priority,
-                })
-
-    # Sort by priority descending (highest priority first)
-    candidates.sort(key=lambda c: c["priority"], reverse=True)
-
-    # Greedy fill within budget
+    # Round-robin across groups, least-sampled first, gap-filling x-values
     schedule = []
     remaining = budget_seconds
-    for c in candidates:
-        if c["est_wall"] <= remaining:
-            schedule.append(c)
-            remaining -= c["est_wall"]
-        if remaining <= 0:
+    while remaining > 0 and groups:
+        # Sort by n_cached so least-known groups get picks first
+        groups.sort(key=lambda g: g["n_cached"])
+        made_progress = False
+        for group in groups:
+            if group["est_wall"] > remaining:
+                continue
+            # Sample from gap or resample near under-observed points
+            x_val = _sample_from_gaps(
+                group["lo_exp"], group["hi_exp"], group["existing_log2"],
+                sample_counts=group["sample_counts"])
+            params = dict(group["fixed_params"])
+            params[group["vary_param"]] = x_val
+            schedule.append({
+                "label": group["label"],
+                "cmd_template": group["cmd_template"],
+                "params": params,
+                "cache_key": group["cache_key"],
+                "val_str": str(x_val),
+                "est_wall": group["est_wall"],
+            })
+            remaining -= group["est_wall"]
+            group["n_cached"] += 1
+            log2_val = np.log2(float(x_val))
+            group["existing_log2"].append(log2_val)
+            group["sample_counts"][log2_val] = group["sample_counts"].get(log2_val, 0) + 1
+            made_progress = True
+        if not made_progress:
             break
 
     return schedule
@@ -821,44 +918,47 @@ def run_scaling_experiment(available, runs, figs_dir, cfg, model="mlp",
         print(f"\n  Budget mode: {budget_seconds}s wall-time budget")
         print("=" * 70)
 
-        # Build experiment descriptors
+        # Build experiment descriptors with log2 ranges for continuous sampling
         budget_experiments = []
         if model == "cnn":
-            batch_sizes = cfg.get("batch_sizes", [2**n for n in range(4, 11)])
             budget_experiments.append((
-                _cache_key(model, "batch_size"), "batch_size", batch_sizes,
+                _cache_key(model, "batch_size"), "batch_size", (4, 10),
                 {"epochs": epochs}))
         else:
-            dataset_sizes = cfg["dataset_sizes"]
-            batch_sizes = cfg["batch_sizes"]
-            hidden_sizes = cfg["hidden_sizes"]
             fixed_bs = cfg["fixed_batch_size"]
             fixed_ns = cfg["fixed_num_samples"]
 
             budget_experiments.append((
-                _cache_key(model, "dataset_size"), "num_samples", dataset_sizes,
+                _cache_key(model, "dataset_size"), "num_samples",
+                cfg.get("dataset_size_range", (13, 22)),
                 {"batch_size": fixed_bs, "epochs": epochs}))
             budget_experiments.append((
-                _cache_key(model, "batch_size"), "batch_size", batch_sizes,
+                _cache_key(model, "batch_size"), "batch_size",
+                cfg.get("batch_size_range", (8, 15)),
                 {"num_samples": fixed_ns, "epochs": epochs}))
             budget_experiments.append((
-                _cache_key(model, "hidden_size"), "hidden_size", hidden_sizes,
+                _cache_key(model, "hidden_size"), "hidden_size",
+                cfg.get("hidden_size_range", (6, 12)),
                 {"num_samples": fixed_ns, "batch_size": fixed_bs, "epochs": epochs}))
 
         schedule = _build_schedule(cache, budget_experiments, available, budget_seconds)
         print(f"  Scheduled {len(schedule)} runs (est. {sum(s['est_wall'] for s in schedule):.0f}s)")
         _run_scheduled(schedule, cache)
 
-        # Reconstruct throughput for plotting
+        # Reconstruct throughput for plotting — discover x-values from cache
         if model == "cnn":
             tp_ds = None
             tp_hs = None
+            batch_sizes = _discover_x_values(cache, _cache_key(model, "batch_size"))
             tp_bs = _reconstruct_throughput(
                 cache, _cache_key(model, "batch_size"), batch_sizes, labels)
             dataset_sizes = batch_sizes
-            fixed_bs = batch_sizes[-1]
+            fixed_bs = batch_sizes[-1] if batch_sizes else 1024
             fixed_ns = 60000
         else:
+            dataset_sizes = _discover_x_values(cache, _cache_key(model, "dataset_size"))
+            batch_sizes = _discover_x_values(cache, _cache_key(model, "batch_size"))
+            hidden_sizes = _discover_x_values(cache, _cache_key(model, "hidden_size"))
             tp_ds = _reconstruct_throughput(
                 cache, _cache_key(model, "dataset_size"), dataset_sizes, labels)
             tp_bs = _reconstruct_throughput(
@@ -868,7 +968,7 @@ def run_scaling_experiment(available, runs, figs_dir, cfg, model="mlp",
 
         # Jump to plotting (skip the normal collection flow)
         # -- individual throughput plots --
-        if tp_ds is not None:
+        if tp_ds is not None and dataset_sizes:
             fig, ax = plt.subplots(figsize=(12, 7))
             _plot_throughput(ax, dataset_sizes, tp_ds, labels,
                              f"Throughput vs Dataset Size\nbatch_size={fixed_bs}, epochs={epochs}",
@@ -880,18 +980,19 @@ def run_scaling_experiment(available, runs, figs_dir, cfg, model="mlp",
             plt.savefig(p); plt.close()
             print(f"\nSaved: {p}")
 
-        fig, ax = plt.subplots(figsize=(12, 7))
-        bs_title = (f"{prefix}Throughput vs Batch Size\nMNIST (60K samples), epochs={epochs}"
-                     if model == "cnn"
-                     else f"Throughput vs Batch Size\nnum_samples={fixed_ns:,}, epochs={epochs}")
-        _plot_throughput(ax, batch_sizes, tp_bs, labels, bs_title, "Batch Size",
-                         cache=cache, cache_key=_cache_key(model, "batch_size"))
-        plt.tight_layout()
-        p = os.path.join(figs_dir, f"{file_prefix}scaling_batch_size.png")
-        plt.savefig(p); plt.close()
-        print(f"\nSaved: {p}")
+        if batch_sizes:
+            fig, ax = plt.subplots(figsize=(12, 7))
+            bs_title = (f"{prefix}Throughput vs Batch Size\nMNIST (60K samples), epochs={epochs}"
+                         if model == "cnn"
+                         else f"Throughput vs Batch Size\nnum_samples={fixed_ns:,}, epochs={epochs}")
+            _plot_throughput(ax, batch_sizes, tp_bs, labels, bs_title, "Batch Size",
+                             cache=cache, cache_key=_cache_key(model, "batch_size"))
+            plt.tight_layout()
+            p = os.path.join(figs_dir, f"{file_prefix}scaling_batch_size.png")
+            plt.savefig(p); plt.close()
+            print(f"\nSaved: {p}")
 
-        if tp_hs is not None:
+        if tp_hs is not None and hidden_sizes:
             fig, ax = plt.subplots(figsize=(12, 7))
             _plot_throughput(ax, hidden_sizes, tp_hs, labels,
                              f"Throughput vs Hidden Layer Size\nsamples={fixed_ns:,}, batch={fixed_bs}, epochs={epochs}",
@@ -1024,10 +1125,11 @@ def run_scaling_experiment(available, runs, figs_dir, cfg, model="mlp",
 
     # Build experiments list based on available data
     experiments = []
-    if tp_ds is not None:
+    if tp_ds is not None and dataset_sizes:
         experiments.append(("dataset_size", dataset_sizes, tp_ds, "Dataset Size (samples)", True))
-    experiments.append(("batch_size", batch_sizes, tp_bs, "Batch Size", False))
-    if tp_hs is not None:
+    if batch_sizes:
+        experiments.append(("batch_size", batch_sizes, tp_bs, "Batch Size", False))
+    if tp_hs is not None and hidden_sizes:
         experiments.append(("hidden_size", hidden_sizes, tp_hs, "Hidden Size", False))
 
     for exp_name, xs, tp_data, xlabel, use_sample_fmt in experiments:
@@ -1131,42 +1233,54 @@ def run_scaling_experiment(available, runs, figs_dir, cfg, model="mlp",
         fig.suptitle("CNN Benchmark: GPU Scaling Analysis (LeNet-5 / MNIST)",
                       fontsize=18, fontweight="bold", y=0.98)
     else:
-        # MLP: 2x2 overview
+        # MLP: 2x2 overview — only plot subplots that have data
         fig, axes = plt.subplots(2, 2, figsize=(18, 14))
 
-        _plot_throughput(axes[0, 0], dataset_sizes, tp_ds, labels,
-                         f"Dataset Size Scaling (batch={fixed_bs})", "Dataset Size",
-                         cache=cache, cache_key=_cache_key(model, "dataset_size"))
-        _format_x_samples(axes[0, 0])
+        if dataset_sizes and tp_ds:
+            _plot_throughput(axes[0, 0], dataset_sizes, tp_ds, labels,
+                             f"Dataset Size Scaling (batch={fixed_bs})", "Dataset Size",
+                             cache=cache, cache_key=_cache_key(model, "dataset_size"))
+            _format_x_samples(axes[0, 0])
+        else:
+            axes[0, 0].set_visible(False)
 
-        _plot_throughput(axes[0, 1], batch_sizes, tp_bs, labels,
-                         f"Batch Size Scaling (samples={fixed_ns:,})", "Batch Size",
-                         cache=cache, cache_key=_cache_key(model, "batch_size"))
+        if batch_sizes and tp_bs:
+            _plot_throughput(axes[0, 1], batch_sizes, tp_bs, labels,
+                             f"Batch Size Scaling (samples={fixed_ns:,})", "Batch Size",
+                             cache=cache, cache_key=_cache_key(model, "batch_size"))
+        else:
+            axes[0, 1].set_visible(False)
 
-        _plot_throughput(axes[1, 0], hidden_sizes, tp_hs, labels,
-                         f"Hidden Size Scaling (batch={fixed_bs})", "Hidden Size",
-                         cache=cache, cache_key=_cache_key(model, "hidden_size"))
+        if hidden_sizes and tp_hs:
+            _plot_throughput(axes[1, 0], hidden_sizes, tp_hs, labels,
+                             f"Hidden Size Scaling (batch={fixed_bs})", "Hidden Size",
+                             cache=cache, cache_key=_cache_key(model, "hidden_size"))
 
-        for gpu_label, cpu_label, color, legend_name in speedup_pairs[:3]:
-            gpu_vals = tp_hs.get(gpu_label, [])
-            cpu_vals = tp_hs.get(cpu_label, [])
-            if not gpu_vals or not cpu_vals:
-                continue
-            xf, yf = [], []
-            for i in range(min(len(gpu_vals), len(cpu_vals))):
-                if gpu_vals[i] and cpu_vals[i] and cpu_vals[i] > 0:
-                    xf.append(hidden_sizes[i])
-                    yf.append(gpu_vals[i] / cpu_vals[i])
-            if yf:
-                axes[1, 1].plot(xf, yf, marker="o", color=color, linewidth=2.5, markersize=8, label=legend_name)
+            for gpu_label, cpu_label, color, legend_name in speedup_pairs[:3]:
+                gpu_vals = tp_hs.get(gpu_label, [])
+                cpu_vals = tp_hs.get(cpu_label, [])
+                if not gpu_vals or not cpu_vals:
+                    continue
+                xf, yf = [], []
+                for i in range(min(len(gpu_vals), len(cpu_vals))):
+                    if gpu_vals[i] and cpu_vals[i] and cpu_vals[i] > 0:
+                        xf.append(hidden_sizes[i])
+                        yf.append(gpu_vals[i] / cpu_vals[i])
+                if yf:
+                    axes[1, 1].plot(xf, yf, marker="o", color=color, linewidth=2.5, markersize=8, label=legend_name)
 
-        axes[1, 1].axhline(y=1.0, color="#e74c3c", linestyle="--", alpha=0.7, linewidth=1.5)
-        axes[1, 1].set_xscale("log", base=2)
-        axes[1, 1].set_xlabel("Hidden Size")
-        axes[1, 1].set_ylabel("Speedup (x)")
-        axes[1, 1].set_title("GPU Speedup vs Hidden Size", fontweight="bold")
-        axes[1, 1].grid(True, which="both", alpha=0.3)
-        axes[1, 1].legend(loc="best")
+            axes[1, 1].axhline(y=1.0, color="#e74c3c", linestyle="--", alpha=0.7, linewidth=1.5)
+            axes[1, 1].set_xscale("log", base=2)
+            axes[1, 1].set_xlabel("Hidden Size")
+            axes[1, 1].set_ylabel("Speedup (x)")
+            axes[1, 1].set_title("GPU Speedup vs Hidden Size", fontweight="bold")
+            axes[1, 1].grid(True, which="both", alpha=0.3)
+            handles, leg_labels = axes[1, 1].get_legend_handles_labels()
+            if handles:
+                axes[1, 1].legend(loc="best")
+        else:
+            axes[1, 0].set_visible(False)
+            axes[1, 1].set_visible(False)
 
         fig.suptitle("MLP Benchmark: GPU Scaling Analysis", fontsize=18, fontweight="bold", y=0.98)
 
