@@ -51,9 +51,10 @@ All 8 MLP implementations produce identical standardized output for benchmark pa
 | Rust (CPU) | `src/rust/cnn-cpu/src/main.rs` | im2col + Rayon threadpool with cache-tiled GEMM (TILE=64) |
 | Rust (cuBLAS) | `src/rust/cnn-cuda-cublas/src/main.rs` | cuBLAS GEMM + custom CUDA kernels for conv/pool/activations |
 | Rust (CUDA Kernels) | `src/rust/cnn-cuda-kernels/src/main.rs` | All custom CUDA kernels including shared-memory tiled matmul |
-| NumPy (CPU) | `src/python/models/cnn/cnn_numpy.py` | Vectorized im2col + NumPy matmul, manual backprop |
 | PyTorch (CPU) | `src/python/models/cnn/cnn_pytorch.py` | nn.Module with manual Xavier init, CPU backend |
 | PyTorch (CUDA) | `src/python/models/cnn/cnn_pytorch.py` | Same model on GPU via `--device cuda` |
+
+NumPy is excluded from CNN benchmarks: pure-Python im2col is prohibitively slow (timeouts at 600s), unlike MLP where NumPy's BLAS backend makes it a competitive CPU baseline.
 
 All CNN implementations train on MNIST (60K training / 10K test, 28x28 grayscale digits, 10 classes).
 
@@ -145,6 +146,12 @@ python3 src/scripts/benchmark.py --mode scaling --budget 0
 
 # CNN: scaling mode — throughput vs batch size on MNIST
 python3 src/scripts/benchmark.py --mode scaling --model cnn --runs 1
+
+# CNN: budget mode — accumulate samples (results merge with cache)
+python3 src/scripts/benchmark.py --mode scaling --model cnn --budget 30 --scaling-epochs 20
+
+# Replot CNN from cache
+python3 src/scripts/benchmark.py --mode scaling --model cnn --budget 0
 ```
 
 ## Scaling Benchmark Analysis
@@ -221,6 +228,42 @@ The hidden-size speedup plot shows the most dramatic GPU advantage of any experi
 
 ![Scaling Overview](figs/scaling_overview.png)
 
+---
+
+## CNN Scaling Benchmark Analysis
+
+The CNN benchmark uses the same GP regression methodology as MLP, sweeping batch size from 16 to 1024 on the MNIST dataset (60,000 training images, fixed architecture). Because MNIST is a fixed-size dataset and the LeNet-5 architecture has no configurable hidden size, batch size is the only meaningful scaling axis.
+
+### CNN Peak Throughput
+
+| Implementation | Peak Throughput | Notes |
+|---|---|---|
+| PyTorch (CUDA) | **291K/s** | cuDNN fused convolution kernels |
+| PyTorch (CPU) | 36K/s | cuDNN CPU path + autograd |
+| C (CUDA) | 16K/s | im2col + cuBLAS GEMM |
+| Rust (cuBLAS) | 16K/s | im2col + cuBLAS via FFI |
+| C (CPU) | 13K/s | im2col + OpenMP tiled GEMM |
+| Rust (CUDA Kernels) | 13K/s | im2col + shared-memory tiled matmul |
+| Rust (CPU) | 5K/s | im2col + Rayon tiled GEMM |
+
+### Batch Size Scaling (16 -- 1024)
+
+Fixed parameters: MNIST (60K samples), LeNet-5 architecture, epochs = 20.
+
+![CNN Throughput vs Batch Size](figs/cnn_scaling_batch_size.png)
+
+The CNN batch-size sweep tells a different story than MLP because the computational profile is fundamentally different. Where MLP throughput is dominated by large GEMM operations on the fully connected layers, CNN throughput is bottlenecked by the im2col transform and the relatively small GEMMs it produces. Conv1 produces a (6×25) × (25×576) multiply and Conv2 a (16×150) × (150×64) multiply --- both far smaller than the MLP's (batch×hidden) × (hidden×hidden) GEMMs. This means the CNN is more sensitive to per-sample overhead (im2col is per-sample) and less able to saturate GPU compute at any batch size.
+
+PyTorch CUDA dominates the CNN benchmark because PyTorch's cuDNN backend uses specialized convolution algorithms (Winograd, FFT-based) that bypass im2col entirely for common kernel sizes. The hand-written im2col implementations (C, Rust) convert convolution into GEMM but cannot match cuDNN's fused kernels that avoid the memory traffic of materializing the column matrix. This architectural advantage is most visible in CNNs where convolution dominates the runtime.
+
+The CPU implementations show a tighter spread than in MLP benchmarks. The im2col workspace (29K floats ≈ 116 KB per sample) fits comfortably in L2 cache for small batches, so the CPU implementations avoid the cache-thrashing that plagues large-batch MLP. C (CPU) benefits from OpenMP parallelism across the per-sample convolution loop and achieves higher throughput than Rust (CPU), whose Rayon threadpool incurs more scheduling overhead on the fine-grained per-sample work.
+
+![CNN GPU Speedup vs Batch Size](figs/cnn_gpu_speedup_batch_size.png)
+
+The GPU speedup plot reveals that cuDNN's advantage over im2col is architectural, not just a constant factor. PyTorch CUDA / CPU speedup grows with batch size (reaching ~8x at large batches), while C CUDA / C CPU stays nearly flat around 1.5x. The im2col implementations move the same amount of memory regardless of backend --- the GPU gains little because the bottleneck is the column matrix materialization, not the GEMM itself. Meanwhile, Rust cuBLAS / C CUDA hovers at 1.0x, confirming that Rust's FFI bindings add zero overhead to the hot path.
+
+![CNN Scaling Overview](figs/cnn_scaling_overview.png)
+
 ## Project Structure
 
 ```
@@ -254,7 +297,6 @@ ML-in-C/
 │   │   │   ├── mlp_numpy.py       # NumPy MLP implementation
 │   │   │   └── mlp_pytorch.py     # PyTorch MLP (CPU + CUDA)
 │   │   ├── models/cnn/
-│   │   │   ├── cnn_numpy.py       # NumPy CNN with im2col
 │   │   │   └── cnn_pytorch.py     # PyTorch CNN (CPU + CUDA)
 │   │   └── setup.py
 │   └── scripts/
@@ -264,7 +306,7 @@ ML-in-C/
 │       ├── preprocess_iris.py     # Preprocess Iris data
 │       └── run_pipeline.sh        # Full pipeline (download + build + run)
 ├── build.sh                       # One-command build (detects toolchains)
-├── mathematical_foundations.md    # Math derivations for the MLP algorithm
+├── mathematical_foundations.md    # Math derivations for MLP and CNN algorithms
 ├── requirements.txt               # Python dependencies
 ├── LICENSE                        # Apache 2.0
 └── README.md
@@ -272,12 +314,13 @@ ML-in-C/
 
 ## Mathematical Foundations
 
-See [mathematical_foundations.md](mathematical_foundations.md) for detailed derivations of:
-- Feature normalization (z-score)
-- Xavier weight initialization
-- Forward propagation (ReLU + numerically stable softmax)
-- Cross-entropy loss
-- Backpropagation (including the softmax+CE gradient shortcut)
+See [mathematical_foundations.md](mathematical_foundations.md) for detailed derivations covering both the MLP and CNN:
+- Feature normalization (z-score) and Xavier weight initialization
+- Forward/backward propagation with ReLU, numerically stable softmax, and cross-entropy loss
+- The softmax + cross-entropy gradient shortcut
+- Convolution via im2col: transforming sliding-window operations into GEMM
+- Average pooling forward and backward passes
+- col2im gradient scattering with overlap accumulation
 - Mini-batch SGD with gradient averaging
 
 ## License
