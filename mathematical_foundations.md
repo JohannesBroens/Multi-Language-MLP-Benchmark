@@ -31,6 +31,8 @@ This document describes the mathematics behind the neural network implementation
 
 ---
 
+# Shared Concepts
+
 ## Feature Normalization
 
 Before training, all input features are z-score normalized per feature:
@@ -48,75 +50,11 @@ This centers each feature around zero with unit variance, which helps gradient d
 
 ---
 
----
-
-# Multi-Layer Perceptron (MLP)
-
-## MLP Architecture
-
-A single hidden-layer MLP with:
-
-- **Input layer**: $n$ features
-- **Hidden layer**: $m$ neurons with ReLU activation
-- **Output layer**: $k$ neurons with softmax activation (one per class)
-
-```math
-\begin{align*}
-\mathbf{h} &= \text{ReLU}\left(\mathbf{W}^{(1)} \mathbf{x} + \mathbf{b}^{(1)}\right) \\
-\hat{\mathbf{y}} &= \text{softmax}\left(\mathbf{W}^{(2)} \mathbf{h} + \mathbf{b}^{(2)}\right)
-\end{align*}
-```
-
-Where:
-- $\mathbf{x} \in \mathbb{R}^{n}$: input vector
-- $\mathbf{W}^{(1)} \in \mathbb{R}^{m \times n}$: input-to-hidden weights
-- $\mathbf{b}^{(1)} \in \mathbb{R}^{m}$: hidden biases (initialized to zero)
-- $\mathbf{W}^{(2)} \in \mathbb{R}^{k \times m}$: hidden-to-output weights
-- $\mathbf{b}^{(2)} \in \mathbb{R}^{k}$: output biases (initialized to zero)
-
----
-
-## Weight Initialization
-
-Weights are initialized with **Xavier/He uniform** initialization:
-
-```math
-W_{ij} \sim \text{Uniform}\left(-\sqrt{\frac{2}{n_{\text{in}}}},\; \sqrt{\frac{2}{n_{\text{in}}}}\right)
-```
-
-Where $n_{\text{in}}$ is the fan-in (number of input connections to the layer). This scale factor prevents vanishing or exploding activations in networks with ReLU, by keeping the variance of activations approximately constant across layers.
-
-Biases are initialized to zero.
-
----
-
-## MLP Forward Propagation
-
-### Hidden Layer
-
-```math
-\begin{align*}
-\mathbf{z}^{(1)} &= \mathbf{W}^{(1)} \mathbf{x} + \mathbf{b}^{(1)} \\
-\mathbf{h} &= \text{ReLU}(\mathbf{z}^{(1)})
-\end{align*}
-```
-
-### Output Layer
-
-```math
-\begin{align*}
-\mathbf{z}^{(2)} &= \mathbf{W}^{(2)} \mathbf{h} + \mathbf{b}^{(2)} \\
-\hat{\mathbf{y}} &= \text{softmax}(\mathbf{z}^{(2)})
-\end{align*}
-```
-
----
-
 ## Activation Functions
 
 ### ReLU (Rectified Linear Unit)
 
-Used in the hidden layer:
+Used in hidden layers of both MLP and CNN:
 
 ```math
 \text{ReLU}(z) = \max(0, z)
@@ -170,46 +108,17 @@ The epsilon ($\epsilon = 10^{-7}$) prevents $\log(0)$.
 
 ---
 
-## MLP Backpropagation
+## Weight Initialization
 
-### Output Layer Gradient (Softmax + Cross-Entropy Shortcut)
-
-When combining softmax activation with cross-entropy loss, the gradient simplifies elegantly:
+Weights are initialized with **Xavier/He uniform** initialization:
 
 ```math
-\delta^{(2)} = \hat{\mathbf{y}} - \mathbf{y}
+W_{ij} \sim \text{Uniform}\left(-\sqrt{\frac{2}{n_{\text{in}}}},\; \sqrt{\frac{2}{n_{\text{in}}}}\right)
 ```
 
-This avoids computing separate softmax and cross-entropy derivatives. 
+Where $n_{\text{in}}$ is the fan-in (number of input connections to the layer). For convolutional layers, $n_{\text{in}} = C_{\text{in}} \cdot k_H \cdot k_W$. This scale factor prevents vanishing or exploding activations in networks with ReLU, by keeping the variance of activations approximately constant across layers.
 
-**Proof**: By the chain rule, 
-```math
-\frac{\partial L}{\partial z_i^{(2)}} = \sum_j \frac{\partial L}{\partial \hat{y}_j} \frac{\partial \hat{y}_j}{\partial z_i^{(2)}}
-```
-For cross-entropy loss and softmax, using
-```math
-\frac{\partial \hat{y}_j}{\partial z_i}=\hat{y}_i(\delta_{ij}-\hat{y}_j),
-```
-this reduces to $\hat{y}_i - y_i$. 
-
-### Hidden Layer Gradient (Backprop through ReLU)
-
-```math
-\delta^{(1)} = \left((\mathbf{W}^{(2)})^\top \delta^{(2)}\right) \odot \text{ReLU}'(\mathbf{z}^{(1)})
-```
-
-Since $\text{ReLU}'(z) = \mathbb{1}[z > 0]$, this zeros out gradients for inactive neurons.
-
-### Weight Gradients
-
-```math
-\begin{align*}
-\nabla_{\mathbf{W}^{(2)}} L &= \delta^{(2)} \mathbf{h}^\top \\
-\nabla_{\mathbf{b}^{(2)}} L &= \delta^{(2)} \\
-\nabla_{\mathbf{W}^{(1)}} L &= \delta^{(1)} \mathbf{x}^\top \\
-\nabla_{\mathbf{b}^{(1)}} L &= \delta^{(1)}
-\end{align*}
-```
+Biases are initialized to zero.
 
 ---
 
@@ -238,6 +147,97 @@ Per-sample gradients are accumulated over the batch, then averaged by dividing t
 ```
 
 This is equivalent to $\theta \leftarrow \theta - \eta \cdot \frac{1}{|B|}\sum_{i \in B} \nabla_\theta L_i$ but avoids a separate division step.
+
+---
+
+# Multi-Layer Perceptron (MLP)
+
+## MLP Architecture
+
+A single hidden-layer MLP with:
+
+- **Input layer**: $n$ features
+- **Hidden layer**: $m$ neurons with ReLU activation
+- **Output layer**: $k$ neurons with softmax activation (one per class)
+
+```math
+\begin{align*}
+\mathbf{h} &= \text{ReLU}\left(\mathbf{W}^{(1)} \mathbf{x} + \mathbf{b}^{(1)}\right) \\
+\hat{\mathbf{y}} &= \text{softmax}\left(\mathbf{W}^{(2)} \mathbf{h} + \mathbf{b}^{(2)}\right)
+\end{align*}
+```
+
+Where:
+- $\mathbf{x} \in \mathbb{R}^{n}$: input vector
+- $\mathbf{W}^{(1)} \in \mathbb{R}^{m \times n}$: input-to-hidden weights
+- $\mathbf{b}^{(1)} \in \mathbb{R}^{m}$: hidden biases (initialized to zero)
+- $\mathbf{W}^{(2)} \in \mathbb{R}^{k \times m}$: hidden-to-output weights
+- $\mathbf{b}^{(2)} \in \mathbb{R}^{k}$: output biases (initialized to zero)
+
+---
+
+## MLP Forward Propagation
+
+### Hidden Layer
+
+```math
+\begin{align*}
+\mathbf{z}^{(1)} &= \mathbf{W}^{(1)} \mathbf{x} + \mathbf{b}^{(1)} \\
+\mathbf{h} &= \text{ReLU}(\mathbf{z}^{(1)})
+\end{align*}
+```
+
+### Output Layer
+
+```math
+\begin{align*}
+\mathbf{z}^{(2)} &= \mathbf{W}^{(2)} \mathbf{h} + \mathbf{b}^{(2)} \\
+\hat{\mathbf{y}} &= \text{softmax}(\mathbf{z}^{(2)})
+\end{align*}
+```
+
+---
+
+## MLP Backpropagation
+
+### Output Layer Gradient (Softmax + Cross-Entropy Shortcut)
+
+When combining softmax activation with cross-entropy loss, the gradient simplifies elegantly:
+
+```math
+\delta^{(2)} = \hat{\mathbf{y}} - \mathbf{y}
+```
+
+This avoids computing separate softmax and cross-entropy derivatives.
+
+**Proof**: By the chain rule,
+```math
+\frac{\partial L}{\partial z_i^{(2)}} = \sum_j \frac{\partial L}{\partial \hat{y}_j} \frac{\partial \hat{y}_j}{\partial z_i^{(2)}}
+```
+For cross-entropy loss and softmax, using
+```math
+\frac{\partial \hat{y}_j}{\partial z_i}=\hat{y}_i(\delta_{ij}-\hat{y}_j),
+```
+this reduces to $\hat{y}_i - y_i$.
+
+### Hidden Layer Gradient (Backprop through ReLU)
+
+```math
+\delta^{(1)} = \left((\mathbf{W}^{(2)})^\top \delta^{(2)}\right) \odot \text{ReLU}'(\mathbf{z}^{(1)})
+```
+
+Since $\text{ReLU}'(z) = \mathbb{1}[z > 0]$, this zeros out gradients for inactive neurons.
+
+### Weight Gradients
+
+```math
+\begin{align*}
+\nabla_{\mathbf{W}^{(2)}} L &= \delta^{(2)} \mathbf{h}^\top \\
+\nabla_{\mathbf{b}^{(2)}} L &= \delta^{(2)} \\
+\nabla_{\mathbf{W}^{(1)}} L &= \delta^{(1)} \mathbf{x}^\top \\
+\nabla_{\mathbf{b}^{(1)}} L &= \delta^{(1)}
+\end{align*}
+```
 
 ---
 

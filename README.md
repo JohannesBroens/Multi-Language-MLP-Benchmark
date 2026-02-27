@@ -1,6 +1,6 @@
 # ML Language Playground: Multi-Language Neural Network Benchmark
 
-A multi-language machine learning benchmark comparing neural network implementations across C, Rust, and Python. Two model families --- MLP and CNN (LeNet-5) --- are each implemented identically in 8 variants spanning CPU and GPU backends to measure throughput scaling.
+A multi-language machine learning benchmark comparing neural network implementations across C, Rust, and Python. Two model families --- MLP (8 implementations) and CNN/LeNet-5 (7 implementations) --- span CPU and GPU backends to measure throughput scaling.
 
 ## MLP Architecture
 
@@ -154,7 +154,7 @@ python3 src/scripts/benchmark.py --mode scaling --model cnn --budget 30 --scalin
 python3 src/scripts/benchmark.py --mode scaling --model cnn --budget 0
 ```
 
-## Scaling Benchmark Analysis
+## MLP Scaling Benchmark Analysis
 
 All measurements were collected on an NVIDIA RTX 3070 (46 SMs, 5888 CUDA cores, 8 GB GDDR6) paired with an Intel Core i9-10900F (10 cores, 20 threads, 2.80 GHz). The benchmark sweeps three independent axes --- dataset size, mini-batch size, and hidden-layer width --- while holding the other two fixed. Each configuration trains the full MLP for 200 epochs and reports end-to-end throughput in samples per second.
 
@@ -270,6 +270,7 @@ The GPU speedup plot reveals that cuDNN's advantage over im2col is architectural
 ML-in-C/
 ├── data/                          # Datasets (downloaded via scripts)
 ├── figs/                          # Generated benchmark charts
+├── logs/                          # Benchmark logs (gitignored)
 ├── src/
 │   ├── c/
 │   │   ├── CMakeLists.txt         # Top-level CMake config

@@ -19,6 +19,7 @@ main
 # Ignore logs and temporary files
 *.log
 *.tmp
+logs/
 .CLAUDE.md
 
 
