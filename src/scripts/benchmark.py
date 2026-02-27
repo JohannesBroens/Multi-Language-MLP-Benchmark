@@ -70,13 +70,14 @@ IMPLEMENTATIONS = [
 
 # CNN implementations — fixed architecture (LeNet-5), MNIST only.
 # No --num-samples or --hidden-size flags; dataset is always mnist.
+# NumPy CNN omitted — pure-Python im2col is too slow for meaningful benchmarks
+# (times out at 600s even with 5 epochs).  NumPy remains in MLP where its
+# BLAS backend makes it a competitive CPU baseline.
 CNN_IMPLEMENTATIONS = [
     ("CNN C (CPU)",
      "./src/c/build_cpu/cnn_main --dataset mnist --batch-size {batch_size} --epochs {epochs}"),
     ("CNN C (CUDA)",
      "./src/c/build_cuda/cnn_main --dataset mnist --batch-size {batch_size} --epochs {epochs}"),
-    ("CNN NumPy",
-     "{python} src/python/models/cnn/cnn_numpy.py --dataset mnist --batch-size {batch_size} --epochs {epochs}"),
     ("CNN PyTorch (CPU)",
      "{python} src/python/models/cnn/cnn_pytorch.py --dataset mnist --device cpu --batch-size {batch_size} --epochs {epochs}"),
     ("CNN PyTorch (CUDA)",
@@ -120,8 +121,7 @@ SPEEDUP_PAIRS = [
 CNN_IMPL_STYLES = {
     "CNN C (CUDA)":            {"color": "#2ecc71", "marker": "D", "linewidth": 3.0, "markersize": 10, "zorder": 10},
     "CNN C (CPU)":             {"color": "#3498db", "marker": "o", "linewidth": 2.2, "markersize": 8,  "zorder": 5},
-    "CNN NumPy":               {"color": "#e67e22", "marker": "s", "linewidth": 2.0, "markersize": 7,  "zorder": 4},
-    "CNN PyTorch (CUDA)":      {"color": "#9b59b6", "marker": "^", "linewidth": 2.2, "markersize": 8,  "zorder": 6},
+"CNN PyTorch (CUDA)":      {"color": "#9b59b6", "marker": "^", "linewidth": 2.2, "markersize": 8,  "zorder": 6},
     "CNN PyTorch (CPU)":       {"color": "#e74c3c", "marker": "v", "linewidth": 1.8, "markersize": 7,  "zorder": 3},
     "CNN Rust (CPU)":          {"color": "#f39c12", "marker": "P", "linewidth": 2.2, "markersize": 8,  "zorder": 5},
     "CNN Rust (cuBLAS)":       {"color": "#1abc9c", "marker": "H", "linewidth": 2.8, "markersize": 9,  "zorder": 9},
