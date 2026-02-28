@@ -92,13 +92,18 @@ def phase_benchmark(config, model):
         import yaml
         with open(tuning_path) as f:
             tuned = yaml.safe_load(f)
-        best = tuned.get("best_params", {})
+        best = tuned.get("selected", tuned.get("best_params", {}))
         if best:
             config["training"]["batch_size"] = best.get("batch_size", config["training"]["batch_size"])
             config["training"]["learning_rate"] = best.get("learning_rate", config["training"]["learning_rate"])
             config["training"]["optimizer"] = best.get("optimizer", "sgd")
             config["training"]["scheduler"] = best.get("scheduler", "none")
-            print(f"Loaded tuned params: {best}")
+            extra = ""
+            if "accuracy" in best and "train_time" in best:
+                extra = f" (acc={best['accuracy']:.2f}%, time={best['train_time']:.3f}s)"
+            print(f"Loaded tuned params: bs={best.get('batch_size')}, "
+                  f"lr={best.get('learning_rate')}, opt={best.get('optimizer')}, "
+                  f"sched={best.get('scheduler')}{extra}")
 
     print(f"=== Benchmarking {model.upper()} ===")
     bench = config.get("benchmark", {})
