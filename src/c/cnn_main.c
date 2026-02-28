@@ -4,6 +4,7 @@
 #include <math.h>
 #include <time.h>
 #include "cnn.h"
+#include "nn_ops.h"
 #include "data_loader.h"
 
 static void print_usage(const char *prog) {
@@ -11,6 +12,8 @@ static void print_usage(const char *prog) {
     printf("  --batch-size N    Mini-batch size (default: 4096)\n");
     printf("  --epochs N        Number of training epochs (default: 20)\n");
     printf("  --learning-rate F Learning rate (default: 0.32)\n");
+    printf("  --optimizer S     Optimizer: sgd, adam (default: sgd)\n");
+    printf("  --scheduler S     LR scheduler: none, cosine (default: none)\n");
 }
 
 /* Fisher-Yates shuffle: randomly permute samples in-place. */
@@ -40,6 +43,8 @@ int main(int argc, char *argv[]) {
     int batch_size = 4096;
     int num_epochs = 20;
     float learning_rate = 0.32f;
+    OptimizerType optimizer = OPT_SGD;
+    SchedulerType scheduler = SCHED_NONE;
 
     for (int i = 1; i < argc; i++) {
         if ((strcmp(argv[i], "--dataset") == 0 || strcmp(argv[i], "-d") == 0) && i + 1 < argc) {
@@ -50,6 +55,12 @@ int main(int argc, char *argv[]) {
             num_epochs = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--learning-rate") == 0 && i + 1 < argc) {
             learning_rate = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--optimizer") == 0 && i + 1 < argc) {
+            if (strcmp(argv[i+1], "adam") == 0) optimizer = OPT_ADAM;
+            i++;
+        } else if (strcmp(argv[i], "--scheduler") == 0 && i + 1 < argc) {
+            if (strcmp(argv[i+1], "cosine") == 0) scheduler = SCHED_COSINE;
+            i++;
         } else {
             print_usage(argv[0]);
             return EXIT_FAILURE;
@@ -103,7 +114,7 @@ int main(int argc, char *argv[]) {
            num_epochs, batch_size, learning_rate);
 
     double t_start = get_time_sec();
-    cnn_train(&cnn, train_inputs, train_labels, train_size, batch_size, num_epochs, learning_rate);
+    cnn_train(&cnn, train_inputs, train_labels, train_size, batch_size, num_epochs, learning_rate, optimizer, scheduler);
     double t_train = get_time_sec() - t_start;
 
     float loss, accuracy;

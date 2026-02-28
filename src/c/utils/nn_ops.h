@@ -7,6 +7,10 @@ extern "C" {
 #define restrict __restrict__
 #endif
 
+/* --- Optimizer and scheduler selection --- */
+typedef enum { OPT_SGD = 0, OPT_ADAM = 1 } OptimizerType;
+typedef enum { SCHED_NONE = 0, SCHED_COSINE = 1 } SchedulerType;
+
 /*
  * Shared neural network operations used across all model implementations.
  * Provides GEMM (matrix multiply), activation functions, loss computation,

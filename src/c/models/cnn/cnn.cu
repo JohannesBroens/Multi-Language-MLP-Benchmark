@@ -539,7 +539,9 @@ static void forward_batch(const CNN *cnn, const float *d_inputs, int bs,
 /* ------------------------------------------------------------------ */
 
 void cnn_train(CNN *cnn, float *inputs, int *targets, int num_samples,
-               int batch_size, int num_epochs, float learning_rate) {
+               int batch_size, int num_epochs, float learning_rate,
+               OptimizerType optimizer, SchedulerType scheduler) {
+    (void)optimizer; (void)scheduler; /* TODO: implement in later tasks */
 
     int input_size = IN_C * IN_H * IN_W;
 

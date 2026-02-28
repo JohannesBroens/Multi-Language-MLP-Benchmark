@@ -1,6 +1,8 @@
 #ifndef CNN_H
 #define CNN_H
 
+#include "nn_ops.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -43,9 +45,10 @@ void cnn_initialize(CNN *cnn);
 /* Free all parameter memory */
 void cnn_free(CNN *cnn);
 
-/* Mini-batch SGD training with cross-entropy loss */
+/* Mini-batch training with cross-entropy loss */
 void cnn_train(CNN *cnn, float *inputs, int *targets, int num_samples,
-               int batch_size, int num_epochs, float learning_rate);
+               int batch_size, int num_epochs, float learning_rate,
+               OptimizerType optimizer, SchedulerType scheduler);
 
 /* Compute average loss and accuracy on a dataset */
 void cnn_evaluate(CNN *cnn, float *inputs, int *targets, int num_samples,

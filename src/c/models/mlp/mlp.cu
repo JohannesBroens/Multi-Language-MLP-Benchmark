@@ -219,7 +219,9 @@ void mlp_free(MLP *mlp) {
 /* ------------------------------------------------------------------ */
 
 void mlp_train(MLP *mlp, float *inputs, int *targets, int num_samples,
-               int batch_size, int num_epochs, float learning_rate) {
+               int batch_size, int num_epochs, float learning_rate,
+               OptimizerType optimizer, SchedulerType scheduler) {
+    (void)optimizer; (void)scheduler; /* TODO: implement in later tasks */
     int in  = mlp->input_size;
     int hid = mlp->hidden_size;
     int out = mlp->output_size;
