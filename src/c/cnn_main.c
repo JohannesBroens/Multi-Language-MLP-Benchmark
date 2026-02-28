@@ -8,8 +8,9 @@
 
 static void print_usage(const char *prog) {
     printf("Usage: %s --dataset [mnist] [options]\n", prog);
-    printf("  --batch-size N    Mini-batch size (default: 64)\n");
+    printf("  --batch-size N    Mini-batch size (default: 4096)\n");
     printf("  --epochs N        Number of training epochs (default: 20)\n");
+    printf("  --learning-rate F Learning rate (default: 0.32)\n");
 }
 
 /* Fisher-Yates shuffle: randomly permute samples in-place. */
@@ -36,9 +37,9 @@ static double get_time_sec(void) {
 
 int main(int argc, char *argv[]) {
     char *dataset_name = "mnist";
-    int batch_size = 64;
+    int batch_size = 4096;
     int num_epochs = 20;
-    float learning_rate = 0.01f;
+    float learning_rate = 0.32f;
 
     for (int i = 1; i < argc; i++) {
         if ((strcmp(argv[i], "--dataset") == 0 || strcmp(argv[i], "-d") == 0) && i + 1 < argc) {
@@ -47,6 +48,8 @@ int main(int argc, char *argv[]) {
             batch_size = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--epochs") == 0 && i + 1 < argc) {
             num_epochs = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--learning-rate") == 0 && i + 1 < argc) {
+            learning_rate = atof(argv[++i]);
         } else {
             print_usage(argv[0]);
             return EXIT_FAILURE;

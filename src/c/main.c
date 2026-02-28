@@ -8,10 +8,11 @@
 
 static void print_usage(const char *prog) {
     printf("Usage: %s --dataset [generated|iris|wine-red|wine-white|breast-cancer|mnist]\n", prog);
-    printf("  --batch-size N    Mini-batch size (default: 32)\n");
+    printf("  --batch-size N    Mini-batch size (default: 8192)\n");
     printf("  --num-samples N   Number of samples for generated dataset (default: 1000)\n");
     printf("  --hidden-size N   Hidden layer size (default: 64)\n");
     printf("  --epochs N        Number of training epochs (default: 1000)\n");
+    printf("  --learning-rate F Learning rate (default: 0.02)\n");
 }
 
 /*
@@ -64,11 +65,11 @@ static double get_time_sec(void) {
 
 int main(int argc, char *argv[]) {
     char *dataset_name = NULL;
-    int batch_size = 32;
+    int batch_size = 8192;
     int num_samples_requested = 0;  /* 0 = use dataset default */
     int hidden_size = 64;
     int num_epochs = 1000;
-    float learning_rate = 0.01f;
+    float learning_rate = 0.02f;
 
     for (int i = 1; i < argc; i++) {
         if ((strcmp(argv[i], "--dataset") == 0 || strcmp(argv[i], "-d") == 0) && i + 1 < argc) {
@@ -81,6 +82,8 @@ int main(int argc, char *argv[]) {
             hidden_size = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--epochs") == 0 && i + 1 < argc) {
             num_epochs = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--learning-rate") == 0 && i + 1 < argc) {
+            learning_rate = atof(argv[++i]);
         } else {
             print_usage(argv[0]);
             return EXIT_FAILURE;

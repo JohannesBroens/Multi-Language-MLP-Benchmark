@@ -1,7 +1,7 @@
 use nn_common::{load_dataset, parse_args, shuffle_data};
 use std::time::Instant;
 
-const LEARNING_RATE: f32 = 0.01;
+const DEFAULT_LR: f32 = 0.32;
 
 // LeNet-5 dimensions
 const IN_C: usize = 1;
@@ -24,19 +24,12 @@ const C2_OW: i32 = 8;
 const C2_COL_ROWS: i32 = 150;  // 6*5*5
 const C2_COL_COLS: i32 = 64;   // 8*8
 const P2_SIZE: i32 = 2;
+const P2_H: i32 = C2_OH / P2_SIZE;  // 4
+const P2_W: i32 = C2_OW / P2_SIZE;  // 4
 const FLAT_SIZE: i32 = 256;    // 16*4*4
 const FC1_OUT: i32 = 120;
 const FC2_OUT: i32 = 84;
 const NUM_CLASSES: i32 = 10;
-
-// Workspace offsets
-const WS_COL1: i32 = 0;
-const WS_CONV1: i32 = C1_COL_ROWS * C1_COL_COLS;
-const WS_POOL1: i32 = WS_CONV1 + C1_OUT * C1_COL_COLS;
-const WS_COL2: i32 = WS_POOL1 + C1_OUT * P1_H * P1_W;
-const WS_CONV2: i32 = WS_COL2 + C2_COL_ROWS * C2_COL_COLS;
-const WS_POOL2: i32 = WS_CONV2 + C2_OUT * C2_COL_COLS;
-const WS_SIZE: i32 = WS_POOL2 + FLAT_SIZE;
 
 // ---------------------------------------------------------------------------
 //  CUDA FFI
@@ -49,7 +42,6 @@ type CublasHandle = *mut std::ffi::c_void;
 enum CublasOperation { N = 0, T = 1 }
 
 const CUDA_MEMCPY_HOST_TO_DEVICE: i32 = 1;
-const CUDA_MEMCPY_DEVICE_TO_DEVICE: i32 = 3;
 const CUDA_MANAGED_MEM_GLOBAL: u32 = 1;
 
 extern "C" {
@@ -67,14 +59,15 @@ extern "C" {
                        m: i32, n: i32, k: i32, alpha: *const f32, A: *const f32, lda: i32,
                        B: *const f32, ldb: i32, beta: *const f32, C: *mut f32, ldc: i32) -> i32;
 
-    // CNN kernels
-    fn launch_im2col(input: *const f32, col: *mut f32, C: i32, H: i32, W: i32, kH: i32, kW: i32, stride: i32, OH: i32, OW: i32);
-    fn launch_col2im(col: *const f32, output: *mut f32, C: i32, H: i32, W: i32, kH: i32, kW: i32, stride: i32, OH: i32, OW: i32);
-    fn launch_avg_pool_forward(input: *const f32, output: *mut f32, C: i32, H: i32, W: i32, pool_size: i32, OH: i32, OW: i32);
-    fn launch_avg_pool_backward(grad_output: *const f32, grad_input: *mut f32, C: i32, H: i32, W: i32, pool_size: i32, OH: i32, OW: i32);
+    // Batched CNN kernels
+    fn launch_im2col_batch(input: *const f32, col: *mut f32, C: i32, B: i32, H: i32, W: i32, kH: i32, kW: i32, stride: i32, OH: i32, OW: i32);
+    fn launch_col2im_batch(col: *const f32, output: *mut f32, C: i32, B: i32, H: i32, W: i32, kH: i32, kW: i32, stride: i32, OH: i32, OW: i32);
+    fn launch_avg_pool_forward_batch(input: *const f32, output: *mut f32, C: i32, B: i32, H: i32, W: i32, pool_size: i32, PH: i32, PW: i32);
+    fn launch_avg_pool_backward_batch(grad_output: *const f32, grad_input: *mut f32, C: i32, B: i32, H: i32, W: i32, pool_size: i32, PH: i32, PW: i32);
+    fn launch_transpose_cb_to_bc(src: *const f32, dst: *mut f32, C: i32, B: i32, S: i32);
+    fn launch_transpose_bc_to_cb(src: *const f32, dst: *mut f32, B: i32, C: i32, S: i32);
     fn launch_add_bias(x: *mut f32, bias: *const f32, channels: i32, spatial: i32);
     fn launch_bias_grad(grad: *const f32, grad_bias: *mut f32, channels: i32, spatial: i32);
-    fn launch_copy_flat(ws_all: *const f32, flat: *mut f32, ws_size: i32, ws_pool2_offset: i32, flat_size: i32, bs: i32);
 
     // Shared elementwise kernels
     fn launch_bias_relu(hidden: *mut f32, bias: *const f32, total: i32, hid: i32);
@@ -115,9 +108,6 @@ fn cuda_memcpy_h2d(dst: *mut f32, src: &[f32]) {
 }
 fn cuda_memcpy_h2d_i32(dst: *mut i32, src: &[i32]) {
     unsafe { cudaMemcpy(dst as *mut _, src.as_ptr() as *const _, src.len() * 4, CUDA_MEMCPY_HOST_TO_DEVICE); }
-}
-fn cuda_memcpy_d2d(dst: *mut f32, src: *const f32, count: usize) {
-    unsafe { cudaMemcpy(dst as *mut _, src as *const _, count * 4, CUDA_MEMCPY_DEVICE_TO_DEVICE); }
 }
 fn cuda_memset_zero(ptr: *mut f32, count: usize) {
     unsafe { cudaMemset(ptr as *mut _, 0, count * 4); }
@@ -187,40 +177,30 @@ impl GpuCnn {
         GpuCnn { conv1_w, conv1_b, conv2_w, conv2_b, fc1_w, fc1_b, fc2_w, fc2_b, out_w, out_b, cublas }
     }
 
-    fn conv_forward_sample(&self, input: *const f32, ws: *mut f32) {
-        unsafe {
-            let col1 = ws.add(WS_COL1 as usize);
-            let conv1 = ws.add(WS_CONV1 as usize);
-            let pool1 = ws.add(WS_POOL1 as usize);
-            let col2 = ws.add(WS_COL2 as usize);
-            let conv2 = ws.add(WS_CONV2 as usize);
-            let pool2 = ws.add(WS_POOL2 as usize);
-
-            launch_im2col(input, col1, 1, IN_H as i32, IN_W as i32, C1_K, C1_K, 1, C1_OH, C1_OW);
-            sgemm_nn(self.cublas, C1_OUT, C1_COL_COLS, C1_COL_ROWS, self.conv1_w, col1, conv1);
-            launch_add_bias(conv1, self.conv1_b, C1_OUT, C1_COL_COLS);
-            launch_relu_forward(conv1, C1_OUT * C1_COL_COLS);
-            launch_avg_pool_forward(conv1, pool1, C1_OUT, C1_OH, C1_OW, P1_SIZE, P1_H, P1_W);
-
-            launch_im2col(pool1, col2, C2_IN, P1_H, P1_W, C2_K, C2_K, 1, C2_OH, C2_OW);
-            sgemm_nn(self.cublas, C2_OUT, C2_COL_COLS, C2_COL_ROWS, self.conv2_w, col2, conv2);
-            launch_add_bias(conv2, self.conv2_b, C2_OUT, C2_COL_COLS);
-            launch_relu_forward(conv2, C2_OUT * C2_COL_COLS);
-            launch_avg_pool_forward(conv2, pool2, C2_OUT, C2_OH, C2_OW, P2_SIZE, C2_OH / P2_SIZE, C2_OW / P2_SIZE);
-        }
-    }
-
     fn forward_batch(&self, d_inputs: *const f32, bs: i32,
-                     ws_all: *mut f32, flat: *mut f32,
-                     fc1_out: *mut f32, fc2_out: *mut f32, out: *mut f32) {
-        let input_size = (IN_C * IN_H * IN_W) as usize;
-        for b in 0..bs as usize {
-            let img = unsafe { d_inputs.add(b * input_size) };
-            let ws = unsafe { ws_all.add(b * WS_SIZE as usize) };
-            self.conv_forward_sample(img, ws);
-        }
-        unsafe { launch_copy_flat(ws_all, flat, WS_SIZE, WS_POOL2, FLAT_SIZE, bs); }
+                     col1_b: *mut f32, conv1_b: *mut f32, pool1_b: *mut f32,
+                     col2_b: *mut f32, conv2_b: *mut f32, pool2_b: *mut f32,
+                     flat: *mut f32, fc1_out: *mut f32, fc2_out: *mut f32, out: *mut f32) {
+        unsafe {
+            // Conv1: input [1, B*784] -> col [25, B*576] -> conv [6, B*576] -> pool [6, B*144]
+            launch_im2col_batch(d_inputs, col1_b, 1, bs, IN_H as i32, IN_W as i32, C1_K, C1_K, 1, C1_OH, C1_OW);
+            sgemm_nn(self.cublas, C1_OUT, bs * C1_COL_COLS, C1_COL_ROWS, self.conv1_w, col1_b, conv1_b);
+            launch_add_bias(conv1_b, self.conv1_b, C1_OUT, bs * C1_COL_COLS);
+            launch_relu_forward(conv1_b, C1_OUT * bs * C1_COL_COLS);
+            launch_avg_pool_forward_batch(conv1_b, pool1_b, C1_OUT, bs, C1_OH, C1_OW, P1_SIZE, P1_H, P1_W);
 
+            // Conv2: pool1 [6, B*144] -> col [150, B*64] -> conv [16, B*64] -> pool [16, B*16]
+            launch_im2col_batch(pool1_b, col2_b, C2_IN, bs, P1_H, P1_W, C2_K, C2_K, 1, C2_OH, C2_OW);
+            sgemm_nn(self.cublas, C2_OUT, bs * C2_COL_COLS, C2_COL_ROWS, self.conv2_w, col2_b, conv2_b);
+            launch_add_bias(conv2_b, self.conv2_b, C2_OUT, bs * C2_COL_COLS);
+            launch_relu_forward(conv2_b, C2_OUT * bs * C2_COL_COLS);
+            launch_avg_pool_forward_batch(conv2_b, pool2_b, C2_OUT, bs, C2_OH, C2_OW, P2_SIZE, P2_H, P2_W);
+
+            // Transpose [C2_OUT, B*P2_H*P2_W] -> [B, FLAT_SIZE]
+            launch_transpose_cb_to_bc(pool2_b, flat, C2_OUT, bs, P2_H * P2_W);
+        }
+
+        // FC layers (batch-major [B, features])
         sgemm_nn(self.cublas, bs, FC1_OUT, FLAT_SIZE, flat, self.fc1_w, fc1_out);
         unsafe { launch_bias_relu(fc1_out, self.fc1_b, bs * FC1_OUT, FC1_OUT); }
 
@@ -232,19 +212,28 @@ impl GpuCnn {
     }
 
     fn train(&mut self, inputs: &[f32], targets: &[i32], num_samples: usize,
-             batch_size: usize, num_epochs: usize) {
+             batch_size: usize, num_epochs: usize, learning_rate: f32) {
         let input_size = IN_C * IN_H * IN_W;
         let d_inputs = cuda_malloc(num_samples * input_size * 4);
         let d_targets = cuda_malloc(num_samples * 4) as *mut i32;
         cuda_memcpy_h2d(d_inputs, &inputs[..num_samples * input_size]);
         cuda_memcpy_h2d_i32(d_targets, &targets[..num_samples]);
 
-        let ws_all = cuda_malloc(batch_size * WS_SIZE as usize * 4);
+        let bs_max = batch_size as i32;
+
+        // Forward buffers (channel-major)
+        let col1_b = cuda_malloc((C1_COL_ROWS * bs_max * C1_COL_COLS) as usize * 4);
+        let conv1_b_buf = cuda_malloc((C1_OUT * bs_max * C1_COL_COLS) as usize * 4);
+        let pool1_b = cuda_malloc((C1_OUT * bs_max * P1_H * P1_W) as usize * 4);
+        let col2_b = cuda_malloc((C2_COL_ROWS * bs_max * C2_COL_COLS) as usize * 4);
+        let conv2_b_buf = cuda_malloc((C2_OUT * bs_max * C2_COL_COLS) as usize * 4);
+        let pool2_b = cuda_malloc((C2_OUT * bs_max * P2_H * P2_W) as usize * 4);
         let flat = cuda_malloc(batch_size * FLAT_SIZE as usize * 4);
         let fc1_out = cuda_malloc(batch_size * FC1_OUT as usize * 4);
         let fc2_out = cuda_malloc(batch_size * FC2_OUT as usize * 4);
         let out = cuda_malloc(batch_size * NUM_CLASSES as usize * 4);
 
+        // Backward buffers
         let d_out = cuda_malloc(batch_size * NUM_CLASSES as usize * 4);
         let d_fc2 = cuda_malloc(batch_size * FC2_OUT as usize * 4);
         let d_fc1 = cuda_malloc(batch_size * FC1_OUT as usize * 4);
@@ -262,16 +251,12 @@ impl GpuCnn {
         let g_conv1_w = cuda_malloc(C1_OUT as usize * C1_COL_ROWS as usize * 4);
         let g_conv1_b = cuda_malloc(C1_OUT as usize * 4);
 
-        let d_pool2 = cuda_malloc(FLAT_SIZE as usize * 4);
-        let d_conv2_out = cuda_malloc((C2_OUT * C2_COL_COLS) as usize * 4);
-        let d_col2 = cuda_malloc((C2_COL_ROWS * C2_COL_COLS) as usize * 4);
-        let d_pool1 = cuda_malloc((C2_IN * P1_H * P1_W) as usize * 4);
-        let d_conv1_out = cuda_malloc((C1_OUT * C1_COL_COLS) as usize * 4);
-
-        let tmp_gw2 = cuda_malloc((C2_OUT * C2_COL_ROWS) as usize * 4);
-        let tmp_gw1 = cuda_malloc((C1_OUT * C1_COL_ROWS) as usize * 4);
-        let tmp_gb2 = cuda_malloc(C2_OUT as usize * 4);
-        let tmp_gb1 = cuda_malloc(C1_OUT as usize * 4);
+        // Backward conv buffers (channel-major)
+        let d_pool2_b = cuda_malloc((C2_OUT * bs_max * P2_H * P2_W) as usize * 4);
+        let d_conv2_b = cuda_malloc((C2_OUT * bs_max * C2_COL_COLS) as usize * 4);
+        let d_col2_b = cuda_malloc((C2_COL_ROWS * bs_max * C2_COL_COLS) as usize * 4);
+        let d_pool1_b = cuda_malloc((C2_IN * bs_max * P1_H * P1_W) as usize * 4);
+        let d_conv1_b = cuda_malloc((C1_OUT * bs_max * C1_COL_COLS) as usize * 4);
 
         let d_losses = cuda_malloc(batch_size * 4);
         let d_loss_sum = cuda_malloc_managed(4);
@@ -288,7 +273,9 @@ impl GpuCnn {
                 let x = unsafe { d_inputs.add(start * input_size) };
                 let y = unsafe { d_targets.add(start) };
 
-                self.forward_batch(x, bs, ws_all, flat, fc1_out, fc2_out, out);
+                self.forward_batch(x, bs, col1_b, conv1_b_buf, pool1_b,
+                                   col2_b, conv2_b_buf, pool2_b,
+                                   flat, fc1_out, fc2_out, out);
 
                 unsafe {
                     launch_ce_grad(out, y, d_out, d_losses, bs, NUM_CLASSES);
@@ -313,46 +300,36 @@ impl GpuCnn {
 
                 sgemm_nt(self.cublas, bs, FLAT_SIZE, FC1_OUT, d_fc1, self.fc1_w, d_flat);
 
-                // Conv backward (per-sample)
-                cuda_memset_zero(g_conv2_w, (C2_OUT * C2_COL_ROWS) as usize);
-                cuda_memset_zero(g_conv2_b, C2_OUT as usize);
-                cuda_memset_zero(g_conv1_w, (C1_OUT * C1_COL_ROWS) as usize);
-                cuda_memset_zero(g_conv1_b, C1_OUT as usize);
+                // Conv backward (batched)
+                unsafe {
+                    // Transpose d_flat [B, FLAT_SIZE] -> d_pool2_b [C2_OUT, B*P2_H*P2_W]
+                    launch_transpose_bc_to_cb(d_flat, d_pool2_b, bs, C2_OUT, P2_H * P2_W);
 
-                for b in 0..bs {
-                    let ws = unsafe { ws_all.add(b as usize * WS_SIZE as usize) };
-                    let col1 = unsafe { ws.add(WS_COL1 as usize) };
-                    let conv1_out_ptr = unsafe { ws.add(WS_CONV1 as usize) };
-                    let col2 = unsafe { ws.add(WS_COL2 as usize) };
-                    let conv2_out_ptr = unsafe { ws.add(WS_CONV2 as usize) };
+                    // Conv2 backward
+                    cuda_memset_zero(d_conv2_b, (C2_OUT * bs * C2_COL_COLS) as usize);
+                    launch_avg_pool_backward_batch(d_pool2_b, d_conv2_b, C2_OUT, bs, C2_OH, C2_OW, P2_SIZE, P2_H, P2_W);
+                    launch_relu_mask(d_conv2_b, conv2_b_buf, C2_OUT * bs * C2_COL_COLS);
 
-                    cuda_memcpy_d2d(d_pool2, unsafe { d_flat.add(b as usize * FLAT_SIZE as usize) }, FLAT_SIZE as usize);
+                    // Weight gradient: d_conv2 [C2_OUT, B*C2_COL_COLS] @ col2^T [B*C2_COL_COLS, C2_COL_ROWS]
+                    sgemm_nt(self.cublas, C2_OUT, C2_COL_ROWS, bs * C2_COL_COLS, d_conv2_b, col2_b, g_conv2_w);
+                    launch_bias_grad(d_conv2_b, g_conv2_b, C2_OUT, bs * C2_COL_COLS);
 
-                    cuda_memset_zero(d_conv2_out, (C2_OUT * C2_COL_COLS) as usize);
-                    unsafe { launch_avg_pool_backward(d_pool2, d_conv2_out, C2_OUT, C2_OH, C2_OW, P2_SIZE, C2_OH / P2_SIZE, C2_OW / P2_SIZE); }
-                    unsafe { launch_relu_mask(d_conv2_out, conv2_out_ptr, C2_OUT * C2_COL_COLS); }
+                    // Input gradient: W2^T [C2_COL_ROWS, C2_OUT] @ d_conv2 [C2_OUT, B*C2_COL_COLS]
+                    sgemm_tn(self.cublas, C2_COL_ROWS, bs * C2_COL_COLS, C2_OUT, self.conv2_w, d_conv2_b, d_col2_b);
 
-                    sgemm_nt(self.cublas, C2_OUT, C2_COL_ROWS, C2_COL_COLS, d_conv2_out, col2, tmp_gw2);
-                    unsafe { launch_sgd(g_conv2_w, tmp_gw2, -1.0, C2_OUT * C2_COL_ROWS); }
-                    unsafe { launch_bias_grad(d_conv2_out, tmp_gb2, C2_OUT, C2_COL_COLS); }
-                    unsafe { launch_sgd(g_conv2_b, tmp_gb2, -1.0, C2_OUT); }
+                    cuda_memset_zero(d_pool1_b, (C2_IN * bs * P1_H * P1_W) as usize);
+                    launch_col2im_batch(d_col2_b, d_pool1_b, C2_IN, bs, P1_H, P1_W, C2_K, C2_K, 1, C2_OH, C2_OW);
 
-                    sgemm_tn(self.cublas, C2_COL_ROWS, C2_COL_COLS, C2_OUT, self.conv2_w, d_conv2_out, d_col2);
+                    // Conv1 backward
+                    cuda_memset_zero(d_conv1_b, (C1_OUT * bs * C1_COL_COLS) as usize);
+                    launch_avg_pool_backward_batch(d_pool1_b, d_conv1_b, C1_OUT, bs, C1_OH, C1_OW, P1_SIZE, P1_H, P1_W);
+                    launch_relu_mask(d_conv1_b, conv1_b_buf, C1_OUT * bs * C1_COL_COLS);
 
-                    cuda_memset_zero(d_pool1, (C2_IN * P1_H * P1_W) as usize);
-                    unsafe { launch_col2im(d_col2, d_pool1, C2_IN, P1_H, P1_W, C2_K, C2_K, 1, C2_OH, C2_OW); }
-
-                    cuda_memset_zero(d_conv1_out, (C1_OUT * C1_COL_COLS) as usize);
-                    unsafe { launch_avg_pool_backward(d_pool1, d_conv1_out, C1_OUT, C1_OH, C1_OW, P1_SIZE, P1_H, P1_W); }
-                    unsafe { launch_relu_mask(d_conv1_out, conv1_out_ptr, C1_OUT * C1_COL_COLS); }
-
-                    sgemm_nt(self.cublas, C1_OUT, C1_COL_ROWS, C1_COL_COLS, d_conv1_out, col1, tmp_gw1);
-                    unsafe { launch_sgd(g_conv1_w, tmp_gw1, -1.0, C1_OUT * C1_COL_ROWS); }
-                    unsafe { launch_bias_grad(d_conv1_out, tmp_gb1, C1_OUT, C1_COL_COLS); }
-                    unsafe { launch_sgd(g_conv1_b, tmp_gb1, -1.0, C1_OUT); }
+                    sgemm_nt(self.cublas, C1_OUT, C1_COL_ROWS, bs * C1_COL_COLS, d_conv1_b, col1_b, g_conv1_w);
+                    launch_bias_grad(d_conv1_b, g_conv1_b, C1_OUT, bs * C1_COL_COLS);
                 }
 
-                let lr_s = LEARNING_RATE / bs as f32;
+                let lr_s = learning_rate / bs as f32;
                 unsafe {
                     launch_sgd(self.out_w, g_out_w, lr_s, FC2_OUT * NUM_CLASSES);
                     launch_sgd(self.out_b, g_out_b, lr_s, NUM_CLASSES);
@@ -372,11 +349,14 @@ impl GpuCnn {
         }
 
         cuda_sync();
-        for p in [d_inputs, d_targets as *mut f32, ws_all, flat, fc1_out, fc2_out, out,
-                   d_out, d_fc2, d_fc1, d_flat, g_out_w, g_out_b, g_fc2_w, g_fc2_b,
-                   g_fc1_w, g_fc1_b, g_conv2_w, g_conv2_b, g_conv1_w, g_conv1_b,
-                   d_pool2, d_conv2_out, d_col2, d_pool1, d_conv1_out,
-                   tmp_gw2, tmp_gw1, tmp_gb2, tmp_gb1, d_losses, d_loss_sum] {
+        for p in [d_inputs, d_targets as *mut f32,
+                   col1_b, conv1_b_buf, pool1_b, col2_b, conv2_b_buf, pool2_b,
+                   flat, fc1_out, fc2_out, out,
+                   d_out, d_fc2, d_fc1, d_flat,
+                   g_out_w, g_out_b, g_fc2_w, g_fc2_b, g_fc1_w, g_fc1_b,
+                   g_conv2_w, g_conv2_b, g_conv1_w, g_conv1_b,
+                   d_pool2_b, d_conv2_b, d_col2_b, d_pool1_b, d_conv1_b,
+                   d_losses, d_loss_sum] {
             cuda_free(p);
         }
     }
@@ -390,7 +370,12 @@ impl GpuCnn {
         cuda_memcpy_h2d(d_inputs, &inputs[..num_samples * input_size]);
         cuda_memcpy_h2d_i32(d_targets, &targets[..num_samples]);
 
-        let ws_all = cuda_malloc(eval_bs as usize * WS_SIZE as usize * 4);
+        let col1_b = cuda_malloc((C1_COL_ROWS * eval_bs * C1_COL_COLS) as usize * 4);
+        let conv1_b_buf = cuda_malloc((C1_OUT * eval_bs * C1_COL_COLS) as usize * 4);
+        let pool1_b = cuda_malloc((C1_OUT * eval_bs * P1_H * P1_W) as usize * 4);
+        let col2_b = cuda_malloc((C2_COL_ROWS * eval_bs * C2_COL_COLS) as usize * 4);
+        let conv2_b_buf = cuda_malloc((C2_OUT * eval_bs * C2_COL_COLS) as usize * 4);
+        let pool2_b = cuda_malloc((C2_OUT * eval_bs * P2_H * P2_W) as usize * 4);
         let flat = cuda_malloc(eval_bs as usize * FLAT_SIZE as usize * 4);
         let fc1_out = cuda_malloc(eval_bs as usize * FC1_OUT as usize * 4);
         let fc2_out = cuda_malloc(eval_bs as usize * FC2_OUT as usize * 4);
@@ -407,7 +392,9 @@ impl GpuCnn {
             let bs = (eval_bs as usize).min(num_samples - start) as i32;
 
             self.forward_batch(unsafe { d_inputs.add(start * input_size) }, bs,
-                               ws_all, flat, fc1_out, fc2_out, out);
+                               col1_b, conv1_b_buf, pool1_b,
+                               col2_b, conv2_b_buf, pool2_b,
+                               flat, fc1_out, fc2_out, out);
 
             unsafe {
                 launch_eval_metrics(out, d_targets.add(start), d_losses, d_correct, bs, NUM_CLASSES);
@@ -419,7 +406,10 @@ impl GpuCnn {
         let loss = unsafe { *d_loss_sum } / num_samples as f32;
         let accuracy = unsafe { *d_correct } as f32 / num_samples as f32 * 100.0;
 
-        for p in [d_inputs, d_targets as *mut f32, ws_all, flat, fc1_out, fc2_out, out, d_losses, d_loss_sum, d_correct as *mut f32] {
+        for p in [d_inputs, d_targets as *mut f32,
+                   col1_b, conv1_b_buf, pool1_b, col2_b, conv2_b_buf, pool2_b,
+                   flat, fc1_out, fc2_out, out,
+                   d_losses, d_loss_sum, d_correct as *mut f32] {
             cuda_free(p);
         }
         (loss, accuracy)
@@ -455,12 +445,13 @@ fn main() {
     println!("Train: {} samples, Test: {} samples", train_size, test_size);
 
     let mut cnn = GpuCnn::new();
+    let learning_rate = if args.learning_rate > 0.0 { args.learning_rate } else { DEFAULT_LR };
     println!("\nTraining LeNet-5 ({} epochs, batch_size={}, lr={:.4})...",
-             args.epochs, args.batch_size, LEARNING_RATE);
+             args.epochs, args.batch_size, learning_rate);
 
     let t_start = Instant::now();
     cnn.train(&dataset.inputs[..train_size * dataset.input_size],
-              &dataset.labels[..train_size], train_size, args.batch_size, args.epochs);
+              &dataset.labels[..train_size], train_size, args.batch_size, args.epochs, learning_rate);
     let t_train = t_start.elapsed().as_secs_f64();
 
     let t_eval_start = Instant::now();

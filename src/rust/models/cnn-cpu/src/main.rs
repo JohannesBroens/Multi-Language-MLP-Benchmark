@@ -6,7 +6,7 @@ use nn_common::{
 };
 use std::time::Instant;
 
-const LEARNING_RATE: f32 = 0.01;
+const DEFAULT_LR: f32 = 0.32;
 
 // ---------------------------------------------------------------------------
 //  LeNet-5 layer dimensions
@@ -47,11 +47,9 @@ const FC2_OUT: usize = 84;
 const NUM_CLASSES: usize = 10;
 
 // ---------------------------------------------------------------------------
-//  im2col / col2im / avg_pool
+//  Per-sample im2col / col2im / pooling (kept for compatibility)
 // ---------------------------------------------------------------------------
 
-/// im2col: unfold image patches into columns for GEMM-based convolution.
-/// Input shape: [C, H, W]. Output shape: [C*kH*kW, OH*OW].
 fn im2col(input: &[f32], c: usize, h: usize, w: usize,
           kh: usize, kw: usize, stride: usize, col: &mut [f32]) {
     let oh = (h - kh) / stride + 1;
@@ -75,7 +73,6 @@ fn im2col(input: &[f32], c: usize, h: usize, w: usize,
     }
 }
 
-/// col2im: inverse of im2col. Accumulates into output (caller must zero first).
 fn col2im(col: &[f32], c: usize, h: usize, w: usize,
           kh: usize, kw: usize, stride: usize, output: &mut [f32]) {
     let oh = (h - kh) / stride + 1;
@@ -99,7 +96,6 @@ fn col2im(col: &[f32], c: usize, h: usize, w: usize,
     }
 }
 
-/// Average pooling forward.
 fn avg_pool_forward(input: &[f32], output: &mut [f32],
                     c: usize, h: usize, w: usize, pool_size: usize) {
     let oh = h / pool_size;
@@ -123,7 +119,6 @@ fn avg_pool_forward(input: &[f32], output: &mut [f32],
     }
 }
 
-/// Average pooling backward.
 fn avg_pool_backward(grad_output: &[f32], grad_input: &mut [f32],
                      c: usize, h: usize, w: usize, pool_size: usize) {
     let oh = h / pool_size;
@@ -157,16 +152,157 @@ fn add_bias(x: &mut [f32], bias: &[f32], channels: usize, spatial: usize) {
 }
 
 // ---------------------------------------------------------------------------
-//  Workspace layout offsets (same as C version)
+//  Batched helpers: channel-major [C, B*spatial] layout
 // ---------------------------------------------------------------------------
 
-const WS_COL1: usize = 0;
-const WS_CONV1: usize = C1_COL_ROWS * C1_COL_COLS;
-const WS_POOL1: usize = WS_CONV1 + C1_OUT * C1_COL_COLS;
-const WS_COL2: usize = WS_POOL1 + C1_OUT * P1_H * P1_W;
-const WS_CONV2: usize = WS_COL2 + C2_COL_ROWS * C2_COL_COLS;
-const WS_POOL2: usize = WS_CONV2 + C2_OUT * C2_COL_COLS;
-const WS_SIZE: usize = WS_POOL2 + FLAT_SIZE;
+/// Batched im2col: input [C, B*H*W] -> col [K, B*OH*OW]
+fn im2col_batch(input: &[f32], batch: usize, c: usize, h: usize, w: usize,
+                kh: usize, kw: usize, stride: usize, col: &mut [f32]) {
+    let oh = (h - kh) / stride + 1;
+    let ow = (w - kw) / stride + 1;
+    let spatial_out = oh * ow;
+    let col_cols = batch * spatial_out;
+
+    let mut col_row = 0;
+    for ci in 0..c {
+        for khi in 0..kh {
+            for kwi in 0..kw {
+                let col_ptr = col_row * col_cols;
+                for b in 0..batch {
+                    let in_base = ci * (batch * h * w) + b * (h * w);
+                    let out_base = col_ptr + b * spatial_out;
+                    for ohi in 0..oh {
+                        for owi in 0..ow {
+                            let hi = ohi * stride + khi;
+                            let wi = owi * stride + kwi;
+                            col[out_base + ohi * ow + owi] =
+                                input[in_base + hi * w + wi];
+                        }
+                    }
+                }
+                col_row += 1;
+            }
+        }
+    }
+}
+
+/// Batched col2im: col [K, B*OH*OW] -> output [C, B*H*W] (accumulates)
+fn col2im_batch(col: &[f32], batch: usize, c: usize, h: usize, w: usize,
+                kh: usize, kw: usize, stride: usize, output: &mut [f32]) {
+    let oh = (h - kh) / stride + 1;
+    let ow = (w - kw) / stride + 1;
+    let spatial_out = oh * ow;
+    let col_cols = batch * spatial_out;
+
+    let mut col_row = 0;
+    for ci in 0..c {
+        for khi in 0..kh {
+            for kwi in 0..kw {
+                let col_ptr = col_row * col_cols;
+                for b in 0..batch {
+                    let out_base = ci * (batch * h * w) + b * (h * w);
+                    let in_base = col_ptr + b * spatial_out;
+                    for ohi in 0..oh {
+                        for owi in 0..ow {
+                            let hi = ohi * stride + khi;
+                            let wi = owi * stride + kwi;
+                            output[out_base + hi * w + wi] +=
+                                col[in_base + ohi * ow + owi];
+                        }
+                    }
+                }
+                col_row += 1;
+            }
+        }
+    }
+}
+
+/// Batched avg pool forward: input [C, B*H*W] -> output [C, B*PH*PW]
+fn avg_pool_forward_batch(input: &[f32], output: &mut [f32],
+                          channels: usize, batch: usize,
+                          h: usize, w: usize, pool_size: usize) {
+    let ph = h / pool_size;
+    let pw = w / pool_size;
+    let scale = 1.0 / (pool_size * pool_size) as f32;
+
+    for c in 0..channels {
+        for b in 0..batch {
+            let in_base = c * batch * h * w + b * h * w;
+            let out_base = c * batch * ph * pw + b * ph * pw;
+            for phi in 0..ph {
+                for pwi in 0..pw {
+                    let mut sum = 0.0f32;
+                    for i in 0..pool_size {
+                        for j in 0..pool_size {
+                            sum += input[in_base + (phi * pool_size + i) * w + (pwi * pool_size + j)];
+                        }
+                    }
+                    output[out_base + phi * pw + pwi] = sum * scale;
+                }
+            }
+        }
+    }
+}
+
+/// Batched avg pool backward: grad_output [C, B*PH*PW] -> grad_input [C, B*H*W]
+fn avg_pool_backward_batch(grad_output: &[f32], grad_input: &mut [f32],
+                           channels: usize, batch: usize,
+                           h: usize, w: usize, pool_size: usize) {
+    let ph = h / pool_size;
+    let pw = w / pool_size;
+    let scale = 1.0 / (pool_size * pool_size) as f32;
+
+    for c in 0..channels {
+        for b in 0..batch {
+            let go_base = c * batch * ph * pw + b * ph * pw;
+            let gi_base = c * batch * h * w + b * h * w;
+            for phi in 0..ph {
+                for pwi in 0..pw {
+                    let g = grad_output[go_base + phi * pw + pwi] * scale;
+                    for i in 0..pool_size {
+                        for j in 0..pool_size {
+                            grad_input[gi_base + (phi * pool_size + i) * w + (pwi * pool_size + j)] = g;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Transpose [C, B*S] -> [B, C*S]
+fn transpose_cb_to_bc(src: &[f32], dst: &mut [f32], channels: usize, batch: usize, s: usize) {
+    for b in 0..batch {
+        for c in 0..channels {
+            let src_off = c * batch * s + b * s;
+            let dst_off = b * channels * s + c * s;
+            dst[dst_off..dst_off + s].copy_from_slice(&src[src_off..src_off + s]);
+        }
+    }
+}
+
+/// Transpose [B, C*S] -> [C, B*S]
+fn transpose_bc_to_cb(src: &[f32], dst: &mut [f32], batch: usize, channels: usize, s: usize) {
+    for c in 0..channels {
+        for b in 0..batch {
+            let src_off = b * channels * s + c * s;
+            let dst_off = c * batch * s + b * s;
+            dst[dst_off..dst_off + s].copy_from_slice(&src[src_off..src_off + s]);
+        }
+    }
+}
+
+/// Conv bias gradient: sum each row of [channels, spatial] -> [channels]
+fn conv_bias_grad(grad: &[f32], grad_bias: &mut [f32], channels: usize, spatial: usize) {
+    for c in 0..channels {
+        let mut sum = 0.0f32;
+        let base = c * spatial;
+        for j in 0..spatial {
+            sum += grad[base + j];
+        }
+        grad_bias[c] = sum;
+    }
+}
 
 // ---------------------------------------------------------------------------
 //  CNN struct
@@ -218,78 +354,30 @@ impl Cnn {
         }
     }
 
-    /// Per-sample conv forward pass.
-    /// Uses separate buffers to avoid borrow-checker issues with overlapping slices.
-    fn conv_forward_sample(&self, input: &[f32], ws: &mut [f32]) {
-        // Use raw pointer for reads from ws while mutating non-overlapping parts.
-        // The workspace regions don't overlap (guaranteed by the offset layout).
-        let ws_ptr = ws.as_ptr();
-
-        // Conv1: im2col -> GEMM -> bias + ReLU -> pool
-        im2col(input, C1_IN, IN_H, IN_W, C1_K, C1_K, 1,
-               &mut ws[WS_COL1..WS_COL1 + C1_COL_ROWS * C1_COL_COLS]);
-
-        // col1 (read) and conv1_out (write) don't overlap
-        let col1_slice = unsafe {
-            std::slice::from_raw_parts(ws_ptr.add(WS_COL1), C1_COL_ROWS * C1_COL_COLS)
-        };
-        sgemm_nn(C1_OUT, C1_COL_COLS, C1_COL_ROWS,
-                 &self.conv1_weights, col1_slice,
-                 &mut ws[WS_CONV1..WS_CONV1 + C1_OUT * C1_COL_COLS]);
-
-        add_bias(&mut ws[WS_CONV1..WS_CONV1 + C1_OUT * C1_COL_COLS],
-                 &self.conv1_biases, C1_OUT, C1_COL_COLS);
-        relu_forward(&mut ws[WS_CONV1..WS_CONV1 + C1_OUT * C1_COL_COLS]);
-
-        // conv1_out (read) and pool1 (write) don't overlap
-        let conv1_slice = unsafe {
-            std::slice::from_raw_parts(ws_ptr.add(WS_CONV1), C1_OUT * C1_COL_COLS)
-        };
-        avg_pool_forward(conv1_slice,
-                         &mut ws[WS_POOL1..WS_POOL1 + C1_OUT * P1_H * P1_W],
-                         C1_OUT, C1_OH, C1_OW, P1_SIZE);
-
-        // Conv2: im2col -> GEMM -> bias + ReLU -> pool
-        // pool1 (read) and col2 (write) don't overlap
-        let pool1_slice = unsafe {
-            std::slice::from_raw_parts(ws_ptr.add(WS_POOL1), C2_IN * P1_H * P1_W)
-        };
-        im2col(pool1_slice, C2_IN, P1_H, P1_W, C2_K, C2_K, 1,
-               &mut ws[WS_COL2..WS_COL2 + C2_COL_ROWS * C2_COL_COLS]);
-
-        let col2_slice = unsafe {
-            std::slice::from_raw_parts(ws_ptr.add(WS_COL2), C2_COL_ROWS * C2_COL_COLS)
-        };
-        sgemm_nn(C2_OUT, C2_COL_COLS, C2_COL_ROWS,
-                 &self.conv2_weights, col2_slice,
-                 &mut ws[WS_CONV2..WS_CONV2 + C2_OUT * C2_COL_COLS]);
-
-        add_bias(&mut ws[WS_CONV2..WS_CONV2 + C2_OUT * C2_COL_COLS],
-                 &self.conv2_biases, C2_OUT, C2_COL_COLS);
-        relu_forward(&mut ws[WS_CONV2..WS_CONV2 + C2_OUT * C2_COL_COLS]);
-
-        let conv2_slice = unsafe {
-            std::slice::from_raw_parts(ws_ptr.add(WS_CONV2), C2_OUT * C2_COL_COLS)
-        };
-        avg_pool_forward(conv2_slice,
-                         &mut ws[WS_POOL2..WS_POOL2 + FLAT_SIZE],
-                         C2_OUT, C2_OH, C2_OW, P2_SIZE);
-    }
-
-    /// Batched forward: per-sample conv, then batched FC.
+    /// Batched forward: one GEMM per conv layer, then batched FC.
     fn forward_batch(&self, inputs: &[f32], bs: usize,
-                     ws_all: &mut [f32], flat: &mut [f32],
+                     col1_b: &mut [f32], conv1_b: &mut [f32], pool1_b: &mut [f32],
+                     col2_b: &mut [f32], conv2_b: &mut [f32], pool2_b: &mut [f32],
+                     flat: &mut [f32],
                      fc1_out: &mut [f32], fc2_out: &mut [f32], out: &mut [f32]) {
-        let input_size = IN_C * IN_H * IN_W;
+        // Conv1: inputs[1, B*784] -> col1_b[25, B*576] -> conv1_b[6, B*576]
+        im2col_batch(inputs, bs, C1_IN, IN_H, IN_W, C1_K, C1_K, 1, col1_b);
+        sgemm_nn(C1_OUT, bs * C1_COL_COLS, C1_COL_ROWS,
+                 &self.conv1_weights, col1_b, conv1_b);
+        add_bias(conv1_b, &self.conv1_biases, C1_OUT, bs * C1_COL_COLS);
+        relu_forward(conv1_b);
+        avg_pool_forward_batch(conv1_b, pool1_b, C1_OUT, bs, C1_OH, C1_OW, P1_SIZE);
 
-        for b in 0..bs {
-            let img = &inputs[b * input_size..(b + 1) * input_size];
-            let ws = &mut ws_all[b * WS_SIZE..(b + 1) * WS_SIZE];
-            self.conv_forward_sample(img, ws);
-            // Copy pool2 to flat
-            flat[b * FLAT_SIZE..(b + 1) * FLAT_SIZE]
-                .copy_from_slice(&ws[WS_POOL2..WS_POOL2 + FLAT_SIZE]);
-        }
+        // Conv2: pool1_b[6, B*144] -> col2_b[150, B*64] -> conv2_b[16, B*64]
+        im2col_batch(pool1_b, bs, C2_IN, P1_H, P1_W, C2_K, C2_K, 1, col2_b);
+        sgemm_nn(C2_OUT, bs * C2_COL_COLS, C2_COL_ROWS,
+                 &self.conv2_weights, col2_b, conv2_b);
+        add_bias(conv2_b, &self.conv2_biases, C2_OUT, bs * C2_COL_COLS);
+        relu_forward(conv2_b);
+        avg_pool_forward_batch(conv2_b, pool2_b, C2_OUT, bs, C2_OH, C2_OW, P2_SIZE);
+
+        // Transition: pool2_b[16, B*16] -> flat[B, 256]
+        transpose_cb_to_bc(pool2_b, flat, C2_OUT, bs, P2_H * P2_W);
 
         // FC1
         sgemm_nn(bs, FC1_OUT, FLAT_SIZE, flat, &self.fc1_weights, fc1_out);
@@ -308,8 +396,15 @@ impl Cnn {
              batch_size: usize, num_epochs: usize, learning_rate: f32) {
         let input_size = IN_C * IN_H * IN_W;
 
-        // Forward workspace
-        let mut ws_all = vec![0.0f32; batch_size * WS_SIZE];
+        // Forward conv workspace (batched, channel-major)
+        let mut col1_b = vec![0.0f32; C1_COL_ROWS * batch_size * C1_COL_COLS];
+        let mut conv1_b = vec![0.0f32; C1_OUT * batch_size * C1_COL_COLS];
+        let mut pool1_b = vec![0.0f32; C1_OUT * batch_size * P1_H * P1_W];
+        let mut col2_b = vec![0.0f32; C2_COL_ROWS * batch_size * C2_COL_COLS];
+        let mut conv2_b = vec![0.0f32; C2_OUT * batch_size * C2_COL_COLS];
+        let mut pool2_b = vec![0.0f32; C2_OUT * batch_size * P2_H * P2_W];
+
+        // FC buffers
         let mut flat = vec![0.0f32; batch_size * FLAT_SIZE];
         let mut fc1_out = vec![0.0f32; batch_size * FC1_OUT];
         let mut fc2_out = vec![0.0f32; batch_size * FC2_OUT];
@@ -334,15 +429,12 @@ impl Cnn {
         let mut grad_conv1_w = vec![0.0f32; C1_OUT * C1_COL_ROWS];
         let mut grad_conv1_b = vec![0.0f32; C1_OUT];
 
-        // Per-sample backward workspace
-        let mut d_pool2 = vec![0.0f32; FLAT_SIZE];
-        let mut d_conv2_out = vec![0.0f32; C2_OUT * C2_COL_COLS];
-        let mut d_col2 = vec![0.0f32; C2_COL_ROWS * C2_COL_COLS];
-        let mut d_pool1 = vec![0.0f32; C2_IN * P1_H * P1_W];
-        let mut d_conv1_out = vec![0.0f32; C1_OUT * C1_COL_COLS];
-
-        let mut tmp_grad_w2 = vec![0.0f32; C2_OUT * C2_COL_ROWS];
-        let mut tmp_grad_w1 = vec![0.0f32; C1_OUT * C1_COL_ROWS];
+        // Backward conv workspace (batched, channel-major)
+        let mut d_pool2_b = vec![0.0f32; C2_OUT * batch_size * P2_H * P2_W];
+        let mut d_conv2_b = vec![0.0f32; C2_OUT * batch_size * C2_COL_COLS];
+        let mut d_col2_b = vec![0.0f32; C2_COL_ROWS * batch_size * C2_COL_COLS];
+        let mut d_pool1_b = vec![0.0f32; C2_IN * batch_size * P1_H * P1_W];
+        let mut d_conv1_b = vec![0.0f32; C1_OUT * batch_size * C1_COL_COLS];
 
         let num_batches = (num_samples + batch_size - 1) / batch_size;
 
@@ -356,9 +448,11 @@ impl Cnn {
                 let x = &inputs[start * input_size..];
                 let y = &targets[start..];
 
-                // Forward
-                self.forward_batch(x, bs, &mut ws_all, &mut flat,
-                                   &mut fc1_out, &mut fc2_out, &mut out);
+                // Forward (batched)
+                self.forward_batch(x, bs,
+                                   &mut col1_b, &mut conv1_b, &mut pool1_b,
+                                   &mut col2_b, &mut conv2_b, &mut pool2_b,
+                                   &mut flat, &mut fc1_out, &mut fc2_out, &mut out);
 
                 // Loss + output gradient
                 let batch_loss = cross_entropy_grad(
@@ -385,78 +479,52 @@ impl Cnn {
 
                 sgemm_nt(bs, FLAT_SIZE, FC1_OUT, &d_fc1, &self.fc1_weights, &mut d_flat);
 
-                // Conv backward (per-sample)
-                for v in grad_conv2_w.iter_mut() { *v = 0.0; }
-                for v in grad_conv2_b.iter_mut() { *v = 0.0; }
-                for v in grad_conv1_w.iter_mut() { *v = 0.0; }
-                for v in grad_conv1_b.iter_mut() { *v = 0.0; }
+                // Conv backward (batched)
 
-                for b in 0..bs {
-                    let ws = &ws_all[b * WS_SIZE..(b + 1) * WS_SIZE];
-                    let col1 = &ws[WS_COL1..WS_COL1 + C1_COL_ROWS * C1_COL_COLS];
-                    let conv1_out_buf = &ws[WS_CONV1..WS_CONV1 + C1_OUT * C1_COL_COLS];
-                    let col2 = &ws[WS_COL2..WS_COL2 + C2_COL_ROWS * C2_COL_COLS];
-                    let conv2_out_buf = &ws[WS_CONV2..WS_CONV2 + C2_OUT * C2_COL_COLS];
+                // Transition: d_flat[B, 256] -> d_pool2_b[16, B*16]
+                transpose_bc_to_cb(&d_flat, &mut d_pool2_b, bs, C2_OUT, P2_H * P2_W);
 
-                    // d_flat[b] -> d_pool2
-                    d_pool2.copy_from_slice(&d_flat[b * FLAT_SIZE..(b + 1) * FLAT_SIZE]);
+                // Pool2 backward
+                avg_pool_backward_batch(&d_pool2_b, &mut d_conv2_b,
+                                        C2_OUT, bs, C2_OH, C2_OW, P2_SIZE);
 
-                    // Pool2 backward
-                    for v in d_conv2_out.iter_mut() { *v = 0.0; }
-                    avg_pool_backward(&d_pool2, &mut d_conv2_out,
-                                      C2_OUT, C2_OH, C2_OW, P2_SIZE);
-
-                    // ReLU backward for conv2
-                    relu_backward(&mut d_conv2_out, conv2_out_buf);
-
-                    // Conv2 weight gradient
-                    sgemm_nt(C2_OUT, C2_COL_ROWS, C2_COL_COLS,
-                             &d_conv2_out, col2, &mut tmp_grad_w2);
-                    for (g, &t) in grad_conv2_w.iter_mut().zip(tmp_grad_w2.iter()) {
-                        *g += t;
-                    }
-
-                    // Conv2 bias gradient
-                    for c in 0..C2_OUT {
-                        let mut sum = 0.0f32;
-                        for j in 0..C2_COL_COLS {
-                            sum += d_conv2_out[c * C2_COL_COLS + j];
-                        }
-                        grad_conv2_b[c] += sum;
-                    }
-
-                    // Conv2 input gradient
-                    sgemm_tn(C2_COL_ROWS, C2_COL_COLS, C2_OUT,
-                             &self.conv2_weights, &d_conv2_out, &mut d_col2);
-
-                    // col2im -> d_pool1
-                    for v in d_pool1.iter_mut() { *v = 0.0; }
-                    col2im(&d_col2, C2_IN, P1_H, P1_W, C2_K, C2_K, 1, &mut d_pool1);
-
-                    // Pool1 backward
-                    for v in d_conv1_out.iter_mut() { *v = 0.0; }
-                    avg_pool_backward(&d_pool1, &mut d_conv1_out,
-                                      C1_OUT, C1_OH, C1_OW, P1_SIZE);
-
-                    // ReLU backward for conv1
-                    relu_backward(&mut d_conv1_out, conv1_out_buf);
-
-                    // Conv1 weight gradient
-                    sgemm_nt(C1_OUT, C1_COL_ROWS, C1_COL_COLS,
-                             &d_conv1_out, col1, &mut tmp_grad_w1);
-                    for (g, &t) in grad_conv1_w.iter_mut().zip(tmp_grad_w1.iter()) {
-                        *g += t;
-                    }
-
-                    // Conv1 bias gradient
-                    for c in 0..C1_OUT {
-                        let mut sum = 0.0f32;
-                        for j in 0..C1_COL_COLS {
-                            sum += d_conv1_out[c * C1_COL_COLS + j];
-                        }
-                        grad_conv1_b[c] += sum;
-                    }
+                // ReLU backward conv2
+                {
+                    let n = C2_OUT * bs * C2_COL_COLS;
+                    relu_backward(&mut d_conv2_b[..n], &conv2_b[..n]);
                 }
+
+                // Conv2 weight gradient (one GEMM)
+                sgemm_nt(C2_OUT, C2_COL_ROWS, bs * C2_COL_COLS,
+                         &d_conv2_b, &col2_b, &mut grad_conv2_w);
+
+                // Conv2 bias gradient
+                conv_bias_grad(&d_conv2_b, &mut grad_conv2_b, C2_OUT, bs * C2_COL_COLS);
+
+                // Conv2 input gradient
+                sgemm_tn(C2_COL_ROWS, bs * C2_COL_COLS, C2_OUT,
+                         &self.conv2_weights, &d_conv2_b, &mut d_col2_b);
+
+                // col2im batch
+                for v in d_pool1_b.iter_mut() { *v = 0.0; }
+                col2im_batch(&d_col2_b, bs, C2_IN, P1_H, P1_W, C2_K, C2_K, 1, &mut d_pool1_b);
+
+                // Pool1 backward
+                avg_pool_backward_batch(&d_pool1_b, &mut d_conv1_b,
+                                        C1_OUT, bs, C1_OH, C1_OW, P1_SIZE);
+
+                // ReLU backward conv1
+                {
+                    let n = C1_OUT * bs * C1_COL_COLS;
+                    relu_backward(&mut d_conv1_b[..n], &conv1_b[..n]);
+                }
+
+                // Conv1 weight gradient (one GEMM)
+                sgemm_nt(C1_OUT, C1_COL_ROWS, bs * C1_COL_COLS,
+                         &d_conv1_b, &col1_b, &mut grad_conv1_w);
+
+                // Conv1 bias gradient
+                conv_bias_grad(&d_conv1_b, &mut grad_conv1_b, C1_OUT, bs * C1_COL_COLS);
 
                 // SGD update
                 let lr_s = learning_rate / bs as f32;
@@ -479,7 +547,13 @@ impl Cnn {
 
     fn evaluate(&self, inputs: &[f32], targets: &[i32], num_samples: usize) -> (f32, f32) {
         let eval_bs = 256;
-        let mut ws_all = vec![0.0f32; eval_bs * WS_SIZE];
+
+        let mut col1_b = vec![0.0f32; C1_COL_ROWS * eval_bs * C1_COL_COLS];
+        let mut conv1_b = vec![0.0f32; C1_OUT * eval_bs * C1_COL_COLS];
+        let mut pool1_b = vec![0.0f32; C1_OUT * eval_bs * P1_H * P1_W];
+        let mut col2_b = vec![0.0f32; C2_COL_ROWS * eval_bs * C2_COL_COLS];
+        let mut conv2_b = vec![0.0f32; C2_OUT * eval_bs * C2_COL_COLS];
+        let mut pool2_b = vec![0.0f32; C2_OUT * eval_bs * P2_H * P2_W];
         let mut flat = vec![0.0f32; eval_bs * FLAT_SIZE];
         let mut fc1_out = vec![0.0f32; eval_bs * FC1_OUT];
         let mut fc2_out = vec![0.0f32; eval_bs * FC2_OUT];
@@ -496,8 +570,9 @@ impl Cnn {
             let bs = eval_bs.min(num_samples - start);
 
             self.forward_batch(&inputs[start * input_size..], bs,
-                               &mut ws_all, &mut flat,
-                               &mut fc1_out, &mut fc2_out, &mut out);
+                               &mut col1_b, &mut conv1_b, &mut pool1_b,
+                               &mut col2_b, &mut conv2_b, &mut pool2_b,
+                               &mut flat, &mut fc1_out, &mut fc2_out, &mut out);
 
             for i in 0..bs {
                 let o = &out[i * NUM_CLASSES..(i + 1) * NUM_CLASSES];
@@ -556,10 +631,11 @@ fn main() {
 
     let num_epochs = args.epochs;
     let batch_size = args.batch_size;
+    let learning_rate = if args.learning_rate > 0.0 { args.learning_rate } else { DEFAULT_LR };
 
     println!(
         "\nTraining LeNet-5 ({} epochs, batch_size={}, lr={:.4})...",
-        num_epochs, batch_size, LEARNING_RATE
+        num_epochs, batch_size, learning_rate
     );
 
     let t_start = Instant::now();
@@ -569,7 +645,7 @@ fn main() {
         train_size,
         batch_size,
         num_epochs,
-        LEARNING_RATE,
+        learning_rate,
     );
     let t_train = t_start.elapsed().as_secs_f64();
 

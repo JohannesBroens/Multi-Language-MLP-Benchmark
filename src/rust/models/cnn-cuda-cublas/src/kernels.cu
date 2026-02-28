@@ -6,6 +6,8 @@
 /*  CNN-specific kernels: im2col, col2im, avg_pool, add_bias          */
 /* ------------------------------------------------------------------ */
 
+/* ---- Per-sample kernels (kept for interface compatibility) ---- */
+
 __global__ void im2col_kernel(const float *input, float *col,
                                int C, int H, int W,
                                int kH, int kW, int stride,
@@ -141,6 +143,216 @@ extern "C" void launch_avg_pool_backward(const float *grad_output, float *grad_i
         grad_output, grad_input, C, H, W, pool_size, OH, OW);
 }
 
+/* ---- Batched kernels: channel-major [C, B*spatial] layout ---- */
+
+/*
+ * Batched im2col: input [C, B*H*W] -> col [K, B*OH*OW]
+ * One thread per output element.
+ */
+__global__ void im2col_batch_kernel(const float *input, float *col,
+                                      int C, int B, int H, int W,
+                                      int kH, int kW, int stride,
+                                      int OH, int OW) {
+    int spatial_out = B * OH * OW;
+    int K = C * kH * kW;
+    int total = K * spatial_out;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int col_row = idx / spatial_out;
+    int col_col = idx % spatial_out;
+
+    int kw_idx = col_row % kW;
+    int tmp = col_row / kW;
+    int kh_idx = tmp % kH;
+    int c = tmp / kH;
+
+    int per_sample = OH * OW;
+    int b = col_col / per_sample;
+    int spatial_idx = col_col % per_sample;
+    int oh = spatial_idx / OW;
+    int ow = spatial_idx % OW;
+
+    int h = oh * stride + kh_idx;
+    int w = ow * stride + kw_idx;
+
+    col[idx] = input[c * B * H * W + b * H * W + h * W + w];
+}
+
+extern "C" void launch_im2col_batch(const float *input, float *col,
+                                      int C, int B, int H, int W,
+                                      int kH, int kW, int stride,
+                                      int OH, int OW) {
+    int total = C * kH * kW * B * OH * OW;
+    int threads = 256;
+    im2col_batch_kernel<<<(total + threads - 1) / threads, threads>>>(
+        input, col, C, B, H, W, kH, kW, stride, OH, OW);
+}
+
+/*
+ * Batched col2im: col [K, B*OH*OW] -> output [C, B*H*W]  (atomicAdd)
+ */
+__global__ void col2im_batch_kernel(const float *col, float *output,
+                                      int C, int B, int H, int W,
+                                      int kH, int kW, int stride,
+                                      int OH, int OW) {
+    int spatial_out = B * OH * OW;
+    int K = C * kH * kW;
+    int total = K * spatial_out;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int col_row = idx / spatial_out;
+    int col_col = idx % spatial_out;
+
+    int kw_idx = col_row % kW;
+    int tmp = col_row / kW;
+    int kh_idx = tmp % kH;
+    int c = tmp / kH;
+
+    int per_sample = OH * OW;
+    int b = col_col / per_sample;
+    int spatial_idx = col_col % per_sample;
+    int oh = spatial_idx / OW;
+    int ow = spatial_idx % OW;
+
+    int h = oh * stride + kh_idx;
+    int w = ow * stride + kw_idx;
+
+    atomicAdd(&output[c * B * H * W + b * H * W + h * W + w], col[idx]);
+}
+
+extern "C" void launch_col2im_batch(const float *col, float *output,
+                                      int C, int B, int H, int W,
+                                      int kH, int kW, int stride,
+                                      int OH, int OW) {
+    int total = C * kH * kW * B * OH * OW;
+    int threads = 256;
+    col2im_batch_kernel<<<(total + threads - 1) / threads, threads>>>(
+        col, output, C, B, H, W, kH, kW, stride, OH, OW);
+}
+
+/*
+ * Batched avg pool forward: input [C, B*H*W] -> output [C, B*PH*PW]
+ */
+__global__ void avg_pool_forward_batch_kernel(const float *input, float *output,
+                                                int C, int B, int H, int W,
+                                                int pool_size, int PH, int PW) {
+    int total = C * B * PH * PW;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int pw_idx = idx % PW;
+    int tmp = idx / PW;
+    int ph_idx = tmp % PH;
+    int tmp2 = tmp / PH;
+    int b = tmp2 % B;
+    int c = tmp2 / B;
+
+    float scale = 1.0f / (pool_size * pool_size);
+    float sum = 0.0f;
+    for (int i = 0; i < pool_size; i++) {
+        for (int j = 0; j < pool_size; j++) {
+            int h = ph_idx * pool_size + i;
+            int w = pw_idx * pool_size + j;
+            sum += input[c * B * H * W + b * H * W + h * W + w];
+        }
+    }
+    output[idx] = sum * scale;
+}
+
+extern "C" void launch_avg_pool_forward_batch(const float *input, float *output,
+                                                int C, int B, int H, int W,
+                                                int pool_size, int PH, int PW) {
+    int total = C * B * PH * PW;
+    int threads = 256;
+    avg_pool_forward_batch_kernel<<<(total + threads - 1) / threads, threads>>>(
+        input, output, C, B, H, W, pool_size, PH, PW);
+}
+
+/*
+ * Batched avg pool backward: grad_output [C, B*PH*PW] -> grad_input [C, B*H*W]
+ */
+__global__ void avg_pool_backward_batch_kernel(const float *grad_output, float *grad_input,
+                                                 int C, int B, int H, int W,
+                                                 int pool_size, int PH, int PW) {
+    int total = C * B * H * W;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int w = idx % W;
+    int tmp = idx / W;
+    int h = tmp % H;
+    int tmp2 = tmp / H;
+    int b = tmp2 % B;
+    int c = tmp2 / B;
+
+    int oh = h / pool_size;
+    int ow = w / pool_size;
+
+    if (oh < PH && ow < PW) {
+        float scale = 1.0f / (pool_size * pool_size);
+        grad_input[idx] = grad_output[c * B * PH * PW + b * PH * PW + oh * PW + ow] * scale;
+    }
+}
+
+extern "C" void launch_avg_pool_backward_batch(const float *grad_output, float *grad_input,
+                                                 int C, int B, int H, int W,
+                                                 int pool_size, int PH, int PW) {
+    int total = C * B * H * W;
+    int threads = 256;
+    avg_pool_backward_batch_kernel<<<(total + threads - 1) / threads, threads>>>(
+        grad_output, grad_input, C, B, H, W, pool_size, PH, PW);
+}
+
+/*
+ * Transpose [C, B*S] -> [B, C*S]  (channel-major to batch-major)
+ */
+__global__ void transpose_cb_to_bc_kernel(const float *src, float *dst,
+                                            int C, int B, int S) {
+    int total = C * B * S;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int s = idx % S;
+    int tmp = idx / S;
+    int b = tmp % B;
+    int c = tmp / B;
+
+    dst[b * C * S + c * S + s] = src[idx];
+}
+
+extern "C" void launch_transpose_cb_to_bc(const float *src, float *dst,
+                                            int C, int B, int S) {
+    int total = C * B * S;
+    int threads = 256;
+    transpose_cb_to_bc_kernel<<<(total + threads - 1) / threads, threads>>>(src, dst, C, B, S);
+}
+
+/*
+ * Transpose [B, C*S] -> [C, B*S]  (batch-major to channel-major)
+ */
+__global__ void transpose_bc_to_cb_kernel(const float *src, float *dst,
+                                            int B, int C, int S) {
+    int total = B * C * S;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int s = idx % S;
+    int tmp = idx / S;
+    int c = tmp % C;
+    int b = tmp / C;
+
+    dst[c * B * S + b * S + s] = src[idx];
+}
+
+extern "C" void launch_transpose_bc_to_cb(const float *src, float *dst,
+                                            int B, int C, int S) {
+    int total = B * C * S;
+    int threads = 256;
+    transpose_bc_to_cb_kernel<<<(total + threads - 1) / threads, threads>>>(src, dst, B, C, S);
+}
+
 /* Add bias to [channels, spatial] matrix */
 __global__ void add_bias_kernel(float *x, const float *bias, int channels, int spatial) {
     int total = channels * spatial;
@@ -171,26 +383,6 @@ __global__ void bias_grad_kernel(const float *grad, float *grad_bias, int channe
 extern "C" void launch_bias_grad(const float *grad, float *grad_bias, int channels, int spatial) {
     int threads = 256;
     bias_grad_kernel<<<(channels + threads - 1) / threads, threads>>>(grad, grad_bias, channels, spatial);
-}
-
-/* Copy flat from workspace */
-__global__ void copy_flat_kernel(const float *ws_all, float *flat,
-                                  int ws_size, int ws_pool2_offset,
-                                  int flat_size, int bs) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= bs * flat_size) return;
-    int b = idx / flat_size;
-    int j = idx % flat_size;
-    flat[idx] = ws_all[b * ws_size + ws_pool2_offset + j];
-}
-
-extern "C" void launch_copy_flat(const float *ws_all, float *flat,
-                                   int ws_size, int ws_pool2_offset,
-                                   int flat_size, int bs) {
-    int total = bs * flat_size;
-    int threads = 256;
-    copy_flat_kernel<<<(total + threads - 1) / threads, threads>>>(
-        ws_all, flat, ws_size, ws_pool2_offset, flat_size, bs);
 }
 
 /* ------------------------------------------------------------------ */

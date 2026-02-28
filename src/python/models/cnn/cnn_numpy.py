@@ -51,7 +51,7 @@ FLAT_SIZE = 256  # 16*4*4
 FC1_OUT = 120
 FC2_OUT = 84
 NUM_CLASSES = 10
-LEARNING_RATE = 0.01
+LEARNING_RATE = 0.32
 
 
 def im2col(input_data, C, H, W, kH, kW, stride, OH, OW):
@@ -325,7 +325,7 @@ class LeNet5:
         self.conv1_b -= lr_s * g_conv1_b
 
 
-def train(model, X_train, y_train, batch_size, num_epochs):
+def train(model, X_train, y_train, batch_size, num_epochs, learning_rate):
     n = len(X_train)
     num_batches = (n + batch_size - 1) // batch_size
 
@@ -347,7 +347,7 @@ def train(model, X_train, y_train, batch_size, num_epochs):
             batch_loss = -np.log(output[np.arange(bs), y_batch] + eps).sum()
             epoch_loss += batch_loss
 
-            model.backward_and_update(X_batch, y_batch, output, flats, fc1_out, fc2_out, caches, LEARNING_RATE)
+            model.backward_and_update(X_batch, y_batch, output, flats, fc1_out, fc2_out, caches, learning_rate)
 
         print(f"  Epoch {epoch:4d}  loss: {epoch_loss / n:.4f}")
 
@@ -365,22 +365,25 @@ def evaluate(model, X_test, y_test):
 def main():
     parser = argparse.ArgumentParser(description="NumPy CNN (LeNet-5)")
     parser.add_argument("--dataset", required=True, choices=["mnist"])
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--learning-rate", type=float, default=0.32)
     args = parser.parse_args()
 
     X, y, num_classes = load_dataset(args.dataset)
     X_train, y_train, X_test, y_test = shuffle_and_split(X, y)
 
+    learning_rate = args.learning_rate
+
     print(f"Dataset: {args.dataset}  ({len(X)} samples, {X.shape[1]} features, {num_classes} classes)")
     print(f"Train: {len(X_train)} samples, Test: {len(X_test)} samples")
-    print(f"\nTraining LeNet-5 ({args.epochs} epochs, batch_size={args.batch_size}, lr={LEARNING_RATE:.4f})...")
+    print(f"\nTraining LeNet-5 ({args.epochs} epochs, batch_size={args.batch_size}, lr={learning_rate:.4f})...")
 
     rng = np.random.default_rng()
     model = LeNet5(rng)
 
     t_start = time.monotonic()
-    train(model, X_train, y_train, args.batch_size, args.epochs)
+    train(model, X_train, y_train, args.batch_size, args.epochs, learning_rate)
     t_train = time.monotonic() - t_start
 
     t_eval_start = time.monotonic()

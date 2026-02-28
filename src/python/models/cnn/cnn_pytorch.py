@@ -49,7 +49,7 @@ _phys_cores = _detect_physical_cores()
 torch.set_num_threads(_phys_cores)
 torch.set_num_interop_threads(min(_phys_cores, 4))
 
-LEARNING_RATE = 0.01
+LEARNING_RATE = 0.32
 
 
 class LeNet5(nn.Module):
@@ -99,7 +99,7 @@ class LeNet5(nn.Module):
         return x
 
 
-def train_model(model, X_train, y_train, device, batch_size, num_epochs):
+def train_model(model, X_train, y_train, device, batch_size, num_epochs, learning_rate):
     model.train()
 
     # Reshape to (N, 1, 28, 28) for conv
@@ -107,7 +107,7 @@ def train_model(model, X_train, y_train, device, batch_size, num_epochs):
     y_tensor = torch.from_numpy(y_train).long().to(device, non_blocking=True)
 
     criterion = nn.CrossEntropyLoss(reduction="mean")
-    optimizer = optim.SGD(model.parameters(), lr=LEARNING_RATE)
+    optimizer = optim.SGD(model.parameters(), lr=learning_rate)
 
     n = len(X_train)
     num_batches = (n + batch_size - 1) // batch_size
@@ -154,8 +154,9 @@ def main():
     parser = argparse.ArgumentParser(description="PyTorch CNN (LeNet-5)")
     parser.add_argument("--dataset", required=True, choices=["mnist"])
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--learning-rate", type=float, default=0.32)
     args = parser.parse_args()
 
     if args.device == "cuda" and not torch.cuda.is_available():
@@ -172,9 +173,11 @@ def main():
     X, y, num_classes = load_dataset(args.dataset)
     X_train, y_train, X_test, y_test = shuffle_and_split(X, y)
 
+    learning_rate = args.learning_rate
+
     print(f"Dataset: {args.dataset}  ({len(X)} samples, {X.shape[1]} features, {num_classes} classes)")
     print(f"Train: {len(X_train)} samples, Test: {len(X_test)} samples")
-    print(f"\nTraining LeNet-5 ({args.epochs} epochs, batch_size={args.batch_size}, lr={LEARNING_RATE:.4f})...")
+    print(f"\nTraining LeNet-5 ({args.epochs} epochs, batch_size={args.batch_size}, lr={learning_rate:.4f})...")
 
     model = LeNet5().to(device)
 
@@ -193,7 +196,7 @@ def main():
     if args.device == "cuda":
         torch.cuda.synchronize()
     t_start = time.monotonic()
-    train_model(model, X_train, y_train, device, args.batch_size, args.epochs)
+    train_model(model, X_train, y_train, device, args.batch_size, args.epochs, learning_rate)
     if args.device == "cuda":
         torch.cuda.synchronize()
     t_train = time.monotonic() - t_start

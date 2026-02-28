@@ -49,6 +49,7 @@ pub struct Args {
     pub num_samples: usize, // 0 = use dataset default
     pub hidden_size: usize,
     pub epochs: usize,
+    pub learning_rate: f32,  // 0.0 = use binary's default
 }
 
 fn print_usage(prog: &str) {
@@ -56,10 +57,11 @@ fn print_usage(prog: &str) {
         "Usage: {} --dataset [generated|iris|wine-red|wine-white|breast-cancer|mnist]",
         prog
     );
-    eprintln!("  --batch-size N    Mini-batch size (default: 32)");
+    eprintln!("  --batch-size N    Mini-batch size (default: 4096)");
     eprintln!("  --num-samples N   Number of samples for generated dataset (default: 1000)");
     eprintln!("  --hidden-size N   Hidden layer size (default: 64)");
     eprintln!("  --epochs N        Number of training epochs (default: 1000)");
+    eprintln!("  --learning-rate F Learning rate (default: model-specific)");
 }
 
 pub fn parse_args() -> Args {
@@ -67,10 +69,11 @@ pub fn parse_args() -> Args {
     let prog = argv.first().map(|s| s.as_str()).unwrap_or("mlp");
 
     let mut dataset: Option<String> = None;
-    let mut batch_size: usize = 32;
+    let mut batch_size: usize = 4096;
     let mut num_samples: usize = 0;
     let mut hidden_size: usize = 64;
     let mut epochs: usize = 1000;
+    let mut learning_rate: f32 = 0.0;
 
     let mut i = 1;
     while i < argv.len() {
@@ -127,6 +130,17 @@ pub fn parse_args() -> Args {
                     std::process::exit(1);
                 });
             }
+            "--learning-rate" => {
+                i += 1;
+                if i >= argv.len() {
+                    print_usage(prog);
+                    std::process::exit(1);
+                }
+                learning_rate = argv[i].parse().unwrap_or_else(|_| {
+                    eprintln!("Invalid --learning-rate value: {}", argv[i]);
+                    std::process::exit(1);
+                });
+            }
             _ => {
                 print_usage(prog);
                 std::process::exit(1);
@@ -146,6 +160,7 @@ pub fn parse_args() -> Args {
         num_samples,
         hidden_size,
         epochs,
+        learning_rate,
     }
 }
 

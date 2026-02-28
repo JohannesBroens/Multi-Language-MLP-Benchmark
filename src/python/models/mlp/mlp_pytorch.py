@@ -143,11 +143,12 @@ def main():
     parser.add_argument("--dataset", required=True,
                         choices=["generated", "iris", "wine-red", "wine-white", "breast-cancer"])
     parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=8192)
     parser.add_argument("--num-samples", type=int, default=0,
                         help="Number of samples for generated dataset (0 = default)")
     parser.add_argument("--hidden-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=1000)
+    parser.add_argument("--learning-rate", type=float, default=0.02)
     args = parser.parse_args()
 
     if args.device == "cuda" and not torch.cuda.is_available():
@@ -159,7 +160,7 @@ def main():
     num_epochs = args.epochs
     batch_size = args.batch_size
     hidden_size = args.hidden_size
-    learning_rate = 0.01
+    learning_rate = args.learning_rate
 
     # Hardware-adaptive optimizations
     if args.device == "cuda":

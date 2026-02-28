@@ -1,7 +1,7 @@
 use nn_common::{load_dataset, normalize_features, parse_args, shuffle_data};
 use std::time::Instant;
 
-const LEARNING_RATE: f32 = 0.01;
+const DEFAULT_LR: f32 = 0.02;
 
 // ---------------------------------------------------------------------------
 //  CUDA FFI types and constants
@@ -199,6 +199,7 @@ impl GpuMlp {
         num_samples: usize,
         batch_size: usize,
         num_epochs: usize,
+        learning_rate: f32,
     ) {
         let inp = self.input_size;
         let hid = self.hidden_size;
@@ -298,7 +299,7 @@ impl GpuMlp {
                 }
 
                 // ---- SGD update ----
-                let lr_s = LEARNING_RATE / bs as f32;
+                let lr_s = learning_rate / bs as f32;
                 let n_iw = inp * hid;
                 let n_ow = hid * out;
                 unsafe {
@@ -434,10 +435,11 @@ fn main() {
     println!("Train: {} samples, Test: {} samples", train_size, test_size);
 
     let mut mlp = GpuMlp::new(dataset.input_size, args.hidden_size, dataset.output_size);
+    let learning_rate = if args.learning_rate > 0.0 { args.learning_rate } else { DEFAULT_LR };
 
     println!(
         "\nTraining ({} epochs, batch_size={}, hidden={}, lr={:.4})...",
-        args.epochs, args.batch_size, args.hidden_size, LEARNING_RATE
+        args.epochs, args.batch_size, args.hidden_size, learning_rate
     );
 
     let t_start = Instant::now();
@@ -447,6 +449,7 @@ fn main() {
         train_size,
         args.batch_size,
         args.epochs,
+        learning_rate,
     );
     let t_train = t_start.elapsed().as_secs_f64();
 

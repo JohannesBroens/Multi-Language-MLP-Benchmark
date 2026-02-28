@@ -84,3 +84,4 @@ CLAUDE.md
 
 # Local config overrides
 configs/local.yaml
+!CMakeLists.txt

@@ -57,21 +57,21 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..
 # Implementation definitions with configurable placeholders.
 IMPLEMENTATIONS = [
     ("C (CPU)",
-     "./src/c/build_cpu/main --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs}"),
+     "./src/c/build_cpu/main --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs} --learning-rate {learning_rate}"),
     ("C (CUDA)",
-     "./src/c/build_cuda/main --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs}"),
+     "./src/c/build_cuda/main --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs} --learning-rate {learning_rate}"),
     ("NumPy",
-     "{python} src/python/models/mlp/mlp_numpy.py --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs}"),
+     "{python} src/python/models/mlp/mlp_numpy.py --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs} --learning-rate {learning_rate}"),
     ("PyTorch (CPU)",
-     "{python} src/python/models/mlp/mlp_pytorch.py --dataset {dataset} --device cpu --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs}"),
+     "{python} src/python/models/mlp/mlp_pytorch.py --dataset {dataset} --device cpu --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs} --learning-rate {learning_rate}"),
     ("PyTorch (CUDA)",
-     "{python} src/python/models/mlp/mlp_pytorch.py --dataset {dataset} --device cuda --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs}"),
+     "{python} src/python/models/mlp/mlp_pytorch.py --dataset {dataset} --device cuda --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs} --learning-rate {learning_rate}"),
     ("Rust (CPU)",
-     "./src/rust/target/release/mlp-cpu --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs}"),
+     "./src/rust/target/release/mlp-cpu --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs} --learning-rate {learning_rate}"),
     ("Rust (cuBLAS)",
-     "./src/rust/target/release/mlp-cuda-cublas --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs}"),
+     "./src/rust/target/release/mlp-cuda-cublas --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs} --learning-rate {learning_rate}"),
     ("Rust (CUDA Kernels)",
-     "./src/rust/target/release/mlp-cuda-kernels --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs}"),
+     "./src/rust/target/release/mlp-cuda-kernels --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs} --learning-rate {learning_rate}"),
 ]
 
 # CNN implementations — fixed architecture (LeNet-5), MNIST only.
@@ -81,19 +81,19 @@ IMPLEMENTATIONS = [
 # BLAS backend makes it a competitive CPU baseline.
 CNN_IMPLEMENTATIONS = [
     ("CNN C (CPU)",
-     "./src/c/build_cpu/cnn_main --dataset mnist --batch-size {batch_size} --epochs {epochs}"),
+     "./src/c/build_cpu/cnn_main --dataset mnist --batch-size {batch_size} --epochs {epochs} --learning-rate {learning_rate}"),
     ("CNN C (CUDA)",
-     "./src/c/build_cuda/cnn_main --dataset mnist --batch-size {batch_size} --epochs {epochs}"),
+     "./src/c/build_cuda/cnn_main --dataset mnist --batch-size {batch_size} --epochs {epochs} --learning-rate {learning_rate}"),
     ("CNN PyTorch (CPU)",
-     "{python} src/python/models/cnn/cnn_pytorch.py --dataset mnist --device cpu --batch-size {batch_size} --epochs {epochs}"),
+     "{python} src/python/models/cnn/cnn_pytorch.py --dataset mnist --device cpu --batch-size {batch_size} --epochs {epochs} --learning-rate {learning_rate}"),
     ("CNN PyTorch (CUDA)",
-     "{python} src/python/models/cnn/cnn_pytorch.py --dataset mnist --device cuda --batch-size {batch_size} --epochs {epochs}"),
+     "{python} src/python/models/cnn/cnn_pytorch.py --dataset mnist --device cuda --batch-size {batch_size} --epochs {epochs} --learning-rate {learning_rate}"),
     ("CNN Rust (CPU)",
-     "./src/rust/target/release/cnn-cpu --dataset mnist --batch-size {batch_size} --epochs {epochs}"),
+     "./src/rust/target/release/cnn-cpu --dataset mnist --batch-size {batch_size} --epochs {epochs} --learning-rate {learning_rate}"),
     ("CNN Rust (cuBLAS)",
-     "./src/rust/target/release/cnn-cuda-cublas --dataset mnist --batch-size {batch_size} --epochs {epochs}"),
+     "./src/rust/target/release/cnn-cuda-cublas --dataset mnist --batch-size {batch_size} --epochs {epochs} --learning-rate {learning_rate}"),
     ("CNN Rust (CUDA Kernels)",
-     "./src/rust/target/release/cnn-cuda-kernels --dataset mnist --batch-size {batch_size} --epochs {epochs}"),
+     "./src/rust/target/release/cnn-cuda-kernels --dataset mnist --batch-size {batch_size} --epochs {epochs} --learning-rate {learning_rate}"),
 ]
 
 # Regex patterns for parsing standardized output
@@ -192,8 +192,9 @@ def is_available(label):
     return True
 
 
-def run_implementation(label, cmd_template, dataset, batch_size=32,
-                       num_samples=0, hidden_size=512, epochs=1000):
+def run_implementation(label, cmd_template, dataset, batch_size=4096,
+                       num_samples=0, hidden_size=512, epochs=1000,
+                       learning_rate=0.02):
     """Run a single implementation and parse its output."""
     cmd = (cmd_template
            .replace("{dataset}", dataset)
@@ -201,7 +202,8 @@ def run_implementation(label, cmd_template, dataset, batch_size=32,
            .replace("{batch_size}", str(batch_size))
            .replace("{num_samples}", str(num_samples))
            .replace("{hidden_size}", str(hidden_size))
-           .replace("{epochs}", str(epochs)))
+           .replace("{epochs}", str(epochs))
+           .replace("{learning_rate}", str(learning_rate)))
 
     env = os.environ.copy()
     if label in ("C (CPU)", "CNN C (CPU)"):
@@ -316,6 +318,7 @@ def _collect_throughput(available, runs, vary_param, vary_values, fixed_params,
                     num_samples=params.get("num_samples", 100000),
                     hidden_size=params.get("hidden_size", 512),
                     epochs=params.get("epochs", 500),
+                    learning_rate=params.get("learning_rate", 0.02),
                 )
                 elapsed = time.monotonic() - t0
                 if r and "throughput" in r:
@@ -531,6 +534,7 @@ def _run_scheduled(schedule, cache):
             num_samples=params.get("num_samples", 100000),
             hidden_size=params.get("hidden_size", 512),
             epochs=params.get("epochs", 500),
+            learning_rate=params.get("learning_rate", 0.02),
         )
         elapsed = time.monotonic() - t0
 
@@ -625,7 +629,7 @@ def run_scaling_experiment(available, runs, figs_dir, cfg, model="mlp",
 
         _collect_throughput(
             available, runs, "batch_size", batch_sizes,
-            {"epochs": epochs},
+            {"epochs": epochs, "learning_rate": 0.32},
             cache=cache, cache_key=_cache_key(model, "batch_size"))
 
     else:
@@ -707,7 +711,8 @@ def run_standard(datasets, available, runs, figs_dir, model="mlp"):
             for run in range(runs):
                 tag = f" (run {run + 1}/{runs})" if runs > 1 else ""
                 print(f"  {label}{tag}...")
-                r = run_implementation(label, cmd_template, dataset)
+                r = run_implementation(label, cmd_template, dataset,
+                                       learning_rate=learning_rate)
                 if r is not None:
                     run_results.append(r)
             if run_results:
