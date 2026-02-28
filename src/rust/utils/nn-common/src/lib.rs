@@ -50,6 +50,8 @@ pub struct Args {
     pub hidden_size: usize,
     pub epochs: usize,
     pub learning_rate: f32,  // 0.0 = use binary's default
+    pub optimizer: String,   // "sgd" or "adam"
+    pub scheduler: String,   // "none" or "cosine"
 }
 
 fn print_usage(prog: &str) {
@@ -62,6 +64,8 @@ fn print_usage(prog: &str) {
     eprintln!("  --hidden-size N   Hidden layer size (default: 64)");
     eprintln!("  --epochs N        Number of training epochs (default: 1000)");
     eprintln!("  --learning-rate F Learning rate (default: model-specific)");
+    eprintln!("  --optimizer STR   Optimizer: sgd|adam (default: sgd)");
+    eprintln!("  --scheduler STR   LR scheduler: none|cosine (default: none)");
 }
 
 pub fn parse_args() -> Args {
@@ -74,6 +78,8 @@ pub fn parse_args() -> Args {
     let mut hidden_size: usize = 64;
     let mut epochs: usize = 1000;
     let mut learning_rate: f32 = 0.0;
+    let mut optimizer: String = "sgd".to_string();
+    let mut scheduler: String = "none".to_string();
 
     let mut i = 1;
     while i < argv.len() {
@@ -141,6 +147,22 @@ pub fn parse_args() -> Args {
                     std::process::exit(1);
                 });
             }
+            "--optimizer" => {
+                i += 1;
+                if i >= argv.len() {
+                    print_usage(prog);
+                    std::process::exit(1);
+                }
+                optimizer = argv[i].clone();
+            }
+            "--scheduler" => {
+                i += 1;
+                if i >= argv.len() {
+                    print_usage(prog);
+                    std::process::exit(1);
+                }
+                scheduler = argv[i].clone();
+            }
             _ => {
                 print_usage(prog);
                 std::process::exit(1);
@@ -161,6 +183,8 @@ pub fn parse_args() -> Args {
         hidden_size,
         epochs,
         learning_rate,
+        optimizer,
+        scheduler,
     }
 }
 

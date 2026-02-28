@@ -77,7 +77,13 @@ impl Mlp {
         batch_size: usize,
         num_epochs: usize,
         learning_rate: f32,
+        optimizer: &str,
+        scheduler: &str,
     ) {
+        if optimizer == "adam" {
+            eprintln!("Warning: Adam optimizer not yet implemented, using SGD");
+        }
+        let _ = scheduler; // will be used in future
         let inp = self.input_size;
         let hid = self.hidden_size;
         let out = self.output_size;
@@ -246,6 +252,8 @@ fn main() {
         args.batch_size,
         args.epochs,
         learning_rate,
+        &args.optimizer,
+        &args.scheduler,
     );
     let t_train = t_start.elapsed().as_secs_f64();
 

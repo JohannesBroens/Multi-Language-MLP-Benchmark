@@ -212,7 +212,12 @@ impl GpuCnn {
     }
 
     fn train(&mut self, inputs: &[f32], targets: &[i32], num_samples: usize,
-             batch_size: usize, num_epochs: usize, learning_rate: f32) {
+             batch_size: usize, num_epochs: usize, learning_rate: f32,
+             optimizer: &str, scheduler: &str) {
+        if optimizer == "adam" {
+            eprintln!("Warning: Adam optimizer not yet implemented, using SGD");
+        }
+        let _ = scheduler; // will be used in future
         let input_size = IN_C * IN_H * IN_W;
         let d_inputs = cuda_malloc(num_samples * input_size * 4);
         let d_targets = cuda_malloc(num_samples * 4) as *mut i32;
@@ -451,7 +456,8 @@ fn main() {
 
     let t_start = Instant::now();
     cnn.train(&dataset.inputs[..train_size * dataset.input_size],
-              &dataset.labels[..train_size], train_size, args.batch_size, args.epochs, learning_rate);
+              &dataset.labels[..train_size], train_size, args.batch_size, args.epochs, learning_rate,
+              &args.optimizer, &args.scheduler);
     let t_train = t_start.elapsed().as_secs_f64();
 
     let t_eval_start = Instant::now();

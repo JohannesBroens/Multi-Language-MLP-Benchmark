@@ -393,7 +393,12 @@ impl Cnn {
     }
 
     fn train(&mut self, inputs: &[f32], targets: &[i32], num_samples: usize,
-             batch_size: usize, num_epochs: usize, learning_rate: f32) {
+             batch_size: usize, num_epochs: usize, learning_rate: f32,
+             optimizer: &str, scheduler: &str) {
+        if optimizer == "adam" {
+            eprintln!("Warning: Adam optimizer not yet implemented, using SGD");
+        }
+        let _ = scheduler; // will be used in future
         let input_size = IN_C * IN_H * IN_W;
 
         // Forward conv workspace (batched, channel-major)
@@ -646,6 +651,8 @@ fn main() {
         batch_size,
         num_epochs,
         learning_rate,
+        &args.optimizer,
+        &args.scheduler,
     );
     let t_train = t_start.elapsed().as_secs_f64();
 
