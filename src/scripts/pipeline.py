@@ -2,11 +2,12 @@
 """Unified pipeline: build -> tune -> benchmark -> plot.
 
 Usage:
-    python src/scripts/pipeline.py all --model mlp
+    python src/scripts/pipeline.py all                # all models
+    python src/scripts/pipeline.py all --model mlp    # just MLP
+    python src/scripts/pipeline.py all --model cnn    # just CNN
     python src/scripts/pipeline.py benchmark --model cnn
-    python src/scripts/pipeline.py plot --model mlp
     python src/scripts/pipeline.py tune --model mlp
-    python src/scripts/pipeline.py build --model mlp
+    python src/scripts/pipeline.py build
 """
 import argparse
 import os
@@ -22,12 +23,14 @@ from config import load_config
 PROJECT_ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
 PYTHON = sys.executable
 
+ALL_MODELS = ["mlp", "cnn"]
 
-def phase_build(config, model):
+
+def phase_build(config, models):
     """Compile C and Rust implementations based on config."""
     build = config.get("build", {})
 
-    # C builds
+    # C builds (shared: both main and cnn_main are built together)
     c_dir = os.path.join(PROJECT_ROOT, "src", "c")
     if build.get("c_cpu", True):
         print("=== Building C (CPU) ===")
@@ -43,15 +46,16 @@ def phase_build(config, model):
         subprocess.run(["cmake", "..", "-DUSE_CUDA=ON"], cwd=build_dir, check=True)
         subprocess.run(["make", "-j"], cwd=build_dir, check=True)
 
-    # Rust builds
+    # Rust builds — per model
     rust_dir = os.path.join(PROJECT_ROOT, "src", "rust")
     rust_targets = []
-    if build.get("rust_cpu", True):
-        rust_targets.append(f"{model}-cpu")
-    if build.get("rust_cublas", True):
-        rust_targets.append(f"{model}-cuda-cublas")
-    if build.get("rust_kernels", True):
-        rust_targets.append(f"{model}-cuda-kernels")
+    for model in models:
+        if build.get("rust_cpu", True):
+            rust_targets.append(f"{model}-cpu")
+        if build.get("rust_cublas", True):
+            rust_targets.append(f"{model}-cuda-cublas")
+        if build.get("rust_kernels", True):
+            rust_targets.append(f"{model}-cuda-kernels")
 
     for target in rust_targets:
         print(f"=== Building Rust ({target}) ===")
@@ -130,31 +134,50 @@ def phase_plot(config, model):
     regenerate_all_plots(config, model)
 
 
+def run_for_model(model, command, phases):
+    """Run a pipeline command for a single model."""
+    config = load_config(model)
+
+    if command == "all":
+        # Build is handled separately (once for all models)
+        for phase_name in config.get("pipeline", {}).get("phases", ["tune", "benchmark"]):
+            phases[phase_name](config, model)
+        phase_plot(config, model)
+    else:
+        phases[command](config, model)
+
+
 def main():
     parser = argparse.ArgumentParser(description="ML-in-C unified pipeline")
     parser.add_argument("command", choices=["all", "build", "tune", "benchmark", "plot"],
                         help="Pipeline phase to run")
-    parser.add_argument("--model", default="mlp", choices=["mlp", "cnn"],
-                        help="Model to operate on")
+    parser.add_argument("--model", default="all", choices=["all", "mlp", "cnn"],
+                        help="Model to operate on (default: all)")
     parser.add_argument("--config", default=None, help="Path to base config YAML")
     args = parser.parse_args()
 
-    config = load_config(args.model, config_path=args.config)
+    models = ALL_MODELS if args.model == "all" else [args.model]
 
     phases = {
-        "build": phase_build,
+        "build": lambda config, model: None,  # handled separately
         "tune": phase_tune,
         "benchmark": phase_benchmark,
         "plot": phase_plot,
     }
 
-    if args.command == "all":
-        phase_build(config, args.model)
-        for phase_name in config.get("pipeline", {}).get("phases", ["tune", "benchmark"]):
-            phases[phase_name](config, args.model)
-        phase_plot(config, args.model)
-    else:
-        phases[args.command](config, args.model)
+    # Build phase: done once (C builds both models, Rust builds per model)
+    if args.command in ("all", "build"):
+        config = load_config(models[0], config_path=args.config)
+        phase_build(config, models)
+        if args.command == "build":
+            return
+
+    # Per-model phases
+    for model in models:
+        print(f"\n{'#'*60}")
+        print(f"#  {model.upper()}")
+        print(f"{'#'*60}\n")
+        run_for_model(model, args.command, phases)
 
 
 if __name__ == "__main__":
