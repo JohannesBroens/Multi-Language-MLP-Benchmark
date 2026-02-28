@@ -85,7 +85,21 @@ def phase_tune(config, model):
 
 
 def phase_benchmark(config, model):
-    """Run benchmarks using config values."""
+    """Run benchmarks using config values (with tuned params if available)."""
+    # Load tuned hyperparameters if available
+    tuning_path = os.path.join(PROJECT_ROOT, "results", "cache", f"tuning_{model}.yaml")
+    if os.path.exists(tuning_path):
+        import yaml
+        with open(tuning_path) as f:
+            tuned = yaml.safe_load(f)
+        best = tuned.get("best_params", {})
+        if best:
+            config["training"]["batch_size"] = best.get("batch_size", config["training"]["batch_size"])
+            config["training"]["learning_rate"] = best.get("learning_rate", config["training"]["learning_rate"])
+            config["training"]["optimizer"] = best.get("optimizer", "sgd")
+            config["training"]["scheduler"] = best.get("scheduler", "none")
+            print(f"Loaded tuned params: {best}")
+
     print(f"=== Benchmarking {model.upper()} ===")
     bench = config.get("benchmark", {})
     cmd = [
