@@ -30,6 +30,8 @@ benchmark:
   mode: standard
   datasets: [generated, iris, breast-cancer]
   runs: 3
+  unified: true
+  min_samples: 3
 
 scaling:
   epochs: 200

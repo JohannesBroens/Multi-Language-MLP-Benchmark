@@ -734,6 +734,279 @@ def run_standard(datasets, available, runs, figs_dir, model="mlp"):
 
 
 # ---------------------------------------------------------------------------
+#  Unified cross-model scheduler
+# ---------------------------------------------------------------------------
+
+def run_unified_scaling(budget_seconds, bench_cfg, figs_dir_root, cfg_by_model,
+                        available_by_model, use_cache=True):
+    """Run variance-weighted scheduling across both MLP and CNN models.
+
+    Phase 1: Round-robin fills experiments with < min_samples measurements.
+    Phase 2: Remaining budget allocated to highest-variance experiments.
+    After all runs, replots each model by calling run_scaling_experiment
+    with budget=0 (replot mode).
+
+    Args:
+        budget_seconds: total wall-time budget in seconds
+        bench_cfg: benchmark config section (has unified, min_samples keys)
+        figs_dir_root: root figs dir (e.g. results/plots); model subdir appended
+        cfg_by_model: {"mlp": mlp_scaling_cfg, "cnn": cnn_scaling_cfg}
+        available_by_model: {"mlp": [(label, cmd)...], "cnn": [(label, cmd)...]}
+        use_cache: whether to use the cache
+    """
+    if not HAS_MATPLOTLIB:
+        print("matplotlib not available -- scaling mode requires matplotlib")
+        return
+
+    from plotting import _cache_key
+    min_samples = bench_cfg.get("min_samples", 3)
+
+    # Load cache
+    cache = _load_cache() if use_cache else {}
+
+    # 1. Enumerate all experiments across both models
+    all_experiments = []  # list of (cache_key, vary_param, x_range, fixed_params, model, label, cmd_template)
+
+    for model, available in available_by_model.items():
+        cfg = cfg_by_model[model]
+        epochs = cfg["epochs"]
+
+        if model == "cnn":
+            for label, cmd_template in available:
+                all_experiments.append({
+                    "cache_key": _cache_key(model, "batch_size"),
+                    "vary_param": "batch_size",
+                    "x_range": (4, 10),
+                    "fixed_params": {"epochs": epochs, "learning_rate": 0.32},
+                    "model": model,
+                    "label": label,
+                    "cmd_template": cmd_template,
+                })
+        else:  # mlp
+            fixed_bs = cfg["fixed_batch_size"]
+            fixed_ns = cfg["fixed_num_samples"]
+
+            for label, cmd_template in available:
+                all_experiments.append({
+                    "cache_key": _cache_key(model, "dataset_size"),
+                    "vary_param": "num_samples",
+                    "x_range": cfg.get("dataset_size_range", (13, 22)),
+                    "fixed_params": {"batch_size": fixed_bs, "epochs": epochs},
+                    "model": model,
+                    "label": label,
+                    "cmd_template": cmd_template,
+                })
+                all_experiments.append({
+                    "cache_key": _cache_key(model, "batch_size"),
+                    "vary_param": "batch_size",
+                    "x_range": cfg.get("batch_size_range", (8, 15)),
+                    "fixed_params": {"num_samples": fixed_ns, "epochs": epochs},
+                    "model": model,
+                    "label": label,
+                    "cmd_template": cmd_template,
+                })
+                all_experiments.append({
+                    "cache_key": _cache_key(model, "hidden_size"),
+                    "vary_param": "hidden_size",
+                    "x_range": cfg.get("hidden_size_range", (6, 12)),
+                    "fixed_params": {"num_samples": fixed_ns, "batch_size": fixed_bs, "epochs": epochs},
+                    "model": model,
+                    "label": label,
+                    "cmd_template": cmd_template,
+                })
+
+    # 2. Count samples per experiment from cache and compute stats
+    def _experiment_stats(exp):
+        """Return (total_samples, mean_variance, est_wall) for an experiment."""
+        ck = exp["cache_key"]
+        label = exp["label"]
+        exp_data = cache.get(ck, {}).get(label, {})
+        total_samples = 0
+        variances = []
+        wall_times = []
+        for val_str, entry in exp_data.items():
+            if isinstance(entry, dict):
+                samples = entry.get("samples", [])
+                total_samples += len(samples)
+                wall_times.extend(entry.get("wall_times", []))
+                if len(samples) >= 2:
+                    variances.append(float(np.var(samples)))
+        mean_var = float(np.mean(variances)) if variances else float("inf")
+        est_wall = float(np.mean(wall_times)) if wall_times else 10.0
+        return total_samples, mean_var, est_wall
+
+    print(f"\n  Unified cross-model scheduling: {budget_seconds:.0f}s budget")
+    print(f"  min_samples={min_samples}, {len(all_experiments)} experiment slots")
+    print("=" * 70)
+
+    remaining = budget_seconds
+    total_runs = 0
+
+    # 3. Phase 1: Round-robin fill experiments with < min_samples
+    print("\n  Phase 1: Round-robin fill (min_samples={})".format(min_samples))
+
+    phase1_ran = True
+    while remaining > 0 and phase1_ran:
+        phase1_ran = False
+        # Sort by total_samples ascending so least-sampled go first
+        scored = [(exp, *_experiment_stats(exp)) for exp in all_experiments]
+        scored.sort(key=lambda x: x[1])  # sort by total_samples
+
+        for exp, total_samples, mean_var, est_wall in scored:
+            if total_samples >= min_samples:
+                continue
+            if est_wall > remaining:
+                continue
+
+            # Sample an x-value using gap-filling
+            lo_exp, hi_exp = exp["x_range"]
+            exp_data = cache.get(exp["cache_key"], {}).get(exp["label"], {})
+            existing_log2 = []
+            sample_counts = {}
+            for val_str, entry in exp_data.items():
+                if isinstance(entry, dict):
+                    try:
+                        log2_val = np.log2(float(val_str))
+                        existing_log2.append(log2_val)
+                        sample_counts[log2_val] = len(entry.get("samples", []))
+                    except (ValueError, ZeroDivisionError):
+                        pass
+
+            x_val = _sample_from_gaps(lo_exp, hi_exp, existing_log2,
+                                       sample_counts=sample_counts)
+            params = dict(exp["fixed_params"])
+            params[exp["vary_param"]] = x_val
+            val_str = str(x_val)
+
+            total_runs += 1
+            print(f"\n  [P1 #{total_runs}] {exp['model']}/{exp['label']} "
+                  f"{exp['vary_param']}={x_val} (n={total_samples})")
+
+            t0 = time.monotonic()
+            r = run_implementation(
+                exp["label"], exp["cmd_template"], "generated",
+                batch_size=params.get("batch_size", 2048),
+                num_samples=params.get("num_samples", 100000),
+                hidden_size=params.get("hidden_size", 512),
+                epochs=params.get("epochs", 500),
+                learning_rate=params.get("learning_rate", 0.02),
+            )
+            elapsed = time.monotonic() - t0
+            remaining -= elapsed
+
+            if r and "throughput" in r:
+                tp = r["throughput"]
+                ck = exp["cache_key"]
+                if ck not in cache:
+                    cache[ck] = {}
+                if exp["label"] not in cache[ck]:
+                    cache[ck][exp["label"]] = {}
+                if val_str not in cache[ck][exp["label"]]:
+                    cache[ck][exp["label"]][val_str] = {"samples": [], "wall_times": []}
+                cache[ck][exp["label"]][val_str]["samples"].append(tp)
+                cache[ck][exp["label"]][val_str]["wall_times"].append(elapsed)
+                print(f"    -> {tp:.0f} samples/s")
+            else:
+                print(f"    -> FAILED")
+
+            _save_cache(cache)
+            phase1_ran = True
+
+    # 4. Phase 2: Remaining budget to highest-variance experiments
+    if remaining > 0:
+        print(f"\n  Phase 2: Variance-weighted allocation ({remaining:.0f}s remaining)")
+
+        while remaining > 0:
+            # Score all experiments by variance (highest first)
+            scored = []
+            for exp in all_experiments:
+                total_samples, mean_var, est_wall = _experiment_stats(exp)
+                if est_wall > remaining:
+                    continue
+                scored.append((exp, total_samples, mean_var, est_wall))
+
+            if not scored:
+                break
+
+            # Sort by variance descending (inf = no data, gets priority too)
+            scored.sort(key=lambda x: -x[2])
+            exp, total_samples, mean_var, est_wall = scored[0]
+
+            lo_exp, hi_exp = exp["x_range"]
+            exp_data = cache.get(exp["cache_key"], {}).get(exp["label"], {})
+            existing_log2 = []
+            sample_counts = {}
+            for val_str, entry in exp_data.items():
+                if isinstance(entry, dict):
+                    try:
+                        log2_val = np.log2(float(val_str))
+                        existing_log2.append(log2_val)
+                        sample_counts[log2_val] = len(entry.get("samples", []))
+                    except (ValueError, ZeroDivisionError):
+                        pass
+
+            x_val = _sample_from_gaps(lo_exp, hi_exp, existing_log2,
+                                       sample_counts=sample_counts)
+            params = dict(exp["fixed_params"])
+            params[exp["vary_param"]] = x_val
+            val_str = str(x_val)
+
+            total_runs += 1
+            var_str = f"var={mean_var:.0f}" if mean_var != float("inf") else "var=inf"
+            print(f"\n  [P2 #{total_runs}] {exp['model']}/{exp['label']} "
+                  f"{exp['vary_param']}={x_val} ({var_str}, n={total_samples})")
+
+            t0 = time.monotonic()
+            r = run_implementation(
+                exp["label"], exp["cmd_template"], "generated",
+                batch_size=params.get("batch_size", 2048),
+                num_samples=params.get("num_samples", 100000),
+                hidden_size=params.get("hidden_size", 512),
+                epochs=params.get("epochs", 500),
+                learning_rate=params.get("learning_rate", 0.02),
+            )
+            elapsed = time.monotonic() - t0
+            remaining -= elapsed
+
+            if r and "throughput" in r:
+                tp = r["throughput"]
+                ck = exp["cache_key"]
+                if ck not in cache:
+                    cache[ck] = {}
+                if exp["label"] not in cache[ck]:
+                    cache[ck][exp["label"]] = {}
+                if val_str not in cache[ck][exp["label"]]:
+                    cache[ck][exp["label"]][val_str] = {"samples": [], "wall_times": []}
+                cache[ck][exp["label"]][val_str]["samples"].append(tp)
+                cache[ck][exp["label"]][val_str]["wall_times"].append(elapsed)
+                print(f"    -> {tp:.0f} samples/s")
+            else:
+                print(f"    -> FAILED")
+
+            _save_cache(cache)
+
+    print(f"\n  Unified scheduling complete: {total_runs} runs in "
+          f"{budget_seconds - remaining:.0f}s")
+
+    # 5. Replot each model by calling run_scaling_experiment with budget=0
+    print("\n" + "=" * 70)
+    print("  Regenerating plots for all models...")
+    print("=" * 70)
+
+    for model, available in available_by_model.items():
+        cfg = dict(cfg_by_model[model])
+        cfg["budget_seconds"] = 0  # replot mode: no new runs
+        model_figs_dir = os.path.join(figs_dir_root, model)
+        os.makedirs(model_figs_dir, exist_ok=True)
+        labels = [l for l, _ in available]
+        print(f"\n  Plotting {model.upper()}...")
+        plot_scaling_results(cache, cfg, model, labels, model_figs_dir)
+        plot_speedup_results(cache, cfg, model, labels, model_figs_dir)
+        plot_overview(cache, cfg, model, labels, model_figs_dir)
+        print_peak_summary(cache, model, labels)
+
+
+# ---------------------------------------------------------------------------
 #  Main
 # ---------------------------------------------------------------------------
 
@@ -771,7 +1044,10 @@ def main():
 
     # Apply config defaults where CLI args were not provided
     mode = args.mode or bench_cfg.get("mode", "standard")
-    runs = args.runs if args.runs is not None else bench_cfg.get("runs", 1)
+    if args.budget is not None and args.runs is None:
+        runs = 1  # budget mode implies single runs (scheduler handles repetition)
+    else:
+        runs = args.runs if args.runs is not None else bench_cfg.get("runs", 1)
 
     if args.budget is not None and runs > 1:
         parser.error("--budget and --runs > 1 are mutually exclusive")
@@ -792,7 +1068,57 @@ def main():
         print(f"Cache: {CACHE_FILE}")
     print()
 
-    if mode == "scaling":
+    # Detect unified mode: --budget set and --model not explicitly passed
+    model_explicit = "--model" in sys.argv
+    unified_mode = (args.budget is not None and not model_explicit
+                    and mode == "scaling" and bench_cfg.get("unified", True))
+
+    if unified_mode:
+        # Unified cross-model scheduling across MLP + CNN
+        def _parse_list(arg):
+            return [int(x) for x in arg.split(",")] if arg else None
+
+        # Build scaling config for each model
+        mlp_config = load_config("mlp")
+        cnn_config = load_config("cnn")
+        mlp_scale = mlp_config["scaling"]
+        cnn_scale = cnn_config["scaling"]
+
+        cfg_by_model = {
+            "mlp": {
+                "epochs": args.scaling_epochs or mlp_scale["epochs"],
+                "fixed_batch_size": args.scaling_fixed_bs or mlp_scale["fixed_batch_size"],
+                "fixed_num_samples": args.scaling_fixed_ns or mlp_scale["fixed_num_samples"],
+                "dataset_sizes": _parse_list(args.scaling_dataset_sizes) or mlp_scale["dataset_sizes"],
+                "batch_sizes": _parse_list(args.scaling_batch_sizes) or mlp_scale["batch_sizes"],
+                "hidden_sizes": _parse_list(args.scaling_hidden_sizes) or mlp_scale["hidden_sizes"],
+            },
+            "cnn": {
+                "epochs": args.scaling_epochs or cnn_scale["epochs"],
+                "batch_sizes": _parse_list(args.scaling_batch_sizes) or cnn_scale["batch_sizes"],
+            },
+        }
+
+        # Build available implementations for each model
+        mlp_available = [(l, c) for l, c in IMPLEMENTATIONS if is_available(l)]
+        cnn_available = [(l, c) for l, c in CNN_IMPLEMENTATIONS if is_available(l)]
+        available_by_model = {"mlp": mlp_available, "cnn": cnn_available}
+
+        print(f"Unified mode: scheduling across MLP ({len(mlp_available)} impls) "
+              f"and CNN ({len(cnn_available)} impls)")
+        print()
+
+        figs_dir_root = os.path.join(PROJECT_ROOT, "results", "plots")
+        run_unified_scaling(
+            budget_seconds=args.budget * 60,
+            bench_cfg=bench_cfg,
+            figs_dir_root=figs_dir_root,
+            cfg_by_model=cfg_by_model,
+            available_by_model=available_by_model,
+            use_cache=not args.no_cache,
+        )
+
+    elif mode == "scaling":
         # Build scaling cfg from YAML defaults, CLI args override
         def _parse_list(arg):
             return [int(x) for x in arg.split(",")] if arg else None
