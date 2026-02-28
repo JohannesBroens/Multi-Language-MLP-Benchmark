@@ -57,21 +57,21 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..
 # Implementation definitions with configurable placeholders.
 IMPLEMENTATIONS = [
     ("C (CPU)",
-     "./src/c/build_cpu/main --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs} --learning-rate {learning_rate}"),
+     "./src/c/build_cpu/main --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler}"),
     ("C (CUDA)",
-     "./src/c/build_cuda/main --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs} --learning-rate {learning_rate}"),
+     "./src/c/build_cuda/main --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler}"),
     ("NumPy",
-     "{python} src/python/models/mlp/mlp_numpy.py --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs} --learning-rate {learning_rate}"),
+     "{python} src/python/models/mlp/mlp_numpy.py --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler}"),
     ("PyTorch (CPU)",
-     "{python} src/python/models/mlp/mlp_pytorch.py --dataset {dataset} --device cpu --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs} --learning-rate {learning_rate}"),
+     "{python} src/python/models/mlp/mlp_pytorch.py --dataset {dataset} --device cpu --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler}"),
     ("PyTorch (CUDA)",
-     "{python} src/python/models/mlp/mlp_pytorch.py --dataset {dataset} --device cuda --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs} --learning-rate {learning_rate}"),
+     "{python} src/python/models/mlp/mlp_pytorch.py --dataset {dataset} --device cuda --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler}"),
     ("Rust (CPU)",
-     "./src/rust/target/release/mlp-cpu --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs} --learning-rate {learning_rate}"),
+     "./src/rust/target/release/mlp-cpu --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler}"),
     ("Rust (cuBLAS)",
-     "./src/rust/target/release/mlp-cuda-cublas --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs} --learning-rate {learning_rate}"),
+     "./src/rust/target/release/mlp-cuda-cublas --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler}"),
     ("Rust (CUDA Kernels)",
-     "./src/rust/target/release/mlp-cuda-kernels --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs} --learning-rate {learning_rate}"),
+     "./src/rust/target/release/mlp-cuda-kernels --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler}"),
 ]
 
 # CNN implementations — fixed architecture (LeNet-5), MNIST only.
@@ -81,19 +81,19 @@ IMPLEMENTATIONS = [
 # BLAS backend makes it a competitive CPU baseline.
 CNN_IMPLEMENTATIONS = [
     ("CNN C (CPU)",
-     "./src/c/build_cpu/cnn_main --dataset mnist --batch-size {batch_size} --epochs {epochs} --learning-rate {learning_rate}"),
+     "./src/c/build_cpu/cnn_main --dataset mnist --batch-size {batch_size} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler}"),
     ("CNN C (CUDA)",
-     "./src/c/build_cuda/cnn_main --dataset mnist --batch-size {batch_size} --epochs {epochs} --learning-rate {learning_rate}"),
+     "./src/c/build_cuda/cnn_main --dataset mnist --batch-size {batch_size} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler}"),
     ("CNN PyTorch (CPU)",
-     "{python} src/python/models/cnn/cnn_pytorch.py --dataset mnist --device cpu --batch-size {batch_size} --epochs {epochs} --learning-rate {learning_rate}"),
+     "{python} src/python/models/cnn/cnn_pytorch.py --dataset mnist --device cpu --batch-size {batch_size} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler}"),
     ("CNN PyTorch (CUDA)",
-     "{python} src/python/models/cnn/cnn_pytorch.py --dataset mnist --device cuda --batch-size {batch_size} --epochs {epochs} --learning-rate {learning_rate}"),
+     "{python} src/python/models/cnn/cnn_pytorch.py --dataset mnist --device cuda --batch-size {batch_size} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler}"),
     ("CNN Rust (CPU)",
-     "./src/rust/target/release/cnn-cpu --dataset mnist --batch-size {batch_size} --epochs {epochs} --learning-rate {learning_rate}"),
+     "./src/rust/target/release/cnn-cpu --dataset mnist --batch-size {batch_size} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler}"),
     ("CNN Rust (cuBLAS)",
-     "./src/rust/target/release/cnn-cuda-cublas --dataset mnist --batch-size {batch_size} --epochs {epochs} --learning-rate {learning_rate}"),
+     "./src/rust/target/release/cnn-cuda-cublas --dataset mnist --batch-size {batch_size} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler}"),
     ("CNN Rust (CUDA Kernels)",
-     "./src/rust/target/release/cnn-cuda-kernels --dataset mnist --batch-size {batch_size} --epochs {epochs} --learning-rate {learning_rate}"),
+     "./src/rust/target/release/cnn-cuda-kernels --dataset mnist --batch-size {batch_size} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler}"),
 ]
 
 # Regex patterns for parsing standardized output
@@ -194,7 +194,7 @@ def is_available(label):
 
 def run_implementation(label, cmd_template, dataset, batch_size=4096,
                        num_samples=0, hidden_size=512, epochs=1000,
-                       learning_rate=0.02):
+                       learning_rate=0.02, optimizer="sgd", scheduler="none"):
     """Run a single implementation and parse its output."""
     cmd = (cmd_template
            .replace("{dataset}", dataset)
@@ -203,7 +203,9 @@ def run_implementation(label, cmd_template, dataset, batch_size=4096,
            .replace("{num_samples}", str(num_samples))
            .replace("{hidden_size}", str(hidden_size))
            .replace("{epochs}", str(epochs))
-           .replace("{learning_rate}", str(learning_rate)))
+           .replace("{learning_rate}", str(learning_rate))
+           .replace("{optimizer}", str(optimizer))
+           .replace("{scheduler}", str(scheduler)))
 
     env = os.environ.copy()
     if label in ("C (CPU)", "CNN C (CPU)"):
@@ -319,6 +321,8 @@ def _collect_throughput(available, runs, vary_param, vary_values, fixed_params,
                     hidden_size=params.get("hidden_size", 512),
                     epochs=params.get("epochs", 500),
                     learning_rate=params.get("learning_rate", 0.02),
+                    optimizer=params.get("optimizer", "sgd"),
+                    scheduler=params.get("scheduler", "none"),
                 )
                 elapsed = time.monotonic() - t0
                 if r and "throughput" in r:
@@ -535,6 +539,8 @@ def _run_scheduled(schedule, cache):
             hidden_size=params.get("hidden_size", 512),
             epochs=params.get("epochs", 500),
             learning_rate=params.get("learning_rate", 0.02),
+            optimizer=params.get("optimizer", "sgd"),
+            scheduler=params.get("scheduler", "none"),
         )
         elapsed = time.monotonic() - t0
 
@@ -702,7 +708,8 @@ def print_markdown_table(results):
             print(f"| {dataset} | {label} | {acc_str} | {metrics['mean_loss']:.4f} | {time_str} | {metrics['mean_eval']:.3f} |")
 
 
-def run_standard(datasets, available, runs, figs_dir, model="mlp"):
+def run_standard(datasets, available, runs, figs_dir, model="mlp",
+                 learning_rate=0.02, optimizer="sgd", scheduler="none"):
     results = defaultdict(dict)
     for dataset in datasets:
         print(f"--- {dataset} ---")
@@ -712,7 +719,9 @@ def run_standard(datasets, available, runs, figs_dir, model="mlp"):
                 tag = f" (run {run + 1}/{runs})" if runs > 1 else ""
                 print(f"  {label}{tag}...")
                 r = run_implementation(label, cmd_template, dataset,
-                                       learning_rate=learning_rate)
+                                       learning_rate=learning_rate,
+                                       optimizer=optimizer,
+                                       scheduler=scheduler)
                 if r is not None:
                     run_results.append(r)
             if run_results:
@@ -890,6 +899,8 @@ def run_unified_scaling(budget_seconds, bench_cfg, figs_dir_root, cfg_by_model,
                 hidden_size=params.get("hidden_size", 512),
                 epochs=params.get("epochs", 500),
                 learning_rate=params.get("learning_rate", 0.02),
+                optimizer=params.get("optimizer", "sgd"),
+                scheduler=params.get("scheduler", "none"),
             )
             elapsed = time.monotonic() - t0
             remaining -= elapsed
@@ -964,6 +975,8 @@ def run_unified_scaling(budget_seconds, bench_cfg, figs_dir_root, cfg_by_model,
                 hidden_size=params.get("hidden_size", 512),
                 epochs=params.get("epochs", 500),
                 learning_rate=params.get("learning_rate", 0.02),
+                optimizer=params.get("optimizer", "sgd"),
+                scheduler=params.get("scheduler", "none"),
             )
             elapsed = time.monotonic() - t0
             remaining -= elapsed
@@ -1150,7 +1163,11 @@ def main():
         else:
             datasets = bench_cfg.get("datasets", ["generated", "iris", "breast-cancer"])
         print(f"Datasets: {datasets}\n")
-        run_standard(datasets, available, runs, figs_dir, model=args.model)
+        train_cfg = config.get("training", {})
+        run_standard(datasets, available, runs, figs_dir, model=args.model,
+                     learning_rate=train_cfg.get("learning_rate", 0.02),
+                     optimizer=train_cfg.get("optimizer", "sgd"),
+                     scheduler=train_cfg.get("scheduler") or "none")
 
 
 if __name__ == "__main__":

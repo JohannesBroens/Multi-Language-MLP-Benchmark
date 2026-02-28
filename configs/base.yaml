@@ -19,6 +19,13 @@ training:
   learning_rate: 0.02
   batch_size: 8192
   hidden_size: 64
+  optimizer: sgd
+  scheduler: null
+  warmup_fraction: 0.05
+  lr_min: 1.0e-6
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
 
 tuning:
   enabled: true
