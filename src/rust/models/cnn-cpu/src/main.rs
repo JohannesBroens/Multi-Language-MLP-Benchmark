@@ -398,7 +398,6 @@ impl Cnn {
         if optimizer == "adam" {
             eprintln!("Warning: Adam optimizer not yet implemented, using SGD");
         }
-        let _ = scheduler; // will be used in future
         let input_size = IN_C * IN_H * IN_W;
 
         // Forward conv workspace (batched, channel-major)
@@ -442,8 +441,18 @@ impl Cnn {
         let mut d_conv1_b = vec![0.0f32; C1_OUT * batch_size * C1_COL_COLS];
 
         let num_batches = (num_samples + batch_size - 1) / batch_size;
+        let warmup = if scheduler == "cosine" {
+            (num_epochs as f32 * 0.05).max(1.0) as usize
+        } else {
+            0
+        };
 
         for epoch in 0..num_epochs {
+            let lr = if scheduler == "cosine" {
+                nn_common::cosine_lr(epoch, num_epochs, learning_rate, warmup, 1e-6)
+            } else {
+                learning_rate
+            };
             let mut epoch_loss = 0.0f32;
 
             for batch in 0..num_batches {
@@ -532,7 +541,7 @@ impl Cnn {
                 conv_bias_grad(&d_conv1_b, &mut grad_conv1_b, C1_OUT, bs * C1_COL_COLS);
 
                 // SGD update
-                let lr_s = learning_rate / bs as f32;
+                let lr_s = lr / bs as f32;
 
                 sgd_update(&mut self.out_weights, &grad_out_w, lr_s);
                 sgd_update(&mut self.out_biases, &grad_out_b, lr_s);

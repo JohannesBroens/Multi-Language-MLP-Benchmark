@@ -83,7 +83,6 @@ impl Mlp {
         if optimizer == "adam" {
             eprintln!("Warning: Adam optimizer not yet implemented, using SGD");
         }
-        let _ = scheduler; // will be used in future
         let inp = self.input_size;
         let hid = self.hidden_size;
         let out = self.output_size;
@@ -98,8 +97,18 @@ impl Mlp {
         let mut grad_b2 = vec![0.0f32; out];
 
         let num_batches = (num_samples + batch_size - 1) / batch_size;
+        let warmup = if scheduler == "cosine" {
+            (num_epochs as f32 * 0.05).max(1.0) as usize
+        } else {
+            0
+        };
 
         for epoch in 0..num_epochs {
+            let lr = if scheduler == "cosine" {
+                nn_common::cosine_lr(epoch, num_epochs, learning_rate, warmup, 1e-6)
+            } else {
+                learning_rate
+            };
             let mut epoch_loss = 0.0f32;
 
             for batch in 0..num_batches {
@@ -149,7 +158,7 @@ impl Mlp {
                 col_sum(&d_hidden[..bs * hid], &mut grad_b1, bs, hid);
 
                 // ---- SGD update ----
-                let lr_s = learning_rate / bs as f32;
+                let lr_s = lr / bs as f32;
 
                 sgd_update(&mut self.input_weights, &grad_w1, lr_s);
                 sgd_update(&mut self.output_weights, &grad_w2, lr_s);

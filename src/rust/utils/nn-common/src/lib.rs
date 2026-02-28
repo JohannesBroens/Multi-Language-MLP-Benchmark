@@ -840,6 +840,16 @@ pub fn col_sum(mat: &[f32], out: &mut [f32], rows: usize, cols: usize) {
     }
 }
 
+/// Cosine annealing with linear warmup.
+/// Returns the learning rate for the given epoch.
+pub fn cosine_lr(epoch: usize, total: usize, lr_max: f32, warmup: usize, lr_min: f32) -> f32 {
+    if epoch < warmup {
+        return lr_max * (epoch as f32 + 1.0) / warmup as f32;
+    }
+    let progress = (epoch - warmup) as f32 / (total - warmup) as f32;
+    lr_min + 0.5 * (lr_max - lr_min) * (1.0 + (std::f32::consts::PI * progress).cos())
+}
+
 /// SGD update: param[i] -= lr * grad[i]
 pub fn sgd_update(param: &mut [f32], grad: &[f32], lr: f32) {
     let n = param.len() as i64;

@@ -206,7 +206,6 @@ impl GpuMlp {
         if optimizer == "adam" {
             eprintln!("Warning: Adam optimizer not yet implemented, using SGD");
         }
-        let _ = scheduler; // will be used in future
         let inp = self.input_size;
         let hid = self.hidden_size;
         let out = self.output_size;
@@ -232,8 +231,19 @@ impl GpuMlp {
         let d_loss_sum = cuda_malloc_managed(std::mem::size_of::<f32>());
 
         let num_batches = (num_samples + batch_size - 1) / batch_size;
+        let warmup = if scheduler == "cosine" {
+            (num_epochs as f32 * 0.05).max(1.0) as usize
+        } else {
+            0
+        };
 
         for epoch in 0..num_epochs {
+            let lr = if scheduler == "cosine" {
+                nn_common::cosine_lr(epoch, num_epochs, learning_rate, warmup, 1e-6)
+            } else {
+                learning_rate
+            };
+
             // Reset epoch loss
             unsafe {
                 *d_loss_sum = 0.0f32;
@@ -305,7 +315,7 @@ impl GpuMlp {
                 }
 
                 // ---- SGD update ----
-                let lr_s = learning_rate / bs as f32;
+                let lr_s = lr / bs as f32;
                 let n_iw = inp * hid;
                 let n_ow = hid * out;
                 unsafe {

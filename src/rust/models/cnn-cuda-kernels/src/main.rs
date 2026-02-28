@@ -190,7 +190,11 @@ impl GpuCnn {
         if optimizer == "adam" {
             eprintln!("Warning: Adam optimizer not yet implemented, using SGD");
         }
-        let _ = scheduler; // will be used in future
+        let warmup = if scheduler == "cosine" {
+            (num_epochs as f32 * 0.05).max(1.0) as usize
+        } else {
+            0
+        };
         let input_size = IN_C * IN_H * IN_W;
         let d_inputs = cuda_malloc(num_samples * input_size * 4);
         let d_targets = cuda_malloc(num_samples * 4) as *mut i32;
@@ -242,6 +246,11 @@ impl GpuCnn {
         let num_batches = (num_samples + batch_size - 1) / batch_size;
 
         for epoch in 0..num_epochs {
+            let lr = if scheduler == "cosine" {
+                nn_common::cosine_lr(epoch, num_epochs, learning_rate, warmup, 1e-6)
+            } else {
+                learning_rate
+            };
             unsafe { *d_loss_sum = 0.0f32; }
 
             for batch in 0..num_batches {
@@ -307,7 +316,7 @@ impl GpuCnn {
                     launch_bias_grad(d_conv1_b, g_conv1_b, C1_OUT, bs * C1_COL_COLS);
                 }
 
-                let lr_s = learning_rate / bs as f32;
+                let lr_s = lr / bs as f32;
                 unsafe {
                     launch_sgd(self.out_w, g_out_w, lr_s, FC2_OUT * NUM_CLASSES);
                     launch_sgd(self.out_b, g_out_b, lr_s, NUM_CLASSES);
