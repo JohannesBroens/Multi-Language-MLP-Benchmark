@@ -97,6 +97,19 @@ float nn_cosine_lr(int epoch, int total_epochs, float lr_max,
 /* --- SGD update: param[i] -= lr * grad[i] --- */
 void nn_sgd_update(float *param, const float *grad, float lr, int n);
 
+/* --- Adam optimizer state and update --- */
+
+typedef struct {
+    float *m;   /* first moment (mean of gradients) */
+    float *v;   /* second moment (mean of squared gradients) */
+    int n;      /* number of parameters */
+} AdamState;
+
+void nn_adam_state_init(AdamState *state, int n);
+void nn_adam_state_free(AdamState *state);
+void nn_adam_update(float *param, const float *grad, AdamState *state,
+                    float lr, float beta1, float beta2, float eps, int t);
+
 /* --- PRNG for weight initialization --- */
 
 /* Xorshift32 PRNG (matches across C and Rust implementations) */

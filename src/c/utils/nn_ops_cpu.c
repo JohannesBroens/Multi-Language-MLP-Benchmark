@@ -298,6 +298,35 @@ void nn_sgd_update(float *param, const float *grad, float lr, int n) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Adam optimizer                                                     */
+/* ------------------------------------------------------------------ */
+
+void nn_adam_state_init(AdamState *state, int n) {
+    state->n = n;
+    state->m = (float *)calloc(n, sizeof(float));
+    state->v = (float *)calloc(n, sizeof(float));
+}
+
+void nn_adam_state_free(AdamState *state) {
+    free(state->m); free(state->v);
+    state->m = NULL; state->v = NULL;
+}
+
+void nn_adam_update(float *param, const float *grad, AdamState *state,
+                    float lr, float beta1, float beta2, float eps, int t) {
+    float bc1 = 1.0f - powf(beta1, (float)t);
+    float bc2 = 1.0f - powf(beta2, (float)t);
+    #pragma omp parallel for schedule(static) if(state->n > NN_ELEM_THRESHOLD)
+    for (int i = 0; i < state->n; i++) {
+        state->m[i] = beta1 * state->m[i] + (1.0f - beta1) * grad[i];
+        state->v[i] = beta2 * state->v[i] + (1.0f - beta2) * grad[i] * grad[i];
+        float m_hat = state->m[i] / bc1;
+        float v_hat = state->v[i] / bc2;
+        param[i] -= lr * m_hat / (sqrtf(v_hat) + eps);
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /*  PRNG for weight initialization                                     */
 /* ------------------------------------------------------------------ */
 

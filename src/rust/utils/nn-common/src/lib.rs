@@ -850,6 +850,50 @@ pub fn cosine_lr(epoch: usize, total: usize, lr_max: f32, warmup: usize, lr_min:
     lr_min + 0.5 * (lr_max - lr_min) * (1.0 + (std::f32::consts::PI * progress).cos())
 }
 
+/// Adam optimizer state: first and second moment estimates per parameter.
+pub struct AdamState {
+    pub m: Vec<f32>,
+    pub v: Vec<f32>,
+}
+
+impl AdamState {
+    pub fn new(n: usize) -> Self {
+        AdamState { m: vec![0.0; n], v: vec![0.0; n] }
+    }
+}
+
+/// Adam optimizer update.
+/// `lr` should already be scaled by 1/batch_size (same convention as SGD).
+pub fn adam_update(
+    param: &mut [f32], grad: &[f32], state: &mut AdamState,
+    lr: f32, beta1: f32, beta2: f32, eps: f32, t: u32,
+) {
+    let bc1 = 1.0 - beta1.powi(t as i32);
+    let bc2 = 1.0 - beta2.powi(t as i32);
+    let n = param.len() as i64;
+    if n > OMP_ELEM_THRESHOLD {
+        param.par_iter_mut()
+            .zip(grad.par_iter())
+            .zip(state.m.par_iter_mut())
+            .zip(state.v.par_iter_mut())
+            .for_each(|(((p, &g), m), v)| {
+                *m = beta1 * *m + (1.0 - beta1) * g;
+                *v = beta2 * *v + (1.0 - beta2) * g * g;
+                let m_hat = *m / bc1;
+                let v_hat = *v / bc2;
+                *p -= lr * m_hat / (v_hat.sqrt() + eps);
+            });
+    } else {
+        for i in 0..param.len() {
+            state.m[i] = beta1 * state.m[i] + (1.0 - beta1) * grad[i];
+            state.v[i] = beta2 * state.v[i] + (1.0 - beta2) * grad[i] * grad[i];
+            let m_hat = state.m[i] / bc1;
+            let v_hat = state.v[i] / bc2;
+            param[i] -= lr * m_hat / (v_hat.sqrt() + eps);
+        }
+    }
+}
+
 /// SGD update: param[i] -= lr * grad[i]
 pub fn sgd_update(param: &mut [f32], grad: &[f32], lr: f32) {
     let n = param.len() as i64;

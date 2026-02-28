@@ -1,8 +1,8 @@
 use nn_common::{
     parse_args, load_dataset, normalize_features, shuffle_data, Xorshift32,
     sgemm_nn, sgemm_tn, sgemm_nt, init_thread_pool,
-    bias_relu, bias_softmax, cross_entropy_grad, col_sum, sgd_update,
-    relu_backward, xavier_init, OMP_ELEM_THRESHOLD,
+    bias_relu, bias_softmax, cross_entropy_grad, col_sum, sgd_update, adam_update,
+    relu_backward, xavier_init, OMP_ELEM_THRESHOLD, AdamState,
 };
 use rayon::prelude::*;
 use std::time::Instant;
@@ -80,9 +80,6 @@ impl Mlp {
         optimizer: &str,
         scheduler: &str,
     ) {
-        if optimizer == "adam" {
-            eprintln!("Warning: Adam optimizer not yet implemented, using SGD");
-        }
         let inp = self.input_size;
         let hid = self.hidden_size;
         let out = self.output_size;
@@ -95,6 +92,13 @@ impl Mlp {
         let mut grad_w2 = vec![0.0f32; hid * out];
         let mut grad_b1 = vec![0.0f32; hid];
         let mut grad_b2 = vec![0.0f32; out];
+
+        let use_adam = optimizer == "adam";
+        let mut adam_w1 = if use_adam { Some(AdamState::new(inp * hid)) } else { None };
+        let mut adam_w2 = if use_adam { Some(AdamState::new(hid * out)) } else { None };
+        let mut adam_b1 = if use_adam { Some(AdamState::new(hid)) } else { None };
+        let mut adam_b2 = if use_adam { Some(AdamState::new(out)) } else { None };
+        let mut step: u32 = 0;
 
         let num_batches = (num_samples + batch_size - 1) / batch_size;
         let warmup = if scheduler == "cosine" {
@@ -157,13 +161,21 @@ impl Mlp {
                 // grad_b1 = column sum of d_hidden
                 col_sum(&d_hidden[..bs * hid], &mut grad_b1, bs, hid);
 
-                // ---- SGD update ----
+                // ---- Parameter update ----
                 let lr_s = lr / bs as f32;
 
-                sgd_update(&mut self.input_weights, &grad_w1, lr_s);
-                sgd_update(&mut self.output_weights, &grad_w2, lr_s);
-                sgd_update(&mut self.hidden_biases, &grad_b1, lr_s);
-                sgd_update(&mut self.output_biases, &grad_b2, lr_s);
+                if let Some(ref mut a) = adam_w1 {
+                    step += 1;
+                    adam_update(&mut self.input_weights, &grad_w1, a, lr_s, 0.9, 0.999, 1e-8, step);
+                    adam_update(&mut self.output_weights, &grad_w2, adam_w2.as_mut().unwrap(), lr_s, 0.9, 0.999, 1e-8, step);
+                    adam_update(&mut self.hidden_biases, &grad_b1, adam_b1.as_mut().unwrap(), lr_s, 0.9, 0.999, 1e-8, step);
+                    adam_update(&mut self.output_biases, &grad_b2, adam_b2.as_mut().unwrap(), lr_s, 0.9, 0.999, 1e-8, step);
+                } else {
+                    sgd_update(&mut self.input_weights, &grad_w1, lr_s);
+                    sgd_update(&mut self.output_weights, &grad_w2, lr_s);
+                    sgd_update(&mut self.hidden_biases, &grad_b1, lr_s);
+                    sgd_update(&mut self.output_biases, &grad_b2, lr_s);
+                }
             }
 
             if epoch % 100 == 0 {

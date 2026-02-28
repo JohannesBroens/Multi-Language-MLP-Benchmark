@@ -69,7 +69,6 @@ static void forward_batch(const MLP *mlp, const float *X, int bs,
 void mlp_train(MLP *mlp, float *inputs, int *targets, int num_samples,
                int batch_size, int num_epochs, float learning_rate,
                OptimizerType optimizer, SchedulerType scheduler) {
-    (void)optimizer; /* TODO: implement Adam in later tasks */
     int in  = mlp->input_size;
     int hid = mlp->hidden_size;
     int out = mlp->output_size;
@@ -88,6 +87,17 @@ void mlp_train(MLP *mlp, float *inputs, int *targets, int num_samples,
         !grad_W1 || !grad_W2 || !grad_b1 || !grad_b2 || !losses) {
         fprintf(stderr, "Failed to allocate training workspace.\n");
         exit(EXIT_FAILURE);
+    }
+
+    /* Adam optimizer state */
+    AdamState adam_W1 = {0}, adam_W2 = {0}, adam_b1 = {0}, adam_b2 = {0};
+    int step = 0;
+    float beta1 = 0.9f, beta2 = 0.999f, eps = 1e-8f;
+    if (optimizer == OPT_ADAM) {
+        nn_adam_state_init(&adam_W1, in * hid);
+        nn_adam_state_init(&adam_W2, hid * out);
+        nn_adam_state_init(&adam_b1, hid);
+        nn_adam_state_init(&adam_b2, out);
     }
 
     int num_batches = (num_samples + batch_size - 1) / batch_size;
@@ -134,17 +144,32 @@ void mlp_train(MLP *mlp, float *inputs, int *targets, int num_samples,
             /* grad_b1 = column sum of d_hidden */
             nn_col_sum(d_hidden, grad_b1, bs, hid);
 
-            /* ---- SGD update ---- */
+            /* ---- Parameter update ---- */
             float lr_s = lr / (float)bs;
+            step++;
 
-            nn_sgd_update(mlp->input_weights, grad_W1, lr_s, in * hid);
-            nn_sgd_update(mlp->output_weights, grad_W2, lr_s, hid * out);
-            nn_sgd_update(mlp->hidden_biases, grad_b1, lr_s, hid);
-            nn_sgd_update(mlp->output_biases, grad_b2, lr_s, out);
+            if (optimizer == OPT_ADAM) {
+                nn_adam_update(mlp->input_weights, grad_W1, &adam_W1, lr_s, beta1, beta2, eps, step);
+                nn_adam_update(mlp->output_weights, grad_W2, &adam_W2, lr_s, beta1, beta2, eps, step);
+                nn_adam_update(mlp->hidden_biases, grad_b1, &adam_b1, lr_s, beta1, beta2, eps, step);
+                nn_adam_update(mlp->output_biases, grad_b2, &adam_b2, lr_s, beta1, beta2, eps, step);
+            } else {
+                nn_sgd_update(mlp->input_weights, grad_W1, lr_s, in * hid);
+                nn_sgd_update(mlp->output_weights, grad_W2, lr_s, hid * out);
+                nn_sgd_update(mlp->hidden_biases, grad_b1, lr_s, hid);
+                nn_sgd_update(mlp->output_biases, grad_b2, lr_s, out);
+            }
         }
 
         if (epoch % 100 == 0)
             printf("  Epoch %4d  loss: %.4f\n", epoch, epoch_loss / num_samples);
+    }
+
+    if (optimizer == OPT_ADAM) {
+        nn_adam_state_free(&adam_W1);
+        nn_adam_state_free(&adam_W2);
+        nn_adam_state_free(&adam_b1);
+        nn_adam_state_free(&adam_b2);
     }
 
     free(hidden);  free(output);

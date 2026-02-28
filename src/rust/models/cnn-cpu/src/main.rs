@@ -1,8 +1,8 @@
 use nn_common::{
     parse_args, load_dataset, shuffle_data, Xorshift32,
     sgemm_nn, sgemm_tn, sgemm_nt, init_thread_pool,
-    bias_relu, bias_softmax, cross_entropy_grad, col_sum, sgd_update,
-    relu_forward, relu_backward, xavier_init,
+    bias_relu, bias_softmax, cross_entropy_grad, col_sum, sgd_update, adam_update,
+    relu_forward, relu_backward, xavier_init, AdamState,
 };
 use std::time::Instant;
 
@@ -395,10 +395,26 @@ impl Cnn {
     fn train(&mut self, inputs: &[f32], targets: &[i32], num_samples: usize,
              batch_size: usize, num_epochs: usize, learning_rate: f32,
              optimizer: &str, scheduler: &str) {
-        if optimizer == "adam" {
-            eprintln!("Warning: Adam optimizer not yet implemented, using SGD");
-        }
         let input_size = IN_C * IN_H * IN_W;
+
+        let use_adam = optimizer == "adam";
+        let mut adam_states: Vec<AdamState> = if use_adam {
+            vec![
+                AdamState::new(C1_OUT * C1_COL_ROWS),  // conv1_weights
+                AdamState::new(C1_OUT),                  // conv1_biases
+                AdamState::new(C2_OUT * C2_COL_ROWS),  // conv2_weights
+                AdamState::new(C2_OUT),                  // conv2_biases
+                AdamState::new(FLAT_SIZE * FC1_OUT),    // fc1_weights
+                AdamState::new(FC1_OUT),                 // fc1_biases
+                AdamState::new(FC1_OUT * FC2_OUT),      // fc2_weights
+                AdamState::new(FC2_OUT),                 // fc2_biases
+                AdamState::new(FC2_OUT * NUM_CLASSES),  // out_weights
+                AdamState::new(NUM_CLASSES),              // out_biases
+            ]
+        } else {
+            vec![]
+        };
+        let mut step: u32 = 0;
 
         // Forward conv workspace (batched, channel-major)
         let mut col1_b = vec![0.0f32; C1_COL_ROWS * batch_size * C1_COL_COLS];
@@ -540,19 +556,33 @@ impl Cnn {
                 // Conv1 bias gradient
                 conv_bias_grad(&d_conv1_b, &mut grad_conv1_b, C1_OUT, bs * C1_COL_COLS);
 
-                // SGD update
+                // Parameter update
                 let lr_s = lr / bs as f32;
 
-                sgd_update(&mut self.out_weights, &grad_out_w, lr_s);
-                sgd_update(&mut self.out_biases, &grad_out_b, lr_s);
-                sgd_update(&mut self.fc2_weights, &grad_fc2_w, lr_s);
-                sgd_update(&mut self.fc2_biases, &grad_fc2_b, lr_s);
-                sgd_update(&mut self.fc1_weights, &grad_fc1_w, lr_s);
-                sgd_update(&mut self.fc1_biases, &grad_fc1_b, lr_s);
-                sgd_update(&mut self.conv2_weights, &grad_conv2_w, lr_s);
-                sgd_update(&mut self.conv2_biases, &grad_conv2_b, lr_s);
-                sgd_update(&mut self.conv1_weights, &grad_conv1_w, lr_s);
-                sgd_update(&mut self.conv1_biases, &grad_conv1_b, lr_s);
+                if use_adam {
+                    step += 1;
+                    adam_update(&mut self.conv1_weights, &grad_conv1_w, &mut adam_states[0], lr_s, 0.9, 0.999, 1e-8, step);
+                    adam_update(&mut self.conv1_biases, &grad_conv1_b, &mut adam_states[1], lr_s, 0.9, 0.999, 1e-8, step);
+                    adam_update(&mut self.conv2_weights, &grad_conv2_w, &mut adam_states[2], lr_s, 0.9, 0.999, 1e-8, step);
+                    adam_update(&mut self.conv2_biases, &grad_conv2_b, &mut adam_states[3], lr_s, 0.9, 0.999, 1e-8, step);
+                    adam_update(&mut self.fc1_weights, &grad_fc1_w, &mut adam_states[4], lr_s, 0.9, 0.999, 1e-8, step);
+                    adam_update(&mut self.fc1_biases, &grad_fc1_b, &mut adam_states[5], lr_s, 0.9, 0.999, 1e-8, step);
+                    adam_update(&mut self.fc2_weights, &grad_fc2_w, &mut adam_states[6], lr_s, 0.9, 0.999, 1e-8, step);
+                    adam_update(&mut self.fc2_biases, &grad_fc2_b, &mut adam_states[7], lr_s, 0.9, 0.999, 1e-8, step);
+                    adam_update(&mut self.out_weights, &grad_out_w, &mut adam_states[8], lr_s, 0.9, 0.999, 1e-8, step);
+                    adam_update(&mut self.out_biases, &grad_out_b, &mut adam_states[9], lr_s, 0.9, 0.999, 1e-8, step);
+                } else {
+                    sgd_update(&mut self.out_weights, &grad_out_w, lr_s);
+                    sgd_update(&mut self.out_biases, &grad_out_b, lr_s);
+                    sgd_update(&mut self.fc2_weights, &grad_fc2_w, lr_s);
+                    sgd_update(&mut self.fc2_biases, &grad_fc2_b, lr_s);
+                    sgd_update(&mut self.fc1_weights, &grad_fc1_w, lr_s);
+                    sgd_update(&mut self.fc1_biases, &grad_fc1_b, lr_s);
+                    sgd_update(&mut self.conv2_weights, &grad_conv2_w, lr_s);
+                    sgd_update(&mut self.conv2_biases, &grad_conv2_b, lr_s);
+                    sgd_update(&mut self.conv1_weights, &grad_conv1_w, lr_s);
+                    sgd_update(&mut self.conv1_biases, &grad_conv1_b, lr_s);
+                }
             }
 
             println!("  Epoch {:4}  loss: {:.4}", epoch, epoch_loss / num_samples as f32);

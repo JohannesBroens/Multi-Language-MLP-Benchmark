@@ -1,4 +1,5 @@
 #include "mlp.h"
+#include "nn_ops.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -221,7 +222,6 @@ void mlp_free(MLP *mlp) {
 void mlp_train(MLP *mlp, float *inputs, int *targets, int num_samples,
                int batch_size, int num_epochs, float learning_rate,
                OptimizerType optimizer, SchedulerType scheduler) {
-    (void)optimizer; /* TODO: implement Adam in later tasks */
     int in  = mlp->input_size;
     int hid = mlp->hidden_size;
     int out = mlp->output_size;
@@ -249,6 +249,17 @@ void mlp_train(MLP *mlp, float *inputs, int *targets, int num_samples,
     CUDA_CHECK(cudaMalloc(&d_grad_b2,   (size_t)out * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_losses,    (size_t)batch_size * sizeof(float)));
     CUDA_CHECK(cudaMallocManaged(&d_loss_sum, sizeof(float)));
+
+    /* Adam optimizer state */
+    AdamState adam_W1 = {0}, adam_W2 = {0}, adam_b1 = {0}, adam_b2 = {0};
+    int step = 0;
+    float beta1 = 0.9f, beta2 = 0.999f, eps = 1e-8f;
+    if (optimizer == OPT_ADAM) {
+        nn_adam_state_init(&adam_W1, in * hid);
+        nn_adam_state_init(&adam_W2, hid * out);
+        nn_adam_state_init(&adam_b1, hid);
+        nn_adam_state_init(&adam_b2, out);
+    }
 
     int threads = 256;
     int num_batches = (num_samples + batch_size - 1) / batch_size;
@@ -311,18 +322,27 @@ void mlp_train(MLP *mlp, float *inputs, int *targets, int num_samples,
             col_sum_kernel<<<(hid + threads - 1) / threads, threads>>>(
                 d_d_hidden, d_grad_b1, bs, hid);
 
-            /* ---- SGD update ---- */
+            /* ---- Parameter update ---- */
             float lr_s = lr / (float)bs;
-            int n_iw = in * hid;
-            int n_ow = hid * out;
-            sgd_kernel<<<(n_iw + threads - 1) / threads, threads>>>(
-                mlp->input_weights, d_grad_W1, lr_s, n_iw);
-            sgd_kernel<<<(n_ow + threads - 1) / threads, threads>>>(
-                mlp->output_weights, d_grad_W2, lr_s, n_ow);
-            sgd_kernel<<<(hid + threads - 1) / threads, threads>>>(
-                mlp->hidden_biases, d_grad_b1, lr_s, hid);
-            sgd_kernel<<<(out + threads - 1) / threads, threads>>>(
-                mlp->output_biases, d_grad_b2, lr_s, out);
+            step++;
+
+            if (optimizer == OPT_ADAM) {
+                nn_adam_update(mlp->input_weights, d_grad_W1, &adam_W1, lr_s, beta1, beta2, eps, step);
+                nn_adam_update(mlp->output_weights, d_grad_W2, &adam_W2, lr_s, beta1, beta2, eps, step);
+                nn_adam_update(mlp->hidden_biases, d_grad_b1, &adam_b1, lr_s, beta1, beta2, eps, step);
+                nn_adam_update(mlp->output_biases, d_grad_b2, &adam_b2, lr_s, beta1, beta2, eps, step);
+            } else {
+                int n_iw = in * hid;
+                int n_ow = hid * out;
+                sgd_kernel<<<(n_iw + threads - 1) / threads, threads>>>(
+                    mlp->input_weights, d_grad_W1, lr_s, n_iw);
+                sgd_kernel<<<(n_ow + threads - 1) / threads, threads>>>(
+                    mlp->output_weights, d_grad_W2, lr_s, n_ow);
+                sgd_kernel<<<(hid + threads - 1) / threads, threads>>>(
+                    mlp->hidden_biases, d_grad_b1, lr_s, hid);
+                sgd_kernel<<<(out + threads - 1) / threads, threads>>>(
+                    mlp->output_biases, d_grad_b2, lr_s, out);
+            }
         }
 
         if (epoch % 100 == 0) {
@@ -332,6 +352,13 @@ void mlp_train(MLP *mlp, float *inputs, int *targets, int num_samples,
     }
 
     CUDA_CHECK(cudaDeviceSynchronize());
+
+    if (optimizer == OPT_ADAM) {
+        nn_adam_state_free(&adam_W1);
+        nn_adam_state_free(&adam_W2);
+        nn_adam_state_free(&adam_b1);
+        nn_adam_state_free(&adam_b2);
+    }
 
     cudaFree(d_inputs);   cudaFree(d_targets);
     cudaFree(d_hidden);   cudaFree(d_output);

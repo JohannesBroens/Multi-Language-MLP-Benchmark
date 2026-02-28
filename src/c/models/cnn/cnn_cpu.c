@@ -425,8 +425,6 @@ static void forward_batch(const CNN *cnn, const float *inputs, int bs,
 void cnn_train(CNN *cnn, float *inputs, int *targets, int num_samples,
                int batch_size, int num_epochs, float learning_rate,
                OptimizerType optimizer, SchedulerType scheduler) {
-    (void)optimizer; /* TODO: implement Adam in later tasks */
-
     int input_size = IN_C * IN_H * IN_W;
 
     /* Forward conv workspace (channel-major batched buffers) */
@@ -470,6 +468,27 @@ void cnn_train(CNN *cnn, float *inputs, int *targets, int num_samples,
     float *d_conv1_b = (float *)malloc((size_t)C1_OUT * batch_size * C1_COL_COLS * sizeof(float));
 
     float *losses = (float *)malloc(batch_size * sizeof(float));
+
+    /* Adam optimizer state (10 param tensors: 5 weight + 5 bias) */
+    AdamState adam_states[10] = {{0}};
+    int step = 0;
+    float beta1 = 0.9f, beta2 = 0.999f, eps = 1e-8f;
+    if (optimizer == OPT_ADAM) {
+        int sizes[10] = {
+            C1_OUT * C1_COL_ROWS,   /* conv1_weights */
+            C1_OUT,                  /* conv1_biases */
+            C2_OUT * C2_COL_ROWS,   /* conv2_weights */
+            C2_OUT,                  /* conv2_biases */
+            FLAT_SIZE * FC1_OUT,    /* fc1_weights */
+            FC1_OUT,                 /* fc1_biases */
+            FC1_OUT * FC2_OUT,      /* fc2_weights */
+            FC2_OUT,                 /* fc2_biases */
+            FC2_OUT * NUM_CLASSES,  /* out_weights */
+            NUM_CLASSES              /* out_biases */
+        };
+        for (int i = 0; i < 10; i++)
+            nn_adam_state_init(&adam_states[i], sizes[i]);
+    }
 
     int num_batches = (num_samples + batch_size - 1) / batch_size;
     int warmup_epochs = (scheduler == SCHED_COSINE) ? (int)(num_epochs * 0.05f) : 0;
@@ -567,25 +586,44 @@ void cnn_train(CNN *cnn, float *inputs, int *targets, int num_samples,
             /* Conv1 bias gradient */
             conv_bias_grad(d_conv1_b, grad_conv1_b, C1_OUT, bs * C1_COL_COLS);
 
-            /* ---- SGD update ---- */
+            /* ---- Parameter update ---- */
             float lr_s = lr / (float)bs;
+            step++;
 
-            nn_sgd_update(cnn->out_weights, grad_out_w, lr_s, FC2_OUT * NUM_CLASSES);
-            nn_sgd_update(cnn->out_biases, grad_out_b, lr_s, NUM_CLASSES);
-            nn_sgd_update(cnn->fc2_weights, grad_fc2_w, lr_s, FC1_OUT * FC2_OUT);
-            nn_sgd_update(cnn->fc2_biases, grad_fc2_b, lr_s, FC2_OUT);
-            nn_sgd_update(cnn->fc1_weights, grad_fc1_w, lr_s, FLAT_SIZE * FC1_OUT);
-            nn_sgd_update(cnn->fc1_biases, grad_fc1_b, lr_s, FC1_OUT);
-            nn_sgd_update(cnn->conv2_weights, grad_conv2_w, lr_s, C2_OUT * C2_COL_ROWS);
-            nn_sgd_update(cnn->conv2_biases, grad_conv2_b, lr_s, C2_OUT);
-            nn_sgd_update(cnn->conv1_weights, grad_conv1_w, lr_s, C1_OUT * C1_COL_ROWS);
-            nn_sgd_update(cnn->conv1_biases, grad_conv1_b, lr_s, C1_OUT);
+            if (optimizer == OPT_ADAM) {
+                nn_adam_update(cnn->conv1_weights, grad_conv1_w, &adam_states[0], lr_s, beta1, beta2, eps, step);
+                nn_adam_update(cnn->conv1_biases, grad_conv1_b, &adam_states[1], lr_s, beta1, beta2, eps, step);
+                nn_adam_update(cnn->conv2_weights, grad_conv2_w, &adam_states[2], lr_s, beta1, beta2, eps, step);
+                nn_adam_update(cnn->conv2_biases, grad_conv2_b, &adam_states[3], lr_s, beta1, beta2, eps, step);
+                nn_adam_update(cnn->fc1_weights, grad_fc1_w, &adam_states[4], lr_s, beta1, beta2, eps, step);
+                nn_adam_update(cnn->fc1_biases, grad_fc1_b, &adam_states[5], lr_s, beta1, beta2, eps, step);
+                nn_adam_update(cnn->fc2_weights, grad_fc2_w, &adam_states[6], lr_s, beta1, beta2, eps, step);
+                nn_adam_update(cnn->fc2_biases, grad_fc2_b, &adam_states[7], lr_s, beta1, beta2, eps, step);
+                nn_adam_update(cnn->out_weights, grad_out_w, &adam_states[8], lr_s, beta1, beta2, eps, step);
+                nn_adam_update(cnn->out_biases, grad_out_b, &adam_states[9], lr_s, beta1, beta2, eps, step);
+            } else {
+                nn_sgd_update(cnn->out_weights, grad_out_w, lr_s, FC2_OUT * NUM_CLASSES);
+                nn_sgd_update(cnn->out_biases, grad_out_b, lr_s, NUM_CLASSES);
+                nn_sgd_update(cnn->fc2_weights, grad_fc2_w, lr_s, FC1_OUT * FC2_OUT);
+                nn_sgd_update(cnn->fc2_biases, grad_fc2_b, lr_s, FC2_OUT);
+                nn_sgd_update(cnn->fc1_weights, grad_fc1_w, lr_s, FLAT_SIZE * FC1_OUT);
+                nn_sgd_update(cnn->fc1_biases, grad_fc1_b, lr_s, FC1_OUT);
+                nn_sgd_update(cnn->conv2_weights, grad_conv2_w, lr_s, C2_OUT * C2_COL_ROWS);
+                nn_sgd_update(cnn->conv2_biases, grad_conv2_b, lr_s, C2_OUT);
+                nn_sgd_update(cnn->conv1_weights, grad_conv1_w, lr_s, C1_OUT * C1_COL_ROWS);
+                nn_sgd_update(cnn->conv1_biases, grad_conv1_b, lr_s, C1_OUT);
+            }
         }
 
         if (epoch % 1 == 0) {
             printf("  Epoch %4d  loss: %.4f\n", epoch, epoch_loss / num_samples);
             fflush(stdout);
         }
+    }
+
+    if (optimizer == OPT_ADAM) {
+        for (int i = 0; i < 10; i++)
+            nn_adam_state_free(&adam_states[i]);
     }
 
     /* Free all workspace */

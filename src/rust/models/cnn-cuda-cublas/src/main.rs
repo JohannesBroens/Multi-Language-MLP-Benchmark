@@ -77,6 +77,8 @@ extern "C" {
     fn launch_relu_mask(d_hidden: *mut f32, hidden: *const f32, total: i32);
     fn launch_col_sum(mat: *const f32, out_vec: *mut f32, rows: i32, cols: i32);
     fn launch_sgd(param: *mut f32, grad: *const f32, lr: f32, n: i32);
+    fn launch_adam(param: *mut f32, grad: *const f32, m: *mut f32, v: *mut f32,
+                   lr: f32, beta1: f32, beta2: f32, eps: f32, t: i32, n: i32);
     fn launch_reduce_sum(arr: *const f32, result: *mut f32, n: i32);
     fn launch_init_weights(weights: *mut f32, size: i32, scale: f32, seed: u64);
     fn launch_eval_metrics(output: *const f32, targets: *const i32, losses: *mut f32, correct: *mut i32, bs: i32, out: i32);
@@ -125,6 +127,32 @@ fn sgemm_tn(h: CublasHandle, m: i32, n: i32, k: i32, a: *const f32, b: *const f3
 fn sgemm_nt(h: CublasHandle, m: i32, n: i32, k: i32, a: *const f32, b: *const f32, c: *mut f32) {
     let alpha: f32 = 1.0; let beta: f32 = 0.0;
     unsafe { cublasSgemm_v2(h, CublasOperation::T, CublasOperation::N, n, m, k, &alpha, b, k, a, k, &beta, c, n); }
+}
+
+// ---------------------------------------------------------------------------
+//  CUDA Adam optimizer state
+// ---------------------------------------------------------------------------
+
+struct CudaAdamState {
+    m: *mut f32,
+    v: *mut f32,
+}
+
+impl CudaAdamState {
+    fn new(n: i32) -> Self {
+        let m = cuda_malloc(n as usize * 4);
+        let v = cuda_malloc(n as usize * 4);
+        cuda_memset_zero(m, n as usize);
+        cuda_memset_zero(v, n as usize);
+        CudaAdamState { m, v }
+    }
+}
+
+impl Drop for CudaAdamState {
+    fn drop(&mut self) {
+        cuda_free(self.m);
+        cuda_free(self.v);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -214,9 +242,25 @@ impl GpuCnn {
     fn train(&mut self, inputs: &[f32], targets: &[i32], num_samples: usize,
              batch_size: usize, num_epochs: usize, learning_rate: f32,
              optimizer: &str, scheduler: &str) {
-        if optimizer == "adam" {
-            eprintln!("Warning: Adam optimizer not yet implemented, using SGD");
-        }
+        let use_adam = optimizer == "adam";
+        let adam_states: Vec<CudaAdamState> = if use_adam {
+            vec![
+                CudaAdamState::new(C1_OUT * C1_COL_ROWS),  // conv1_w
+                CudaAdamState::new(C1_OUT),                  // conv1_b
+                CudaAdamState::new(C2_OUT * C2_COL_ROWS),  // conv2_w
+                CudaAdamState::new(C2_OUT),                  // conv2_b
+                CudaAdamState::new(FLAT_SIZE * FC1_OUT),    // fc1_w
+                CudaAdamState::new(FC1_OUT),                 // fc1_b
+                CudaAdamState::new(FC1_OUT * FC2_OUT),      // fc2_w
+                CudaAdamState::new(FC2_OUT),                 // fc2_b
+                CudaAdamState::new(FC2_OUT * NUM_CLASSES),  // out_w
+                CudaAdamState::new(NUM_CLASSES),              // out_b
+            ]
+        } else {
+            vec![]
+        };
+        let mut step: i32 = 0;
+
         let input_size = IN_C * IN_H * IN_W;
         let d_inputs = cuda_malloc(num_samples * input_size * 4);
         let d_targets = cuda_malloc(num_samples * 4) as *mut i32;
@@ -345,17 +389,33 @@ impl GpuCnn {
                 }
 
                 let lr_s = lr / bs as f32;
-                unsafe {
-                    launch_sgd(self.out_w, g_out_w, lr_s, FC2_OUT * NUM_CLASSES);
-                    launch_sgd(self.out_b, g_out_b, lr_s, NUM_CLASSES);
-                    launch_sgd(self.fc2_w, g_fc2_w, lr_s, FC1_OUT * FC2_OUT);
-                    launch_sgd(self.fc2_b, g_fc2_b, lr_s, FC2_OUT);
-                    launch_sgd(self.fc1_w, g_fc1_w, lr_s, FLAT_SIZE * FC1_OUT);
-                    launch_sgd(self.fc1_b, g_fc1_b, lr_s, FC1_OUT);
-                    launch_sgd(self.conv2_w, g_conv2_w, lr_s, C2_OUT * C2_COL_ROWS);
-                    launch_sgd(self.conv2_b, g_conv2_b, lr_s, C2_OUT);
-                    launch_sgd(self.conv1_w, g_conv1_w, lr_s, C1_OUT * C1_COL_ROWS);
-                    launch_sgd(self.conv1_b, g_conv1_b, lr_s, C1_OUT);
+                if use_adam {
+                    step += 1;
+                    unsafe {
+                        launch_adam(self.conv1_w, g_conv1_w, adam_states[0].m, adam_states[0].v, lr_s, 0.9, 0.999, 1e-8, step, C1_OUT * C1_COL_ROWS);
+                        launch_adam(self.conv1_b, g_conv1_b, adam_states[1].m, adam_states[1].v, lr_s, 0.9, 0.999, 1e-8, step, C1_OUT);
+                        launch_adam(self.conv2_w, g_conv2_w, adam_states[2].m, adam_states[2].v, lr_s, 0.9, 0.999, 1e-8, step, C2_OUT * C2_COL_ROWS);
+                        launch_adam(self.conv2_b, g_conv2_b, adam_states[3].m, adam_states[3].v, lr_s, 0.9, 0.999, 1e-8, step, C2_OUT);
+                        launch_adam(self.fc1_w, g_fc1_w, adam_states[4].m, adam_states[4].v, lr_s, 0.9, 0.999, 1e-8, step, FLAT_SIZE * FC1_OUT);
+                        launch_adam(self.fc1_b, g_fc1_b, adam_states[5].m, adam_states[5].v, lr_s, 0.9, 0.999, 1e-8, step, FC1_OUT);
+                        launch_adam(self.fc2_w, g_fc2_w, adam_states[6].m, adam_states[6].v, lr_s, 0.9, 0.999, 1e-8, step, FC1_OUT * FC2_OUT);
+                        launch_adam(self.fc2_b, g_fc2_b, adam_states[7].m, adam_states[7].v, lr_s, 0.9, 0.999, 1e-8, step, FC2_OUT);
+                        launch_adam(self.out_w, g_out_w, adam_states[8].m, adam_states[8].v, lr_s, 0.9, 0.999, 1e-8, step, FC2_OUT * NUM_CLASSES);
+                        launch_adam(self.out_b, g_out_b, adam_states[9].m, adam_states[9].v, lr_s, 0.9, 0.999, 1e-8, step, NUM_CLASSES);
+                    }
+                } else {
+                    unsafe {
+                        launch_sgd(self.out_w, g_out_w, lr_s, FC2_OUT * NUM_CLASSES);
+                        launch_sgd(self.out_b, g_out_b, lr_s, NUM_CLASSES);
+                        launch_sgd(self.fc2_w, g_fc2_w, lr_s, FC1_OUT * FC2_OUT);
+                        launch_sgd(self.fc2_b, g_fc2_b, lr_s, FC2_OUT);
+                        launch_sgd(self.fc1_w, g_fc1_w, lr_s, FLAT_SIZE * FC1_OUT);
+                        launch_sgd(self.fc1_b, g_fc1_b, lr_s, FC1_OUT);
+                        launch_sgd(self.conv2_w, g_conv2_w, lr_s, C2_OUT * C2_COL_ROWS);
+                        launch_sgd(self.conv2_b, g_conv2_b, lr_s, C2_OUT);
+                        launch_sgd(self.conv1_w, g_conv1_w, lr_s, C1_OUT * C1_COL_ROWS);
+                        launch_sgd(self.conv1_b, g_conv1_b, lr_s, C1_OUT);
+                    }
                 }
             }
 
@@ -364,6 +424,7 @@ impl GpuCnn {
         }
 
         cuda_sync();
+        drop(adam_states);
         for p in [d_inputs, d_targets as *mut f32,
                    col1_b, conv1_b_buf, pool1_b, col2_b, conv2_b_buf, pool2_b,
                    flat, fc1_out, fc2_out, out,

@@ -170,6 +170,20 @@ __global__ void sgd_kernel(float *param, const float *grad, float lr, int n) {
         param[idx] -= lr * grad[idx];
 }
 
+__global__ void adam_kernel(float *param, const float *grad,
+                            float *m, float *v,
+                            float lr, float beta1, float beta2, float eps,
+                            float bc1, float bc2, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        m[idx] = beta1 * m[idx] + (1.0f - beta1) * grad[idx];
+        v[idx] = beta2 * v[idx] + (1.0f - beta2) * grad[idx] * grad[idx];
+        float m_hat = m[idx] / bc1;
+        float v_hat = v[idx] / bc2;
+        param[idx] -= lr * m_hat / (sqrtf(v_hat) + eps);
+    }
+}
+
 /* Reduce sum via shared memory + atomicAdd */
 __global__ void reduce_sum_kernel(const float *arr, float *result, int n) {
     extern __shared__ float sdata[];
@@ -246,6 +260,28 @@ void nn_col_sum(const float *mat, float *out, int rows, int cols) {
 
 void nn_sgd_update(float *param, const float *grad, float lr, int n) {
     sgd_kernel<<<BLOCKS(n), THREADS>>>(param, grad, lr, n);
+}
+
+void nn_adam_state_init(AdamState *state, int n) {
+    state->n = n;
+    CUDA_CHECK(cudaMallocManaged(&state->m, n * sizeof(float)));
+    CUDA_CHECK(cudaMallocManaged(&state->v, n * sizeof(float)));
+    cudaMemset(state->m, 0, n * sizeof(float));
+    cudaMemset(state->v, 0, n * sizeof(float));
+}
+
+void nn_adam_state_free(AdamState *state) {
+    cudaFree(state->m); cudaFree(state->v);
+    state->m = NULL; state->v = NULL;
+}
+
+void nn_adam_update(float *param, const float *grad, AdamState *state,
+                    float lr, float beta1, float beta2, float eps, int t) {
+    float bc1 = 1.0f - powf(beta1, (float)t);
+    float bc2 = 1.0f - powf(beta2, (float)t);
+    adam_kernel<<<BLOCKS(state->n), THREADS>>>(
+        param, grad, state->m, state->v,
+        lr, beta1, beta2, eps, bc1, bc2, state->n);
 }
 
 /* ------------------------------------------------------------------ */

@@ -488,6 +488,31 @@ extern "C" void launch_sgd(float *param, const float *grad, float lr, int n) {
     sgd_kernel<<<(n + threads - 1) / threads, threads>>>(param, grad, lr, n);
 }
 
+/* Adam optimizer update */
+__global__ void adam_kernel(float *param, const float *grad,
+                            float *m, float *v,
+                            float lr, float beta1, float beta2, float eps,
+                            float bc1, float bc2, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        m[idx] = beta1 * m[idx] + (1.0f - beta1) * grad[idx];
+        v[idx] = beta2 * v[idx] + (1.0f - beta2) * grad[idx] * grad[idx];
+        float m_hat = m[idx] / bc1;
+        float v_hat = v[idx] / bc2;
+        param[idx] -= lr * m_hat / (sqrtf(v_hat) + eps);
+    }
+}
+
+extern "C" void launch_adam(float *param, const float *grad,
+                             float *m, float *v,
+                             float lr, float beta1, float beta2, float eps,
+                             int t, int n) {
+    float bc1 = 1.0f - powf(beta1, (float)t);
+    float bc2 = 1.0f - powf(beta2, (float)t);
+    int blocks = (n + 255) / 256;
+    adam_kernel<<<blocks, 256>>>(param, grad, m, v, lr, beta1, beta2, eps, bc1, bc2, n);
+}
+
 __global__ void reduce_sum_kernel(const float *arr, float *result, int n) {
     extern __shared__ float sdata[];
     int tid = threadIdx.x;

@@ -70,6 +70,8 @@ extern "C" {
     fn launch_relu_mask(d_hidden: *mut f32, hidden: *const f32, total: i32);
     fn launch_col_sum(mat: *const f32, out_vec: *mut f32, rows: i32, cols: i32);
     fn launch_sgd(param: *mut f32, grad: *const f32, lr: f32, n: i32);
+    fn launch_adam(param: *mut f32, grad: *const f32, m: *mut f32, v: *mut f32,
+                   lr: f32, beta1: f32, beta2: f32, eps: f32, t: i32, n: i32);
     fn launch_reduce_sum(arr: *const f32, result: *mut f32, n: i32);
     fn launch_init_weights(weights: *mut f32, size: i32, scale: f32, seed: u64);
     fn launch_eval_metrics(
@@ -202,6 +204,32 @@ fn sgemm_nt(handle: CublasHandle, m: i32, n: i32, k: i32, a: *const f32, b: *con
 }
 
 // ---------------------------------------------------------------------------
+//  CUDA Adam optimizer state
+// ---------------------------------------------------------------------------
+
+struct CudaAdamState {
+    m: *mut f32,
+    v: *mut f32,
+}
+
+impl CudaAdamState {
+    fn new(n: i32) -> Self {
+        let m = cuda_malloc(n as usize * std::mem::size_of::<f32>());
+        let v = cuda_malloc(n as usize * std::mem::size_of::<f32>());
+        cuda_memset_zero(m, n as usize);
+        cuda_memset_zero(v, n as usize);
+        CudaAdamState { m, v }
+    }
+}
+
+impl Drop for CudaAdamState {
+    fn drop(&mut self) {
+        cuda_free(self.m);
+        cuda_free(self.v);
+    }
+}
+
+// ---------------------------------------------------------------------------
 //  MLP struct — GPU pointers
 // ---------------------------------------------------------------------------
 
@@ -293,12 +321,16 @@ impl GpuMlp {
         optimizer: &str,
         scheduler: &str,
     ) {
-        if optimizer == "adam" {
-            eprintln!("Warning: Adam optimizer not yet implemented, using SGD");
-        }
         let inp = self.input_size;
         let hid = self.hidden_size;
         let out = self.output_size;
+
+        let use_adam = optimizer == "adam";
+        let adam_w1 = if use_adam { Some(CudaAdamState::new(inp * hid)) } else { None };
+        let adam_w2 = if use_adam { Some(CudaAdamState::new(hid * out)) } else { None };
+        let adam_b1 = if use_adam { Some(CudaAdamState::new(hid)) } else { None };
+        let adam_b2 = if use_adam { Some(CudaAdamState::new(out)) } else { None };
+        let mut step: i32 = 0;
 
         // Copy training data to device
         let d_inputs = cuda_malloc(num_samples * inp as usize * std::mem::size_of::<f32>());
@@ -396,15 +428,28 @@ impl GpuMlp {
                     launch_col_sum(d_d_hidden, d_grad_b1, bs_i, hid);
                 }
 
-                // ---- SGD update ----
+                // ---- Parameter update ----
                 let lr_s = lr / bs as f32;
                 let n_iw = inp * hid;
                 let n_ow = hid * out;
-                unsafe {
-                    launch_sgd(self.input_weights, d_grad_w1, lr_s, n_iw);
-                    launch_sgd(self.output_weights, d_grad_w2, lr_s, n_ow);
-                    launch_sgd(self.hidden_biases, d_grad_b1, lr_s, hid);
-                    launch_sgd(self.output_biases, d_grad_b2, lr_s, out);
+                if let Some(ref a) = adam_w1 {
+                    step += 1;
+                    let aw2 = adam_w2.as_ref().unwrap();
+                    let ab1 = adam_b1.as_ref().unwrap();
+                    let ab2 = adam_b2.as_ref().unwrap();
+                    unsafe {
+                        launch_adam(self.input_weights, d_grad_w1, a.m, a.v, lr_s, 0.9, 0.999, 1e-8, step, n_iw);
+                        launch_adam(self.output_weights, d_grad_w2, aw2.m, aw2.v, lr_s, 0.9, 0.999, 1e-8, step, n_ow);
+                        launch_adam(self.hidden_biases, d_grad_b1, ab1.m, ab1.v, lr_s, 0.9, 0.999, 1e-8, step, hid);
+                        launch_adam(self.output_biases, d_grad_b2, ab2.m, ab2.v, lr_s, 0.9, 0.999, 1e-8, step, out);
+                    }
+                } else {
+                    unsafe {
+                        launch_sgd(self.input_weights, d_grad_w1, lr_s, n_iw);
+                        launch_sgd(self.output_weights, d_grad_w2, lr_s, n_ow);
+                        launch_sgd(self.hidden_biases, d_grad_b1, lr_s, hid);
+                        launch_sgd(self.output_biases, d_grad_b2, lr_s, out);
+                    }
                 }
             }
 
