@@ -2,7 +2,7 @@
 """NumPy MLP implementation — exact replica of the C algorithm.
 
 Single hidden layer, ReLU activation, softmax output, cross-entropy loss.
-Xavier uniform initialization, mini-batch SGD with gradient averaging.
+Xavier uniform initialization, mini-batch SGD or Adam with gradient averaging.
 
 Usage:
     python src/python/models/mlp/mlp_numpy.py --dataset iris
@@ -95,8 +95,8 @@ def cross_entropy_loss(output, targets, num_classes):
 
 def train(X_train, y_train, input_size, num_classes,
           hidden_size=64, batch_size=32, num_epochs=1000, learning_rate=0.01,
-          scheduler="none"):
-    """Train MLP with mini-batch SGD, matching C implementation exactly."""
+          scheduler="none", optimizer="sgd"):
+    """Train MLP with mini-batch SGD or Adam, matching C implementation exactly."""
     rng = np.random.default_rng()
 
     W1 = xavier_init(input_size, hidden_size, rng)
@@ -107,6 +107,15 @@ def train(X_train, y_train, input_size, num_classes,
     n = len(X_train)
     num_batches = (n + batch_size - 1) // batch_size
     warmup = max(1, int(num_epochs * 0.05)) if scheduler == "cosine" else 0
+
+    # Adam moment buffers
+    if optimizer == "adam":
+        beta1, beta2, eps_adam = 0.9, 0.999, 1e-8
+        m_W1, v_W1 = np.zeros_like(W1), np.zeros_like(W1)
+        m_b1, v_b1 = np.zeros_like(b1), np.zeros_like(b1)
+        m_W2, v_W2 = np.zeros_like(W2), np.zeros_like(W2)
+        m_b2, v_b2 = np.zeros_like(b2), np.zeros_like(b2)
+        adam_step = 0
 
     for epoch in range(num_epochs):
         lr = cosine_lr(epoch, num_epochs, learning_rate, warmup) if scheduler == "cosine" else learning_rate
@@ -142,12 +151,26 @@ def train(X_train, y_train, input_size, num_classes,
             grad_W1 = X_batch.T @ d_hidden     # (input, hidden)
             grad_b1 = d_hidden.sum(axis=0)     # (hidden,)
 
-            # SGD update with gradient averaging (lr / batch_size)
+            # Parameter update with gradient averaging (lr / batch_size)
             lr_scaled = lr / bs
-            W1 -= lr_scaled * grad_W1
-            b1 -= lr_scaled * grad_b1
-            W2 -= lr_scaled * grad_W2
-            b2 -= lr_scaled * grad_b2
+            if optimizer == "adam":
+                adam_step += 1
+                bc1 = 1.0 - beta1 ** adam_step
+                bc2 = 1.0 - beta2 ** adam_step
+                for param, grad, m_buf, v_buf in [
+                    (W1, grad_W1, m_W1, v_W1), (b1, grad_b1, m_b1, v_b1),
+                    (W2, grad_W2, m_W2, v_W2), (b2, grad_b2, m_b2, v_b2),
+                ]:
+                    m_buf[:] = beta1 * m_buf + (1 - beta1) * grad
+                    v_buf[:] = beta2 * v_buf + (1 - beta2) * grad ** 2
+                    m_hat = m_buf / bc1
+                    v_hat = v_buf / bc2
+                    param -= lr_scaled * m_hat / (np.sqrt(v_hat) + eps_adam)
+            else:
+                W1 -= lr_scaled * grad_W1
+                b1 -= lr_scaled * grad_b1
+                W2 -= lr_scaled * grad_W2
+                b2 -= lr_scaled * grad_b2
 
         if epoch % 100 == 0:
             print(f"  Epoch {epoch:4d}  loss: {epoch_loss / n:.4f}")
@@ -178,8 +201,6 @@ def main():
     parser.add_argument("--scheduler", default="none", choices=["none", "cosine"])
     args = parser.parse_args()
 
-    if args.optimizer == "adam":
-        print("Warning: Adam not yet implemented for NumPy, using SGD")
     num_epochs = args.epochs
     batch_size = args.batch_size
     hidden_size = args.hidden_size
@@ -198,7 +219,7 @@ def main():
     W1, b1, W2, b2 = train(X_train, y_train, input_size, num_classes,
                             hidden_size=hidden_size, batch_size=batch_size,
                             num_epochs=num_epochs, learning_rate=learning_rate,
-                            scheduler=args.scheduler)
+                            scheduler=args.scheduler, optimizer=args.optimizer)
     t_train = time.monotonic() - t_start
 
     t_eval_start = time.monotonic()
