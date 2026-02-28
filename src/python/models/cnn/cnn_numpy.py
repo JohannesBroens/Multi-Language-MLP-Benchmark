@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import math
 import time
 import sys
 import os
@@ -52,6 +53,14 @@ FC1_OUT = 120
 FC2_OUT = 84
 NUM_CLASSES = 10
 LEARNING_RATE = 0.32
+
+
+def cosine_lr(epoch, total, lr_max, warmup, lr_min=1e-6):
+    """Cosine annealing with linear warmup."""
+    if epoch < warmup:
+        return lr_max * (epoch + 1) / warmup
+    progress = (epoch - warmup) / (total - warmup)
+    return lr_min + 0.5 * (lr_max - lr_min) * (1 + math.cos(math.pi * progress))
 
 
 def im2col(input_data, C, H, W, kH, kW, stride, OH, OW):
@@ -325,11 +334,14 @@ class LeNet5:
         self.conv1_b -= lr_s * g_conv1_b
 
 
-def train(model, X_train, y_train, batch_size, num_epochs, learning_rate):
+def train(model, X_train, y_train, batch_size, num_epochs, learning_rate,
+          scheduler="none"):
     n = len(X_train)
     num_batches = (n + batch_size - 1) // batch_size
+    warmup = max(1, int(num_epochs * 0.05)) if scheduler == "cosine" else 0
 
     for epoch in range(num_epochs):
+        lr = cosine_lr(epoch, num_epochs, learning_rate, warmup) if scheduler == "cosine" else learning_rate
         epoch_loss = 0.0
 
         for batch_idx in range(num_batches):
@@ -347,7 +359,7 @@ def train(model, X_train, y_train, batch_size, num_epochs, learning_rate):
             batch_loss = -np.log(output[np.arange(bs), y_batch] + eps).sum()
             epoch_loss += batch_loss
 
-            model.backward_and_update(X_batch, y_batch, output, flats, fc1_out, fc2_out, caches, learning_rate)
+            model.backward_and_update(X_batch, y_batch, output, flats, fc1_out, fc2_out, caches, lr)
 
         print(f"  Epoch {epoch:4d}  loss: {epoch_loss / n:.4f}")
 
@@ -374,9 +386,6 @@ def main():
 
     if args.optimizer == "adam":
         print("Warning: Adam not yet implemented for NumPy, using SGD")
-    if args.scheduler == "cosine":
-        print("Warning: Cosine scheduler not yet implemented for NumPy, using constant LR")
-
     X, y, num_classes = load_dataset(args.dataset)
     X_train, y_train, X_test, y_test = shuffle_and_split(X, y)
 
@@ -390,7 +399,8 @@ def main():
     model = LeNet5(rng)
 
     t_start = time.monotonic()
-    train(model, X_train, y_train, args.batch_size, args.epochs, learning_rate)
+    train(model, X_train, y_train, args.batch_size, args.epochs, learning_rate,
+          scheduler=args.scheduler)
     t_train = time.monotonic() - t_start
 
     t_eval_start = time.monotonic()

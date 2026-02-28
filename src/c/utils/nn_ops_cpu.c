@@ -271,6 +271,23 @@ void nn_col_sum(const float *mat, float *out, int rows, int cols) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Learning rate scheduler                                            */
+/* ------------------------------------------------------------------ */
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+float nn_cosine_lr(int epoch, int total_epochs, float lr_max,
+                   int warmup_epochs, float lr_min) {
+    if (epoch < warmup_epochs) {
+        return lr_max * ((float)(epoch + 1) / (float)warmup_epochs);
+    }
+    float progress = (float)(epoch - warmup_epochs) / (float)(total_epochs - warmup_epochs);
+    return lr_min + 0.5f * (lr_max - lr_min) * (1.0f + cosf((float)M_PI * progress));
+}
+
+/* ------------------------------------------------------------------ */
 /*  SGD update                                                         */
 /* ------------------------------------------------------------------ */
 

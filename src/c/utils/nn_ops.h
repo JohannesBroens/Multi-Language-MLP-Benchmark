@@ -86,6 +86,14 @@ void nn_cross_entropy_grad(const float *probs, const int *targets,
 /* --- Column sum: out[j] = sum_i(mat[i*cols+j]) --- */
 void nn_col_sum(const float *mat, float *out, int rows, int cols);
 
+/* --- Learning rate scheduler --- */
+
+/* Cosine annealing with linear warmup.
+ * Returns lr_max * (epoch+1)/warmup during warmup phase,
+ * then cosine decay from lr_max to lr_min over remaining epochs. */
+float nn_cosine_lr(int epoch, int total_epochs, float lr_max,
+                   int warmup_epochs, float lr_min);
+
 /* --- SGD update: param[i] -= lr * grad[i] --- */
 void nn_sgd_update(float *param, const float *grad, float lr, int n);
 

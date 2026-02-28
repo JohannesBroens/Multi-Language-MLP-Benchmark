@@ -425,7 +425,7 @@ static void forward_batch(const CNN *cnn, const float *inputs, int bs,
 void cnn_train(CNN *cnn, float *inputs, int *targets, int num_samples,
                int batch_size, int num_epochs, float learning_rate,
                OptimizerType optimizer, SchedulerType scheduler) {
-    (void)optimizer; (void)scheduler; /* TODO: implement in later tasks */
+    (void)optimizer; /* TODO: implement Adam in later tasks */
 
     int input_size = IN_C * IN_H * IN_W;
 
@@ -472,8 +472,13 @@ void cnn_train(CNN *cnn, float *inputs, int *targets, int num_samples,
     float *losses = (float *)malloc(batch_size * sizeof(float));
 
     int num_batches = (num_samples + batch_size - 1) / batch_size;
+    int warmup_epochs = (scheduler == SCHED_COSINE) ? (int)(num_epochs * 0.05f) : 0;
+    if (warmup_epochs < 1 && scheduler == SCHED_COSINE) warmup_epochs = 1;
 
     for (int epoch = 0; epoch < num_epochs; epoch++) {
+        float lr = (scheduler == SCHED_COSINE)
+            ? nn_cosine_lr(epoch, num_epochs, learning_rate, warmup_epochs, 1e-6f)
+            : learning_rate;
         float epoch_loss = 0.0f;
 
         for (int batch = 0; batch < num_batches; batch++) {
@@ -563,7 +568,7 @@ void cnn_train(CNN *cnn, float *inputs, int *targets, int num_samples,
             conv_bias_grad(d_conv1_b, grad_conv1_b, C1_OUT, bs * C1_COL_COLS);
 
             /* ---- SGD update ---- */
-            float lr_s = learning_rate / (float)bs;
+            float lr_s = lr / (float)bs;
 
             nn_sgd_update(cnn->out_weights, grad_out_w, lr_s, FC2_OUT * NUM_CLASSES);
             nn_sgd_update(cnn->out_biases, grad_out_b, lr_s, NUM_CLASSES);

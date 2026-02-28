@@ -9,6 +9,7 @@ Usage:
 """
 
 import argparse
+import math
 import time
 import sys
 import os
@@ -45,6 +46,14 @@ import numpy as np
 # Allow imports from project root
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 from python.utils.data_utils import load_dataset, normalize_features, shuffle_and_split
+
+
+def cosine_lr(epoch, total, lr_max, warmup, lr_min=1e-6):
+    """Cosine annealing with linear warmup."""
+    if epoch < warmup:
+        return lr_max * (epoch + 1) / warmup
+    progress = (epoch - warmup) / (total - warmup)
+    return lr_min + 0.5 * (lr_max - lr_min) * (1 + math.cos(math.pi * progress))
 
 
 def xavier_init(fan_in, fan_out, rng):
@@ -85,7 +94,8 @@ def cross_entropy_loss(output, targets, num_classes):
 
 
 def train(X_train, y_train, input_size, num_classes,
-          hidden_size=64, batch_size=32, num_epochs=1000, learning_rate=0.01):
+          hidden_size=64, batch_size=32, num_epochs=1000, learning_rate=0.01,
+          scheduler="none"):
     """Train MLP with mini-batch SGD, matching C implementation exactly."""
     rng = np.random.default_rng()
 
@@ -96,8 +106,10 @@ def train(X_train, y_train, input_size, num_classes,
 
     n = len(X_train)
     num_batches = (n + batch_size - 1) // batch_size
+    warmup = max(1, int(num_epochs * 0.05)) if scheduler == "cosine" else 0
 
     for epoch in range(num_epochs):
+        lr = cosine_lr(epoch, num_epochs, learning_rate, warmup) if scheduler == "cosine" else learning_rate
         epoch_loss = 0.0
 
         for batch_idx in range(num_batches):
@@ -131,7 +143,7 @@ def train(X_train, y_train, input_size, num_classes,
             grad_b1 = d_hidden.sum(axis=0)     # (hidden,)
 
             # SGD update with gradient averaging (lr / batch_size)
-            lr_scaled = learning_rate / bs
+            lr_scaled = lr / bs
             W1 -= lr_scaled * grad_W1
             b1 -= lr_scaled * grad_b1
             W2 -= lr_scaled * grad_W2
@@ -168,9 +180,6 @@ def main():
 
     if args.optimizer == "adam":
         print("Warning: Adam not yet implemented for NumPy, using SGD")
-    if args.scheduler == "cosine":
-        print("Warning: Cosine scheduler not yet implemented for NumPy, using constant LR")
-
     num_epochs = args.epochs
     batch_size = args.batch_size
     hidden_size = args.hidden_size
@@ -188,7 +197,8 @@ def main():
     t_start = time.monotonic()
     W1, b1, W2, b2 = train(X_train, y_train, input_size, num_classes,
                             hidden_size=hidden_size, batch_size=batch_size,
-                            num_epochs=num_epochs, learning_rate=learning_rate)
+                            num_epochs=num_epochs, learning_rate=learning_rate,
+                            scheduler=args.scheduler)
     t_train = time.monotonic() - t_start
 
     t_eval_start = time.monotonic()
