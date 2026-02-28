@@ -1,0 +1,7 @@
+# Copy to configs/local.yaml and customize
+# local.yaml is gitignored — your machine-specific overrides
+build:
+  c_cuda: false
+  rust_cublas: false
+  rust_kernels: false
+  python_pytorch_cuda: false

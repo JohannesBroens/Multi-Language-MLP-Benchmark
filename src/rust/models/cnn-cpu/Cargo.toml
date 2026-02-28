@@ -8,4 +8,4 @@ name = "cnn-cpu"
 path = "src/main.rs"
 
 [dependencies]
-nn-common = { path = "../nn-common" }
+nn-common = { path = "../../utils/nn-common" }

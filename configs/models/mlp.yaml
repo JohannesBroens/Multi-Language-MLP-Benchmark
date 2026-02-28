@@ -1,0 +1,2 @@
+# MLP model config — MLP IS the base config, so this is intentionally minimal.
+# Override here only if MLP needs to diverge from base.yaml defaults.

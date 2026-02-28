@@ -37,7 +37,7 @@ if "OPENBLAS_NUM_THREADS" not in os.environ:
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-from python.models.mlp.data_utils import load_dataset, shuffle_and_split
+from python.utils.data_utils import load_dataset, shuffle_and_split
 
 # LeNet-5 architecture constants
 IN_C, IN_H, IN_W = 1, 28, 28

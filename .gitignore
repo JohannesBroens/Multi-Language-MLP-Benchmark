@@ -36,10 +36,9 @@ logs/
 losses.txt
 test_loss.txt
 
-# Ignore non-PNG benchmark figures
-figs/*.jpg
-figs/*.svg
-figs/*.pdf
+# Results directories
+results/cache/
+results/logs/
 
 # Ignore Python bytecode and cache directories
 __pycache__/
@@ -82,3 +81,6 @@ docs/plans/
 *.csv
 *.json
 CLAUDE.md
+
+# Local config overrides
+configs/local.yaml

@@ -44,7 +44,7 @@ import numpy as np
 
 # Allow imports from project root
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-from python.models.mlp.data_utils import load_dataset, normalize_features, shuffle_and_split
+from python.utils.data_utils import load_dataset, normalize_features, shuffle_and_split
 
 
 def xavier_init(fan_in, fan_out, rng):

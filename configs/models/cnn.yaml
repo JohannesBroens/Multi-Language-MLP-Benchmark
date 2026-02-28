@@ -1,0 +1,12 @@
+# CNN model config — overrides base.yaml defaults for LeNet-5 on MNIST
+
+training:
+  epochs: 200
+  learning_rate: 0.32
+  batch_size: 4096
+
+benchmark:
+  datasets: [mnist]
+
+scaling:
+  batch_sizes: [16, 32, 64, 128, 256, 512, 1024]

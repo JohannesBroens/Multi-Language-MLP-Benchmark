@@ -20,19 +20,19 @@ set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -march=native -ffast-math")
 set(CMAKE_CUDA_FLAGS_RELEASE "${CMAKE_CUDA_FLAGS_RELEASE} --use_fast_math")
 
 # Add subdirectories
-add_subdirectory(nn_ops)
+add_subdirectory(utils)
 add_subdirectory(models/mlp)
 add_subdirectory(models/cnn)
 
 # MLP executable
-add_executable(main main.c data_loader.c)
+add_executable(main main.c $<TARGET_OBJECTS:data_loader>)
 target_link_libraries(main PRIVATE mlp nn_ops m)
-target_include_directories(main PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(main PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/utils)
 
 # CNN executable
-add_executable(cnn_main cnn_main.c data_loader.c)
+add_executable(cnn_main cnn_main.c $<TARGET_OBJECTS:data_loader>)
 target_link_libraries(cnn_main PRIVATE cnn nn_ops m)
-target_include_directories(cnn_main PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(cnn_main PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/utils)
 
 if(USE_CUDA)
     message(STATUS "Building with CUDA support")

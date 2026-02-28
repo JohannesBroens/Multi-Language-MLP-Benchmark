@@ -1,11 +1,11 @@
 [workspace]
 members = [
-    "nn-common",
-    "mlp-cpu",
-    "mlp-cuda-cublas",
-    "mlp-cuda-kernels",
-    "cnn-cpu",
-    "cnn-cuda-cublas",
-    "cnn-cuda-kernels",
+    "utils/nn-common",
+    "models/mlp-cpu",
+    "models/mlp-cuda-cublas",
+    "models/mlp-cuda-kernels",
+    "models/cnn-cpu",
+    "models/cnn-cuda-cublas",
+    "models/cnn-cuda-kernels",
 ]
 resolver = "2"

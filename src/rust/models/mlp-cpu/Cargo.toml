@@ -8,6 +8,6 @@ name = "mlp-cpu"
 path = "src/main.rs"
 
 [dependencies]
-nn-common = { path = "../nn-common" }
+nn-common = { path = "../../utils/nn-common" }
 rayon = "1.10"
 num_cpus = "1.16"

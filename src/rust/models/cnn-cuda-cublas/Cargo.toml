@@ -1,15 +1,15 @@
 [package]
-name = "mlp-cuda-kernels"
+name = "cnn-cuda-cublas"
 version = "0.1.0"
 edition = "2021"
 build = "build.rs"
 
 [[bin]]
-name = "mlp-cuda-kernels"
+name = "cnn-cuda-cublas"
 path = "src/main.rs"
 
 [dependencies]
-nn-common = { path = "../nn-common" }
+nn-common = { path = "../../utils/nn-common" }
 
 [build-dependencies]
 cc = { version = "1.0", features = ["parallel"] }

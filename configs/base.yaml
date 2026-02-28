@@ -1,0 +1,45 @@
+# Base configuration — MLP defaults (all models inherit from this)
+
+pipeline:
+  phases: [tune, benchmark]
+  force_retune: false
+
+build:
+  c_cpu: true
+  c_cuda: true
+  rust_cpu: true
+  rust_cublas: true
+  rust_kernels: true
+  python_numpy: true
+  python_pytorch_cpu: true
+  python_pytorch_cuda: true
+
+training:
+  epochs: 1000
+  learning_rate: 0.02
+  batch_size: 8192
+  hidden_size: 64
+
+tuning:
+  enabled: true
+  metric: accuracy
+  batch_sizes: [256, 512, 1024, 2048, 4096, 8192]
+  learning_rates: [0.001, 0.005, 0.01, 0.02, 0.05, 0.1]
+
+benchmark:
+  mode: standard
+  datasets: [generated, iris, breast-cancer]
+  runs: 3
+
+scaling:
+  epochs: 200
+  fixed_batch_size: 4096
+  fixed_num_samples: 262144
+  dataset_sizes: [8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152, 4194304]
+  batch_sizes: [256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+  hidden_sizes: [64, 128, 256, 512, 1024, 2048, 4096]
+
+plotting:
+  dpi: 150
+  title_prefix: true
+  output_dir: results/plots

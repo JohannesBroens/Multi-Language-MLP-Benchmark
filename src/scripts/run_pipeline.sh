@@ -5,7 +5,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Determine the project root directory
 PROJECT_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
 
-echo "Starting the pipeline..."
+echo "NOTE: For full pipeline with config support, use: python src/scripts/pipeline.py all --model mlp"
+echo ""
+echo "Starting the legacy pipeline..."
 
 # Step 1: Download datasets
 echo "Checking for datasets..."

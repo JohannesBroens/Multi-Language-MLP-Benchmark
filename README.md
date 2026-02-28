@@ -138,7 +138,7 @@ python3 src/scripts/benchmark.py --mode standard --datasets generated,iris,breas
 python3 src/scripts/benchmark.py --mode scaling --runs 1
 
 # MLP: budget mode — accumulate benchmark samples with variance-weighted scheduling
-# Runs can be repeated; results accumulate in figs/benchmark_cache.json
+# Runs can be repeated; results accumulate in results/cache/benchmark_cache.json
 python3 src/scripts/benchmark.py --mode scaling --budget 60   # 60 minutes
 
 # Replot from cached data without running any benchmarks
@@ -174,13 +174,13 @@ Throughput curves are fitted using Gaussian Process regression in log-log space,
 
 Fixed parameters: batch\_size = 4096, hidden\_size = 512, epochs = 200.
 
-![Throughput vs Dataset Size](figs/scaling_dataset_size.png)
+![Throughput vs Dataset Size](results/plots/mlp/scaling_dataset_size.png)
 
 The dataset-size sweep shows that throughput is largely independent of dataset size for both CPU and GPU implementations. Both tiers maintain roughly constant throughput across two orders of magnitude (8K to 4M samples). The GPU implementations --- C CUDA, Rust cuBLAS, PyTorch CUDA, and Rust CUDA Kernels --- sustain approximately 5--10M samples/s throughout, with C CUDA and Rust cuBLAS at the top (~10M) and PyTorch CUDA consistently lower (~7M), the gap attributable to Python dispatch overhead and autograd bookkeeping. The CPU implementations cluster between 700K and 1.3M samples/s, also largely flat across the sweep.
 
 This flat scaling is expected: with a fixed batch size of 4096, each mini-batch GEMM has the same dimensions regardless of how many total samples exist. More data simply means more mini-batches per epoch, and throughput (samples per second) stays constant because the per-batch cost is unchanged.
 
-![GPU Speedup vs Dataset Size](figs/gpu_speedup_dataset_size.png)
+![GPU Speedup vs Dataset Size](results/plots/mlp/gpu_speedup_dataset_size.png)
 
 The GPU speedup plot shows a roughly constant ratio across dataset sizes --- typically 5--15x depending on the pair --- confirming that the GPU advantage comes from faster per-batch computation, not from better scaling behavior. The confidence bands are wider at the extremes of the range where fewer data points constrain the GP fit. The Rust cuBLAS / C CUDA ratio (orange line) hovers near 1.0x throughout, confirming that the Rust FFI bindings to cuBLAS introduce negligible overhead compared to calling CUDA APIs directly from C.
 
@@ -190,7 +190,7 @@ The GPU speedup plot shows a roughly constant ratio across dataset sizes --- typ
 
 Fixed parameters: num\_samples = 262,144, hidden\_size = 512, epochs = 200.
 
-![Throughput vs Batch Size](figs/scaling_batch_size.png)
+![Throughput vs Batch Size](results/plots/mlp/scaling_batch_size.png)
 
 Batch size is the primary lever for GPU utilization because it determines how many threads can execute in parallel during a single GEMM call. The RTX 3070 has 46 streaming multiprocessors, each capable of scheduling up to 2048 threads, for a total of approximately 94K concurrent threads at full occupancy. A batch size of 256 produces GEMM dimensions of (256 x 512) and (512 x 512) --- enough work to partially fill the GPU, but not enough to fully hide memory latency through thread-level parallelism.
 
@@ -198,7 +198,7 @@ The GPU throughput curves rise steeply from batch size 256 through 4096, with ea
 
 The CPU implementations exhibit a different pattern. Throughput initially increases with batch size --- larger batches improve data locality in the tiled GEMM, reduce per-batch loop overhead, and allow OpenMP/Rayon thread pools to amortize scheduling costs. However, beyond batch sizes of 1024--2048, CPU throughput peaks and then declines. This is likely caused by increased memory pressure: large batch matrices exceed L3 cache capacity, forcing the tiled GEMM to spill to main memory on every tile access. Rust (CPU) suffers the steepest decline of any CPU implementation at large batch sizes, suggesting the Rust CPU tiling strategy handles large matrices less efficiently than C's OpenMP-parallelized equivalent.
 
-![GPU Speedup vs Batch Size](figs/gpu_speedup_batch_size.png)
+![GPU Speedup vs Batch Size](results/plots/mlp/gpu_speedup_batch_size.png)
 
 The batch-size speedup plot illustrates a textbook GPU scaling curve. At batch size 256, GPU speedup over the corresponding CPU implementation ranges from 5--10x. By the largest batch sizes, the ratios reach 20--35x across most pairs. This monotonic increase demonstrates that GPUs are fundamentally throughput machines: they need large amounts of data-parallel work to justify the fixed costs of kernel launches and memory transfers. The Rust cuBLAS / C CUDA ratio remains flat near 1.0x, once again confirming zero FFI overhead in the hot path.
 
@@ -208,7 +208,7 @@ The batch-size speedup plot illustrates a textbook GPU scaling curve. At batch s
 
 Fixed parameters: num\_samples = 262,144, batch\_size = 4096, epochs = 200.
 
-![Throughput vs Hidden Size](figs/scaling_hidden_size.png)
+![Throughput vs Hidden Size](results/plots/mlp/scaling_hidden_size.png)
 
 The hidden-size sweep is the most revealing experiment because it directly controls the arithmetic intensity of the workload. The dominant GEMM operations have dimensions (batch x hidden) and (hidden x hidden), so FLOPs per sample scale as O(hidden^2). This makes hidden-size scaling the clearest test of compute-bound versus memory-bound behavior.
 
@@ -218,7 +218,7 @@ As hidden size increases to 256 and beyond, the GPU implementations pull away dr
 
 The CPU implementations suffer severely at large hidden sizes. Large weight matrices far exceed CPU cache capacity, and the O(hidden^2) compute ensures that even OpenMP parallelism cannot compensate. All four CPU implementations converge toward similar throughput at the largest hidden sizes, with Rust (CPU) consistently the slowest --- the same GEMM efficiency gap observed in the batch-size experiment.
 
-![GPU Speedup vs Hidden Size](figs/gpu_speedup_hidden_size.png)
+![GPU Speedup vs Hidden Size](results/plots/mlp/gpu_speedup_hidden_size.png)
 
 The hidden-size speedup plot shows the most dramatic GPU advantage of any experiment. At small hidden sizes, speedups are modest (2--4x), reflecting the kernel launch overhead on small matrices. As hidden size grows, the speedup curves rise super-linearly because the GPU's throughput degrades more slowly than the CPU's --- the GPU has enough on-chip SRAM (shared memory plus register file) to tile large matrix multiplies efficiently, while the CPU's cache hierarchy is overwhelmed. The Rust Kernels / Rust CPU curve demonstrates that the GPU advantage is architecture-dependent, not language-dependent: the same Rust codebase shows an order-of-magnitude speedup simply by switching the GEMM backend from CPU tiling to GPU execution.
 
@@ -226,7 +226,7 @@ The hidden-size speedup plot shows the most dramatic GPU advantage of any experi
 
 ### Overview
 
-![Scaling Overview](figs/scaling_overview.png)
+![Scaling Overview](results/plots/mlp/scaling_overview.png)
 
 ---
 
@@ -250,7 +250,7 @@ The CNN benchmark uses the same GP regression methodology as MLP, sweeping batch
 
 Fixed parameters: MNIST (60K samples), LeNet-5 architecture, epochs = 20.
 
-![CNN Throughput vs Batch Size](figs/cnn_scaling_batch_size.png)
+![CNN Throughput vs Batch Size](results/plots/cnn/scaling_batch_size.png)
 
 The CNN batch-size sweep tells a different story than MLP because the computational profile is fundamentally different. Where MLP throughput is dominated by large GEMM operations on the fully connected layers, CNN throughput is bottlenecked by the im2col transform and the relatively small GEMMs it produces. Conv1 produces a (6×25) × (25×576) multiply and Conv2 a (16×150) × (150×64) multiply --- both far smaller than the MLP's (batch×hidden) × (hidden×hidden) GEMMs. This means the CNN is more sensitive to per-sample overhead (im2col is per-sample) and less able to saturate GPU compute at any batch size.
 
@@ -258,19 +258,23 @@ PyTorch CUDA dominates the CNN benchmark because PyTorch's cuDNN backend uses sp
 
 The CPU implementations show a tighter spread than in MLP benchmarks. The im2col workspace (29K floats ≈ 116 KB per sample) fits comfortably in L2 cache for small batches, so the CPU implementations avoid the cache-thrashing that plagues large-batch MLP. C (CPU) benefits from OpenMP parallelism across the per-sample convolution loop and achieves higher throughput than Rust (CPU), whose Rayon threadpool incurs more scheduling overhead on the fine-grained per-sample work.
 
-![CNN GPU Speedup vs Batch Size](figs/cnn_gpu_speedup_batch_size.png)
+![CNN GPU Speedup vs Batch Size](results/plots/cnn/gpu_speedup_batch_size.png)
 
 The GPU speedup plot reveals that cuDNN's advantage over im2col is architectural, not just a constant factor. PyTorch CUDA / CPU speedup grows with batch size (reaching ~8x at large batches), while C CUDA / C CPU stays nearly flat around 1.5x. The im2col implementations move the same amount of memory regardless of backend --- the GPU gains little because the bottleneck is the column matrix materialization, not the GEMM itself. Meanwhile, Rust cuBLAS / C CUDA hovers at 1.0x, confirming that Rust's FFI bindings add zero overhead to the hot path.
 
-![CNN Scaling Overview](figs/cnn_scaling_overview.png)
+![CNN Scaling Overview](results/plots/cnn/scaling_overview.png)
 
 ## Project Structure
 
 ```
 ML-in-C/
 ├── data/                          # Datasets (downloaded via scripts)
-├── figs/                          # Generated benchmark charts
-├── logs/                          # Benchmark logs (gitignored)
+├── configs/                       # Layered YAML config (base + model overrides)
+├── results/
+│   ├── plots/mlp/                 # MLP benchmark charts
+│   ├── plots/cnn/                 # CNN benchmark charts
+│   ├── cache/                     # Benchmark cache (gitignored)
+│   └── logs/                      # Benchmark logs (gitignored)
 ├── src/
 │   ├── c/
 │   │   ├── CMakeLists.txt         # Top-level CMake config

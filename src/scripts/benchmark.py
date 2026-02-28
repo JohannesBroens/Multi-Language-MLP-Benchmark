@@ -26,6 +26,8 @@ import time
 import warnings
 from collections import defaultdict
 
+from config import load_config
+
 # Suppress sklearn GP convergence warnings (noisy with few data points)
 try:
     from sklearn.exceptions import ConvergenceWarning
@@ -35,14 +37,18 @@ except ImportError:
 
 import numpy as np
 
+from plotting import (
+    HAS_MATPLOTLIB, IMPL_STYLES, CNN_IMPL_STYLES, SPEEDUP_PAIRS, CNN_SPEEDUP_PAIRS,
+    _setup_style, _plot_throughput, _format_x_samples, _speedup_with_ci,
+    _reconstruct_throughput, _discover_x_values,
+    generate_charts, plot_scaling_results, plot_speedup_results, plot_overview,
+    print_peak_summary,
+)
+
 try:
-    import matplotlib
-    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    import matplotlib.ticker as ticker
-    HAS_MATPLOTLIB = True
 except ImportError:
-    HAS_MATPLOTLIB = False
+    pass
 
 
 # Project root (two levels up from src/scripts/)
@@ -97,51 +103,15 @@ PATTERN_TRAIN = re.compile(r"Train time:\s+([\d.]+)\s*s")
 PATTERN_EVAL = re.compile(r"Eval time:\s+([\d.]+)\s*s")
 PATTERN_THROUGHPUT = re.compile(r"Throughput:\s+([\d.]+)\s*samples/s")
 
-# Plot styling
-IMPL_STYLES = {
-    "C (CUDA)":       {"color": "#2ecc71", "marker": "D", "linewidth": 3.0, "markersize": 10, "zorder": 10},
-    "C (CPU)":        {"color": "#3498db", "marker": "o", "linewidth": 2.2, "markersize": 8,  "zorder": 5},
-    "NumPy":          {"color": "#e67e22", "marker": "s", "linewidth": 2.0, "markersize": 7,  "zorder": 4},
-    "PyTorch (CUDA)": {"color": "#9b59b6", "marker": "^", "linewidth": 2.2, "markersize": 8,  "zorder": 6},
-    "PyTorch (CPU)":  {"color": "#e74c3c", "marker": "v", "linewidth": 1.8, "markersize": 7,  "zorder": 3},
-    "Rust (CPU)":          {"color": "#f39c12", "marker": "P", "linewidth": 2.2, "markersize": 8,  "zorder": 5},
-    "Rust (cuBLAS)":       {"color": "#1abc9c", "marker": "H", "linewidth": 2.8, "markersize": 9,  "zorder": 9},
-    "Rust (CUDA Kernels)": {"color": "#e91e63", "marker": "X", "linewidth": 2.8, "markersize": 9,  "zorder": 8},
-}
 
-SPEEDUP_PAIRS = [
-    ("C (CUDA)", "C (CPU)", "#2ecc71", "C CUDA / C CPU"),
-    ("Rust (cuBLAS)", "Rust (CPU)", "#1abc9c", "Rust cuBLAS / Rust CPU"),
-    ("Rust (CUDA Kernels)", "Rust (CPU)", "#e91e63", "Rust Kernels / Rust CPU"),
-    ("PyTorch (CUDA)", "PyTorch (CPU)", "#9b59b6", "PyTorch CUDA / CPU"),
-    ("Rust (cuBLAS)", "C (CUDA)", "#f39c12", "Rust cuBLAS / C CUDA"),
-]
-
-# CNN plot styles — same colors, prefixed labels
-CNN_IMPL_STYLES = {
-    "CNN C (CUDA)":            {"color": "#2ecc71", "marker": "D", "linewidth": 3.0, "markersize": 10, "zorder": 10},
-    "CNN C (CPU)":             {"color": "#3498db", "marker": "o", "linewidth": 2.2, "markersize": 8,  "zorder": 5},
-"CNN PyTorch (CUDA)":      {"color": "#9b59b6", "marker": "^", "linewidth": 2.2, "markersize": 8,  "zorder": 6},
-    "CNN PyTorch (CPU)":       {"color": "#e74c3c", "marker": "v", "linewidth": 1.8, "markersize": 7,  "zorder": 3},
-    "CNN Rust (CPU)":          {"color": "#f39c12", "marker": "P", "linewidth": 2.2, "markersize": 8,  "zorder": 5},
-    "CNN Rust (cuBLAS)":       {"color": "#1abc9c", "marker": "H", "linewidth": 2.8, "markersize": 9,  "zorder": 9},
-    "CNN Rust (CUDA Kernels)": {"color": "#e91e63", "marker": "X", "linewidth": 2.8, "markersize": 9,  "zorder": 8},
-}
-
-CNN_SPEEDUP_PAIRS = [
-    ("CNN C (CUDA)", "CNN C (CPU)", "#2ecc71", "C CUDA / C CPU"),
-    ("CNN Rust (cuBLAS)", "CNN Rust (CPU)", "#1abc9c", "Rust cuBLAS / Rust CPU"),
-    ("CNN Rust (CUDA Kernels)", "CNN Rust (CPU)", "#e91e63", "Rust Kernels / Rust CPU"),
-    ("CNN PyTorch (CUDA)", "CNN PyTorch (CPU)", "#9b59b6", "PyTorch CUDA / CPU"),
-    ("CNN Rust (cuBLAS)", "CNN C (CUDA)", "#f39c12", "Rust cuBLAS / C CUDA"),
-]
+# Style constants imported from plotting module
 
 
 # ---------------------------------------------------------------------------
 #  Benchmark result cache — avoids re-running expensive experiments
 # ---------------------------------------------------------------------------
 
-CACHE_FILE = os.path.join(PROJECT_ROOT, "figs", "benchmark_cache.json")
+CACHE_FILE = os.path.join(PROJECT_ROOT, "results", "cache", "benchmark_cache.json")
 
 
 def _migrate_cache_entry(value):
@@ -235,11 +205,13 @@ def run_implementation(label, cmd_template, dataset, batch_size=32,
 
     env = os.environ.copy()
     if label in ("C (CPU)", "CNN C (CPU)"):
-        lib_dir = os.path.join(PROJECT_ROOT, "src", "c", "build_cpu")
-        env["LD_LIBRARY_PATH"] = lib_dir + ":" + env.get("LD_LIBRARY_PATH", "")
+        build_dir = os.path.join(PROJECT_ROOT, "src", "c", "build_cpu")
+        lib_dirs = [build_dir, os.path.join(build_dir, "utils"), os.path.join(build_dir, "models", "mlp"), os.path.join(build_dir, "models", "cnn")]
+        env["LD_LIBRARY_PATH"] = ":".join(lib_dirs) + ":" + env.get("LD_LIBRARY_PATH", "")
     elif label in ("C (CUDA)", "CNN C (CUDA)"):
-        lib_dir = os.path.join(PROJECT_ROOT, "src", "c", "build_cuda")
-        env["LD_LIBRARY_PATH"] = lib_dir + ":" + env.get("LD_LIBRARY_PATH", "")
+        build_dir = os.path.join(PROJECT_ROOT, "src", "c", "build_cuda")
+        lib_dirs = [build_dir, os.path.join(build_dir, "utils"), os.path.join(build_dir, "models", "mlp"), os.path.join(build_dir, "models", "cnn")]
+        env["LD_LIBRARY_PATH"] = ":".join(lib_dirs) + ":" + env.get("LD_LIBRARY_PATH", "")
 
     try:
         result = subprocess.run(
@@ -278,301 +250,9 @@ def run_implementation(label, cmd_template, dataset, batch_size=32,
     return parsed
 
 
-# ---------------------------------------------------------------------------
-#  Plot helpers
-# ---------------------------------------------------------------------------
 
-def _setup_style():
-    """Dark-ish professional style."""
-    plt.rcParams.update({
-        "figure.facecolor": "#1a1a2e",
-        "axes.facecolor": "#16213e",
-        "axes.edgecolor": "#e0e0e0",
-        "axes.labelcolor": "#e0e0e0",
-        "axes.titlesize": 14,
-        "axes.labelsize": 12,
-        "text.color": "#e0e0e0",
-        "xtick.color": "#c0c0c0",
-        "ytick.color": "#c0c0c0",
-        "grid.color": "#334466",
-        "grid.alpha": 0.5,
-        "legend.facecolor": "#1a1a2e",
-        "legend.edgecolor": "#555555",
-        "legend.fontsize": 10,
-        "font.family": "sans-serif",
-        "figure.dpi": 150,
-    })
-
-
-def _ranked_legend(ax, throughput_data, labels):
-    """Create legend ordered by peak throughput (best first)."""
-    handles, leg_labels = ax.get_legend_handles_labels()
-    # Build label->peak map
-    peak = {}
-    for label in labels:
-        vals = [v for v in throughput_data.get(label, []) if v is not None]
-        peak[label] = max(vals) if vals else 0
-
-    # Sort handles by peak throughput descending
-    paired = sorted(zip(handles, leg_labels), key=lambda x: peak.get(x[1], 0), reverse=True)
-    if paired:
-        handles, leg_labels = zip(*paired)
-        ax.legend(handles, leg_labels, loc="best")
-
-
-def _format_y_throughput(ax):
-    """Format y-axis as readable throughput (K/s, M/s)."""
-    def fmt(x, _):
-        if x >= 1e6:
-            return f"{x/1e6:.0f}M"
-        if x >= 1e3:
-            return f"{x/1e3:.0f}K"
-        return f"{x:.0f}"
-    ax.yaxis.set_major_formatter(ticker.FuncFormatter(fmt))
-
-
-def _format_x_samples(ax):
-    """Format x-axis sample counts as readable (K, M)."""
-    def fmt(x, _):
-        if x >= 1e6:
-            return f"{x/1e6:.0f}M"
-        if x >= 1e3:
-            return f"{x/1e3:.0f}K"
-        return f"{x:.0f}"
-    ax.xaxis.set_major_formatter(ticker.FuncFormatter(fmt))
-
-
-def _fit_gp(cache, cache_key, label, x_values=None):
-    """Fit a Gaussian Process in log-log space for a single implementation.
-
-    Returns (x_dense, y_mean, y_lower, y_upper, x_obs, y_obs_mean) or None
-    if fewer than 2 data points are available.
-
-    Works in log2 for x, log10 for y.
-    """
-    try:
-        from sklearn.gaussian_process import GaussianProcessRegressor
-        from sklearn.gaussian_process.kernels import ConstantKernel, RBF, WhiteKernel
-    except ImportError:
-        return None
-
-    if cache is None or cache_key is None:
-        return None
-
-    exp_data = cache.get(cache_key, {}).get(label, {})
-    if not exp_data:
-        return None
-
-    # Collect all raw samples per x value
-    x_obs_list = []
-    y_obs_means = []
-    x_all = []
-    y_all = []
-    for val_str, entry in sorted(exp_data.items(), key=lambda kv: float(kv[0])):
-        samples = entry.get("samples", [])
-        if not samples:
-            continue
-        x_val = float(val_str)
-        mean_val = float(np.mean(samples))
-        if mean_val <= 0 or x_val <= 0:
-            continue
-        x_obs_list.append(x_val)
-        y_obs_means.append(mean_val)
-        for s in samples:
-            if s > 0:
-                x_all.append(np.log2(x_val))
-                y_all.append(np.log10(s))
-
-    # Need at least 3 distinct x-values for a meaningful GP fit.
-    # With only 2 points, the GP produces flat lines with huge bands —
-    # a direct line plot is more honest.
-    if len(x_obs_list) < 3:
-        return None
-
-    X_train = np.array(x_all).reshape(-1, 1)
-    y_train = np.array(y_all)
-
-    kernel = ConstantKernel(1.0) * RBF(length_scale=1.0) + WhiteKernel(noise_level=0.1)
-    gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=3, alpha=1e-6)
-    try:
-        gp.fit(X_train, y_train)
-    except Exception:
-        return None
-
-    # Dense prediction grid
-    x_log_min = np.log2(min(x_obs_list))
-    x_log_max = np.log2(max(x_obs_list))
-    X_dense_log = np.linspace(x_log_min, x_log_max, 200).reshape(-1, 1)
-    y_pred, y_std = gp.predict(X_dense_log, return_std=True)
-
-    x_dense = 2 ** X_dense_log.ravel()
-    y_mean = 10 ** y_pred
-    y_lower = 10 ** (y_pred - 1.96 * y_std)
-    y_upper = 10 ** (y_pred + 1.96 * y_std)
-
-    return (x_dense, y_mean, y_lower, y_upper,
-            np.array(x_obs_list), np.array(y_obs_means))
-
-
-def _plot_throughput(ax, xs, throughput_data, available_labels, title, xlabel,
-                     cache=None, cache_key=None):
-    """Plot throughput lines with implementation-specific styling.
-
-    When cache/cache_key are provided, attempts GP regression for smooth curves
-    with confidence bands. Falls back to direct line plot if GP fails.
-    """
-    for label in available_labels:
-        vals = throughput_data.get(label, [])
-        xf = [xs[i] for i, v in enumerate(vals) if v is not None]
-        yf = [v for v in vals if v is not None]
-        if not yf:
-            continue
-
-        s = IMPL_STYLES.get(label, {"color": "gray", "marker": ".", "linewidth": 1.5, "markersize": 6, "zorder": 1})
-
-        gp_result = _fit_gp(cache, cache_key, label) if cache is not None else None
-
-        if gp_result is not None:
-            x_dense, y_mean, y_lower, y_upper, x_obs, y_obs_mean = gp_result
-            # Smooth GP curve
-            ax.plot(x_dense, y_mean, color=s["color"],
-                    linewidth=s["linewidth"], zorder=s["zorder"], label=label)
-            # Confidence band
-            ax.fill_between(x_dense, y_lower, y_upper,
-                            color=s["color"], alpha=0.18, zorder=s["zorder"] - 1)
-            # Scatter for observed means
-            ax.scatter(x_obs, y_obs_mean, marker=s["marker"], color=s["color"],
-                       s=s["markersize"] ** 2, edgecolors="white", linewidths=0.8,
-                       zorder=s["zorder"] + 1)
-        else:
-            # Fallback: direct line plot
-            ax.plot(xf, yf, marker=s["marker"], color=s["color"],
-                    linewidth=s["linewidth"], markersize=s["markersize"],
-                    zorder=s["zorder"], label=label)
-
-    ax.set_xscale("log", base=2)
-    ax.set_yscale("log")
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel("Throughput (samples/s)")
-    ax.set_title(title, fontsize=14, fontweight="bold")
-    ax.grid(True, which="both", alpha=0.3)
-    _format_y_throughput(ax)
-    _ranked_legend(ax, throughput_data, available_labels)
-
-
-def _speedup_with_ci(cache, cache_key, gpu_label, cpu_label):
-    """Compute speedup with confidence interval using separate GP fits.
-
-    Returns (x_points, speedup_mean, speedup_lower, speedup_upper) or None.
-    Speedup = 10^(gpu_log_mean - cpu_log_mean).
-    CI via diff_std = sqrt(gpu_std^2 + cpu_std^2).
-    """
-    try:
-        from sklearn.gaussian_process import GaussianProcessRegressor
-        from sklearn.gaussian_process.kernels import ConstantKernel, RBF, WhiteKernel
-    except ImportError:
-        return None
-
-    if cache is None or cache_key is None:
-        return None
-
-    gpu_data = cache.get(cache_key, {}).get(gpu_label, {})
-    cpu_data = cache.get(cache_key, {}).get(cpu_label, {})
-    if not gpu_data or not cpu_data:
-        return None
-
-    def _build_training_data(impl_data):
-        x_all, y_all = [], []
-        for val_str, entry in impl_data.items():
-            samples = entry.get("samples", [])
-            x_val = float(val_str)
-            if x_val <= 0:
-                continue
-            for s in samples:
-                if s > 0:
-                    x_all.append(np.log2(x_val))
-                    y_all.append(np.log10(s))
-        return np.array(x_all), np.array(y_all)
-
-    X_gpu, y_gpu = _build_training_data(gpu_data)
-    X_cpu, y_cpu = _build_training_data(cpu_data)
-    # Need at least 3 distinct x-values per implementation for meaningful GP
-    if len(set(X_gpu)) < 3 or len(set(X_cpu)) < 3:
-        return None
-
-    kernel = ConstantKernel(1.0) * RBF(length_scale=1.0) + WhiteKernel(noise_level=0.1)
-
-    gp_gpu = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=3, alpha=1e-6)
-    gp_cpu = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=3, alpha=1e-6)
-    try:
-        gp_gpu.fit(X_gpu.reshape(-1, 1), y_gpu)
-        gp_cpu.fit(X_cpu.reshape(-1, 1), y_cpu)
-    except Exception:
-        return None
-
-    # Common x range: intersection of both domains
-    x_min = max(X_gpu.min(), X_cpu.min())
-    x_max = min(X_gpu.max(), X_cpu.max())
-    if x_min >= x_max:
-        return None
-
-    X_dense = np.linspace(x_min, x_max, 200).reshape(-1, 1)
-    gpu_mean, gpu_std = gp_gpu.predict(X_dense, return_std=True)
-    cpu_mean, cpu_std = gp_cpu.predict(X_dense, return_std=True)
-
-    # Speedup in log10 space: log10(speedup) = gpu_log - cpu_log
-    diff_mean = gpu_mean - cpu_mean
-    diff_std = np.sqrt(gpu_std ** 2 + cpu_std ** 2)
-
-    x_points = 2 ** X_dense.ravel()
-    speedup_mean = 10 ** diff_mean
-    speedup_lower = 10 ** (diff_mean - 1.96 * diff_std)
-    speedup_upper = 10 ** (diff_mean + 1.96 * diff_std)
-
-    return x_points, speedup_mean, speedup_lower, speedup_upper
-
-
-# ---------------------------------------------------------------------------
-#  Cache-to-throughput reconstruction
-# ---------------------------------------------------------------------------
-
-def _reconstruct_throughput(cache, cache_key, x_values, labels):
-    """Rebuild {label: [mean_or_None]} from cache for plotting.
-
-    For each label and x_value, computes the mean of cached samples,
-    or None if no samples exist.
-    """
-    throughput = {label: [] for label in labels}
-    exp_data = cache.get(cache_key, {}) if cache else {}
-
-    for val in x_values:
-        val_str = str(val)
-        for label in labels:
-            entry = exp_data.get(label, {}).get(val_str, {})
-            samples = entry.get("samples", []) if isinstance(entry, dict) else []
-            if samples:
-                throughput[label].append(float(np.mean(samples)))
-            else:
-                throughput[label].append(None)
-
-    return throughput
-
-
-def _discover_x_values(cache, cache_key):
-    """Discover all unique x-values from cache for a given experiment.
-
-    Returns sorted list of integer x-values found across all implementations.
-    """
-    exp_data = cache.get(cache_key, {}) if cache else {}
-    x_set = set()
-    for impl_data in exp_data.values():
-        if isinstance(impl_data, dict):
-            for val_str in impl_data.keys():
-                try:
-                    x_set.add(int(val_str))
-                except ValueError:
-                    pass
-    return sorted(x_set)
+# Plot helpers, GP regression, cache reconstruction, and chart generation
+# are all imported from plotting.py above.
 
 
 # ---------------------------------------------------------------------------
@@ -884,29 +564,20 @@ def _run_scheduled(schedule, cache):
 
 def run_scaling_experiment(available, runs, figs_dir, cfg, model="mlp",
                            use_cache=True):
-    """Run GPU-focused scaling experiments with multiple plot types."""
+    """Run GPU-focused scaling experiments, then generate plots.
+
+    Data collection stays here; all chart generation is delegated to plotting.py.
+    """
     if not HAS_MATPLOTLIB:
         print("matplotlib not available -- scaling mode requires matplotlib")
         return
 
-    _setup_style()
     os.makedirs(figs_dir, exist_ok=True)
-
-    # Temporarily override global IMPL_STYLES for _plot_throughput
-    global IMPL_STYLES
-    orig_styles = IMPL_STYLES
-
-    # Select model-specific styles and speedup pairs
-    styles = CNN_IMPL_STYLES if model == "cnn" else orig_styles
-    speedup_pairs = CNN_SPEEDUP_PAIRS if model == "cnn" else SPEEDUP_PAIRS
-    prefix = f"{model.upper()} " if model != "mlp" else ""
-    file_prefix = f"{model}_" if model != "mlp" else ""
-
-    IMPL_STYLES = styles
 
     # Load or initialize cache
     cache = _load_cache() if use_cache else {}
 
+    from plotting import _cache_key
     epochs = cfg["epochs"]
     labels = [l for l, _ in available]
     budget_seconds = cfg.get("budget_seconds", None)
@@ -918,7 +589,6 @@ def run_scaling_experiment(available, runs, figs_dir, cfg, model="mlp",
         print(f"\n  Budget mode: {budget_seconds}s wall-time budget")
         print("=" * 70)
 
-        # Build experiment descriptors with log2 ranges for continuous sampling
         budget_experiments = []
         if model == "cnn":
             budget_experiments.append((
@@ -945,102 +615,21 @@ def run_scaling_experiment(available, runs, figs_dir, cfg, model="mlp",
         print(f"  Scheduled {len(schedule)} runs (est. {sum(s['est_wall'] for s in schedule):.0f}s)")
         _run_scheduled(schedule, cache)
 
-        # Reconstruct throughput for plotting — discover x-values from cache
-        if model == "cnn":
-            tp_ds = None
-            tp_hs = None
-            batch_sizes = _discover_x_values(cache, _cache_key(model, "batch_size"))
-            tp_bs = _reconstruct_throughput(
-                cache, _cache_key(model, "batch_size"), batch_sizes, labels)
-            dataset_sizes = batch_sizes
-            fixed_bs = batch_sizes[-1] if batch_sizes else 1024
-            fixed_ns = 60000
-        else:
-            dataset_sizes = _discover_x_values(cache, _cache_key(model, "dataset_size"))
-            batch_sizes = _discover_x_values(cache, _cache_key(model, "batch_size"))
-            hidden_sizes = _discover_x_values(cache, _cache_key(model, "hidden_size"))
-            tp_ds = _reconstruct_throughput(
-                cache, _cache_key(model, "dataset_size"), dataset_sizes, labels)
-            tp_bs = _reconstruct_throughput(
-                cache, _cache_key(model, "batch_size"), batch_sizes, labels)
-            tp_hs = _reconstruct_throughput(
-                cache, _cache_key(model, "hidden_size"), hidden_sizes, labels)
-
-        # Jump to plotting (skip the normal collection flow)
-        # -- individual throughput plots --
-        if tp_ds is not None and dataset_sizes:
-            fig, ax = plt.subplots(figsize=(12, 7))
-            _plot_throughput(ax, dataset_sizes, tp_ds, labels,
-                             f"Throughput vs Dataset Size\nbatch_size={fixed_bs}, epochs={epochs}",
-                             "Dataset Size (samples)",
-                             cache=cache, cache_key=_cache_key(model, "dataset_size"))
-            _format_x_samples(ax)
-            plt.tight_layout()
-            p = os.path.join(figs_dir, f"{file_prefix}scaling_dataset_size.png")
-            plt.savefig(p); plt.close()
-            print(f"\nSaved: {p}")
-
-        if batch_sizes:
-            fig, ax = plt.subplots(figsize=(12, 7))
-            bs_title = (f"{prefix}Throughput vs Batch Size\nMNIST (60K samples), epochs={epochs}"
-                         if model == "cnn"
-                         else f"Throughput vs Batch Size\nnum_samples={fixed_ns:,}, epochs={epochs}")
-            _plot_throughput(ax, batch_sizes, tp_bs, labels, bs_title, "Batch Size",
-                             cache=cache, cache_key=_cache_key(model, "batch_size"))
-            plt.tight_layout()
-            p = os.path.join(figs_dir, f"{file_prefix}scaling_batch_size.png")
-            plt.savefig(p); plt.close()
-            print(f"\nSaved: {p}")
-
-        if tp_hs is not None and hidden_sizes:
-            fig, ax = plt.subplots(figsize=(12, 7))
-            _plot_throughput(ax, hidden_sizes, tp_hs, labels,
-                             f"Throughput vs Hidden Layer Size\nsamples={fixed_ns:,}, batch={fixed_bs}, epochs={epochs}",
-                             "Hidden Size",
-                             cache=cache, cache_key=_cache_key(model, "hidden_size"))
-            plt.tight_layout()
-            p = os.path.join(figs_dir, f"{file_prefix}scaling_hidden_size.png")
-            plt.savefig(p); plt.close()
-            print(f"\nSaved: {p}")
-
-        # Fall through to speedup plots, overview, and summary below
-        # (they use tp_ds, tp_bs, tp_hs which are now set)
-
-    # For CNN, only batch size scaling makes sense (fixed MNIST dataset, fixed architecture)
+    # For CNN, only batch size scaling (fixed MNIST dataset, fixed architecture)
     elif model == "cnn":
-        batch_sizes = cfg.get("batch_sizes", [2**n for n in range(4, 11)])  # 16 .. 1024
-        tp_ds = None
-        tp_hs = None
+        batch_sizes = cfg.get("batch_sizes", [2**n for n in range(4, 11)])
 
         print("=" * 70)
         print(f"  CNN Batch Size Scaling  (MNIST 60K, epochs={epochs})")
         print("=" * 70)
 
-        tp_bs = _collect_throughput(
+        _collect_throughput(
             available, runs, "batch_size", batch_sizes,
             {"epochs": epochs},
             cache=cache, cache_key=_cache_key(model, "batch_size"))
 
-        fig, ax = plt.subplots(figsize=(12, 7))
-        _plot_throughput(ax, batch_sizes, tp_bs, labels,
-                         f"{prefix}Throughput vs Batch Size\nMNIST (60K samples), epochs={epochs}",
-                         "Batch Size",
-                         cache=cache, cache_key=_cache_key(model, "batch_size"))
-        plt.tight_layout()
-        p = os.path.join(figs_dir, f"{file_prefix}scaling_batch_size.png")
-        plt.savefig(p)
-        plt.close()
-        print(f"\nSaved: {p}")
-
-        dataset_sizes = batch_sizes  # reuse for speedup x-axis
-        fixed_bs = batch_sizes[-1]
-        fixed_ns = 60000
-
     else:
         # MLP: full three-axis scaling
-        # ================================================================
-        #  Experiment 1: Throughput vs Dataset Size
-        # ================================================================
         dataset_sizes = cfg["dataset_sizes"]
         fixed_bs = cfg["fixed_batch_size"]
 
@@ -1048,26 +637,11 @@ def run_scaling_experiment(available, runs, figs_dir, cfg, model="mlp",
         print(f"  Experiment 1: Dataset Size Scaling  (batch={fixed_bs}, epochs={epochs})")
         print("=" * 70)
 
-        tp_ds = _collect_throughput(
+        _collect_throughput(
             available, runs, "num_samples", dataset_sizes,
             {"batch_size": fixed_bs, "epochs": epochs},
             cache=cache, cache_key=_cache_key(model, "dataset_size"))
 
-        fig, ax = plt.subplots(figsize=(12, 7))
-        _plot_throughput(ax, dataset_sizes, tp_ds, labels,
-                         f"Throughput vs Dataset Size\nbatch_size={fixed_bs}, epochs={epochs}",
-                         "Dataset Size (samples)",
-                         cache=cache, cache_key=_cache_key(model, "dataset_size"))
-        _format_x_samples(ax)
-        plt.tight_layout()
-        p = os.path.join(figs_dir, f"{file_prefix}scaling_dataset_size.png")
-        plt.savefig(p)
-        plt.close()
-        print(f"\nSaved: {p}")
-
-        # ================================================================
-        #  Experiment 2: Throughput vs Batch Size
-        # ================================================================
         batch_sizes = cfg["batch_sizes"]
         fixed_ns = cfg["fixed_num_samples"]
 
@@ -1075,244 +649,34 @@ def run_scaling_experiment(available, runs, figs_dir, cfg, model="mlp",
         print(f"  Experiment 2: Batch Size Scaling  (samples={fixed_ns}, epochs={epochs})")
         print("=" * 70)
 
-        tp_bs = _collect_throughput(
+        _collect_throughput(
             available, runs, "batch_size", batch_sizes,
             {"num_samples": fixed_ns, "epochs": epochs},
             cache=cache, cache_key=_cache_key(model, "batch_size"))
 
-        fig, ax = plt.subplots(figsize=(12, 7))
-        _plot_throughput(ax, batch_sizes, tp_bs, labels,
-                         f"Throughput vs Batch Size\nnum_samples={fixed_ns:,}, epochs={epochs}",
-                         "Batch Size",
-                         cache=cache, cache_key=_cache_key(model, "batch_size"))
-        plt.tight_layout()
-        p = os.path.join(figs_dir, f"{file_prefix}scaling_batch_size.png")
-        plt.savefig(p)
-        plt.close()
-        print(f"\nSaved: {p}")
-
-        # ================================================================
-        #  Experiment 3: Throughput vs Hidden Size  (GPU compute scaling)
-        # ================================================================
         hidden_sizes = cfg["hidden_sizes"]
 
         print("\n" + "=" * 70)
         print(f"  Experiment 3: Hidden Size Scaling  (samples={fixed_ns}, batch={fixed_bs}, epochs={epochs})")
         print("=" * 70)
 
-        tp_hs = _collect_throughput(
+        _collect_throughput(
             available, runs, "hidden_size", hidden_sizes,
             {"num_samples": fixed_ns, "batch_size": fixed_bs, "epochs": epochs},
             cache=cache, cache_key=_cache_key(model, "hidden_size"))
 
-        fig, ax = plt.subplots(figsize=(12, 7))
-        _plot_throughput(ax, hidden_sizes, tp_hs, labels,
-                         f"Throughput vs Hidden Layer Size\nsamples={fixed_ns:,}, batch={fixed_bs}, epochs={epochs}",
-                         "Hidden Size",
-                         cache=cache, cache_key=_cache_key(model, "hidden_size"))
-        plt.tight_layout()
-        p = os.path.join(figs_dir, f"{file_prefix}scaling_hidden_size.png")
-        plt.savefig(p)
-        plt.close()
-        print(f"\nSaved: {p}")
-
-    # ================================================================
-    #  GPU Speedup plots
-    # ================================================================
-    print("\n" + "=" * 70)
-    print("  Generating GPU speedup plots...")
-    print("=" * 70)
-
-    # Build experiments list based on available data
-    experiments = []
-    if tp_ds is not None and dataset_sizes:
-        experiments.append(("dataset_size", dataset_sizes, tp_ds, "Dataset Size (samples)", True))
-    if batch_sizes:
-        experiments.append(("batch_size", batch_sizes, tp_bs, "Batch Size", False))
-    if tp_hs is not None and hidden_sizes:
-        experiments.append(("hidden_size", hidden_sizes, tp_hs, "Hidden Size", False))
-
-    for exp_name, xs, tp_data, xlabel, use_sample_fmt in experiments:
-        fig, ax = plt.subplots(figsize=(12, 7))
-        sp_cache_key = _cache_key(model, exp_name)
-
-        any_plotted = False
-        for gpu_label, cpu_label, color, legend_name in speedup_pairs:
-            gpu_vals = tp_data.get(gpu_label, [])
-            cpu_vals = tp_data.get(cpu_label, [])
-            if not gpu_vals or not cpu_vals:
-                continue
-
-            # Raw ratios for scatter overlay
-            xf, yf = [], []
-            for i in range(min(len(gpu_vals), len(cpu_vals))):
-                if gpu_vals[i] is not None and cpu_vals[i] is not None and cpu_vals[i] > 0:
-                    xf.append(xs[i])
-                    yf.append(gpu_vals[i] / cpu_vals[i])
-
-            # Try GP-based speedup with CI
-            sp_result = _speedup_with_ci(cache, sp_cache_key, gpu_label, cpu_label) if cache else None
-
-            if sp_result is not None:
-                x_pts, sp_mean, sp_lower, sp_upper = sp_result
-                ax.plot(x_pts, sp_mean, color=color, linewidth=2.5, label=legend_name)
-                ax.fill_between(x_pts, sp_lower, sp_upper, color=color, alpha=0.20)
-                if yf:
-                    ax.scatter(xf, yf, color=color, marker="o", s=64,
-                               edgecolors="white", linewidths=0.8, zorder=10)
-                any_plotted = True
-            elif yf:
-                ax.plot(xf, yf, marker="o", color=color, linewidth=2.5,
-                        markersize=8, label=legend_name)
-                any_plotted = True
-
-        if not any_plotted:
-            plt.close()
-            continue
-
-        ax.axhline(y=1.0, color="#e74c3c", linestyle="--", alpha=0.7, linewidth=1.5, label="Break-even (1x)")
-        ax.set_xscale("log", base=2)
-        ax.set_xlabel(xlabel)
-        ax.set_ylabel("Speedup (x)")
-        ax.set_title(f"{prefix}GPU Speedup vs {xlabel}\n(higher = GPU wins)", fontsize=14, fontweight="bold")
-        ax.grid(True, which="both", alpha=0.3)
-
-        if use_sample_fmt:
-            _format_x_samples(ax)
-
-        # Sort legend by peak speedup
-        handles, leg_labels = ax.get_legend_handles_labels()
-        peak_sp = {}
-        for h, ll in zip(handles, leg_labels):
-            if ll == "Break-even (1x)":
-                peak_sp[ll] = -1
-            else:
-                ydata = h.get_ydata()
-                peak_sp[ll] = max(ydata) if len(ydata) > 0 else 0
-        paired = sorted(zip(handles, leg_labels), key=lambda x: peak_sp.get(x[1], 0), reverse=True)
-        handles, leg_labels = zip(*paired)
-        ax.legend(handles, leg_labels, loc="best")
-
-        plt.tight_layout()
-        p = os.path.join(figs_dir, f"{file_prefix}gpu_speedup_{exp_name}.png")
-        plt.savefig(p)
-        plt.close()
-        print(f"  Saved: {p}")
-
-    # ================================================================
-    #  Combined overview plot
-    # ================================================================
-    if model == "cnn":
-        # CNN: single row — throughput + speedup
-        fig, axes = plt.subplots(1, 2, figsize=(18, 7))
-
-        _plot_throughput(axes[0], batch_sizes, tp_bs, labels,
-                         "Batch Size Scaling (MNIST)", "Batch Size",
-                         cache=cache, cache_key=_cache_key(model, "batch_size"))
-
-        bs_cache_key = _cache_key(model, "batch_size")
-        for gpu_label, cpu_label, color, legend_name in speedup_pairs[:3]:
-            sp_result = _speedup_with_ci(cache, bs_cache_key, gpu_label, cpu_label) if cache else None
-            if sp_result is not None:
-                x_pts, sp_mean, sp_lower, sp_upper = sp_result
-                axes[1].plot(x_pts, sp_mean, color=color, linewidth=2.5, label=legend_name)
-                axes[1].fill_between(x_pts, sp_lower, sp_upper, color=color, alpha=0.15)
-
-        axes[1].axhline(y=1.0, color="#e74c3c", linestyle="--", alpha=0.7, linewidth=1.5)
-        axes[1].set_xscale("log", base=2)
-        axes[1].set_xlabel("Batch Size")
-        axes[1].set_ylabel("Speedup (x)")
-        axes[1].set_title("GPU Speedup vs Batch Size", fontweight="bold")
-        axes[1].grid(True, which="both", alpha=0.3)
-        handles, leg_labels = axes[1].get_legend_handles_labels()
-        if handles:
-            axes[1].legend(loc="best")
-
-        fig.suptitle("CNN Benchmark: GPU Scaling Analysis (LeNet-5 / MNIST)",
-                      fontsize=18, fontweight="bold", y=0.98)
-    else:
-        # MLP: 2x2 overview — only plot subplots that have data
-        fig, axes = plt.subplots(2, 2, figsize=(18, 14))
-
-        if dataset_sizes and tp_ds:
-            _plot_throughput(axes[0, 0], dataset_sizes, tp_ds, labels,
-                             f"Dataset Size Scaling (batch={fixed_bs})", "Dataset Size",
-                             cache=cache, cache_key=_cache_key(model, "dataset_size"))
-            _format_x_samples(axes[0, 0])
-        else:
-            axes[0, 0].set_visible(False)
-
-        if batch_sizes and tp_bs:
-            _plot_throughput(axes[0, 1], batch_sizes, tp_bs, labels,
-                             f"Batch Size Scaling (samples={fixed_ns:,})", "Batch Size",
-                             cache=cache, cache_key=_cache_key(model, "batch_size"))
-        else:
-            axes[0, 1].set_visible(False)
-
-        if hidden_sizes and tp_hs:
-            _plot_throughput(axes[1, 0], hidden_sizes, tp_hs, labels,
-                             f"Hidden Size Scaling (batch={fixed_bs})", "Hidden Size",
-                             cache=cache, cache_key=_cache_key(model, "hidden_size"))
-
-            hs_cache_key = _cache_key(model, "hidden_size")
-            for gpu_label, cpu_label, color, legend_name in speedup_pairs[:3]:
-                sp_result = _speedup_with_ci(cache, hs_cache_key, gpu_label, cpu_label) if cache else None
-                if sp_result is not None:
-                    x_pts, sp_mean, sp_lower, sp_upper = sp_result
-                    axes[1, 1].plot(x_pts, sp_mean, color=color, linewidth=2.5, label=legend_name)
-                    axes[1, 1].fill_between(x_pts, sp_lower, sp_upper, color=color, alpha=0.15)
-
-            axes[1, 1].axhline(y=1.0, color="#e74c3c", linestyle="--", alpha=0.7, linewidth=1.5)
-            axes[1, 1].set_xscale("log", base=2)
-            axes[1, 1].set_xlabel("Hidden Size")
-            axes[1, 1].set_ylabel("Speedup (x)")
-            axes[1, 1].set_title("GPU Speedup vs Hidden Size", fontweight="bold")
-            axes[1, 1].grid(True, which="both", alpha=0.3)
-            handles, leg_labels = axes[1, 1].get_legend_handles_labels()
-            if handles:
-                axes[1, 1].legend(loc="best")
-        else:
-            axes[1, 0].set_visible(False)
-            axes[1, 1].set_visible(False)
-
-        fig.suptitle("MLP Benchmark: GPU Scaling Analysis", fontsize=18, fontweight="bold", y=0.98)
-
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
-    p = os.path.join(figs_dir, f"{file_prefix}scaling_overview.png")
-    plt.savefig(p)
-    plt.close()
-    print(f"\n  Saved: {p}")
-
-    # Print summary table
-    print("\n" + "=" * 70)
-    print("  PEAK THROUGHPUT SUMMARY")
-    print("=" * 70)
-    all_experiments = []
-    if tp_ds is not None:
-        all_experiments.append(("Dataset Size", tp_ds))
-    all_experiments.append(("Batch Size", tp_bs))
-    if tp_hs is not None:
-        all_experiments.append(("Hidden Size", tp_hs))
-
-    for exp_name, tp_data in all_experiments:
-        print(f"\n  {exp_name} experiment:")
-        ranked = []
-        for label in labels:
-            vals = [v for v in tp_data.get(label, []) if v is not None]
-            if vals:
-                ranked.append((label, max(vals)))
-        ranked.sort(key=lambda x: x[1], reverse=True)
-        for i, (label, peak) in enumerate(ranked):
-            bar = "#" * int(peak / ranked[0][1] * 40) if ranked else ""
-            if peak >= 1e6:
-                print(f"    {i+1}. {label:<25} {peak/1e6:>8.2f}M/s  {bar}")
-            else:
-                print(f"    {i+1}. {label:<25} {peak/1e3:>8.0f}K/s  {bar}")
-
-    # Save cache and restore styles
+    # Save cache
     if use_cache:
         _save_cache(cache)
-    IMPL_STYLES = orig_styles
+
+    # Delegate all plotting to the plotting module
+    print("\n" + "=" * 70)
+    print("  Generating plots...")
+    print("=" * 70)
+    plot_scaling_results(cache, cfg, model, labels, figs_dir)
+    plot_speedup_results(cache, cfg, model, labels, figs_dir)
+    plot_overview(cache, cfg, model, labels, figs_dir)
+    print_peak_summary(cache, model, labels)
 
 
 # ---------------------------------------------------------------------------
@@ -1334,57 +698,7 @@ def print_markdown_table(results):
             print(f"| {dataset} | {label} | {acc_str} | {metrics['mean_loss']:.4f} | {time_str} | {metrics['mean_eval']:.3f} |")
 
 
-def generate_charts(results, figs_dir):
-    if not HAS_MATPLOTLIB:
-        print("matplotlib not available, skipping chart generation")
-        return
-
-    os.makedirs(figs_dir, exist_ok=True)
-    datasets = sorted(results.keys())
-    all_labels = []
-    for d in datasets:
-        for label in results[d]:
-            if label not in all_labels:
-                all_labels.append(label)
-
-    x = np.arange(len(datasets))
-    width = 0.8 / max(len(all_labels), 1)
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    for i, label in enumerate(all_labels):
-        vals = [results[d][label]["mean_train"] if label in results[d] else 0 for d in datasets]
-        errs = [results[d][label]["std_train"] or 0 if label in results[d] else 0 for d in datasets]
-        ax.bar(x + i * width, vals, width, yerr=errs, label=label, capsize=3)
-    ax.set_xlabel("Dataset")
-    ax.set_ylabel("Train Time (s)")
-    ax.set_title("MLP Training Time by Implementation")
-    ax.set_xticks(x + width * (len(all_labels) - 1) / 2)
-    ax.set_xticklabels(datasets)
-    ax.legend()
-    ax.grid(axis="y", alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(os.path.join(figs_dir, "benchmark_train_time.png"), dpi=150)
-    plt.close()
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    for i, label in enumerate(all_labels):
-        vals = [results[d][label]["mean_acc"] if label in results[d] else 0 for d in datasets]
-        errs = [results[d][label]["std_acc"] or 0 if label in results[d] else 0 for d in datasets]
-        ax.bar(x + i * width, vals, width, yerr=errs, label=label, capsize=3)
-    ax.set_xlabel("Dataset")
-    ax.set_ylabel("Test Accuracy (%)")
-    ax.set_title("MLP Test Accuracy by Implementation")
-    ax.set_xticks(x + width * (len(all_labels) - 1) / 2)
-    ax.set_xticklabels(datasets)
-    ax.legend()
-    ax.grid(axis="y", alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(os.path.join(figs_dir, "benchmark_accuracy.png"), dpi=150)
-    plt.close()
-    print(f"\nCharts saved to {figs_dir}/")
-
-
-def run_standard(datasets, available, runs, figs_dir):
+def run_standard(datasets, available, runs, figs_dir, model="mlp"):
     results = defaultdict(dict)
     for dataset in datasets:
         print(f"--- {dataset} ---")
@@ -1411,7 +725,7 @@ def run_standard(datasets, available, runs, figs_dir):
                 }
         print()
     print_markdown_table(results)
-    generate_charts(results, figs_dir)
+    generate_charts(results, figs_dir, model=model)
 
 
 # ---------------------------------------------------------------------------
@@ -1420,86 +734,92 @@ def run_standard(datasets, available, runs, figs_dir):
 
 def main():
     parser = argparse.ArgumentParser(description="Benchmark Runner (MLP / CNN)")
-    parser.add_argument("--mode", default="standard", choices=["standard", "scaling"])
+    parser.add_argument("--mode", default=None, choices=["standard", "scaling"])
     parser.add_argument("--model", default="mlp", choices=["mlp", "cnn"],
                         help="Model family to benchmark (default: mlp)")
-    parser.add_argument("--datasets", default="generated,iris,breast-cancer",
+    parser.add_argument("--datasets", default=None,
                         help="Comma-separated dataset names (standard mode, MLP only)")
-    parser.add_argument("--runs", type=int, default=1)
+    parser.add_argument("--runs", type=int, default=None)
     parser.add_argument("--budget", type=float, default=None, metavar="MINUTES",
                         help="Time budget in minutes for variance-weighted scheduling "
                              "(scaling mode only; use 0 to just replot from cache)")
     parser.add_argument("--no-cache", action="store_true",
                         help="Disable result caching (re-run everything)")
 
-    # Scaling parameters -- all power-of-2 by default
-    parser.add_argument("--scaling-epochs", type=int, default=200)
-    parser.add_argument("--scaling-fixed-bs", type=int, default=4096)
-    parser.add_argument("--scaling-fixed-ns", type=int, default=262144,
-                        help="Fixed num_samples (default: 2^18 = 262144)")
+    # Scaling parameters -- None means "use config value"
+    parser.add_argument("--scaling-epochs", type=int, default=None)
+    parser.add_argument("--scaling-fixed-bs", type=int, default=None)
+    parser.add_argument("--scaling-fixed-ns", type=int, default=None,
+                        help="Fixed num_samples (config default: 2^18 = 262144)")
     parser.add_argument("--scaling-dataset-sizes", type=str, default=None,
-                        help="Comma-separated (default: 2^12..2^20)")
+                        help="Comma-separated (config default: 8K..4M)")
     parser.add_argument("--scaling-batch-sizes", type=str, default=None,
-                        help="Comma-separated (default: 2^7..2^14)")
+                        help="Comma-separated (config default: 256..32K)")
     parser.add_argument("--scaling-hidden-sizes", type=str, default=None,
-                        help="Comma-separated (default: 2^5..2^10)")
+                        help="Comma-separated (config default: 64..4096)")
     args = parser.parse_args()
 
-    if args.budget is not None and args.runs > 1:
+    # Load layered config: base.yaml <- models/{model}.yaml <- local.yaml
+    config = load_config(args.model)
+    bench_cfg = config["benchmark"]
+    scale_cfg = config["scaling"]
+
+    # Apply config defaults where CLI args were not provided
+    mode = args.mode or bench_cfg.get("mode", "standard")
+    runs = args.runs if args.runs is not None else bench_cfg.get("runs", 1)
+
+    if args.budget is not None and runs > 1:
         parser.error("--budget and --runs > 1 are mutually exclusive")
 
-    figs_dir = os.path.join(PROJECT_ROOT, "figs")
+    figs_dir = os.path.join(PROJECT_ROOT, "results", "plots", args.model)
 
     # Select implementation list based on model
     impl_list = CNN_IMPLEMENTATIONS if args.model == "cnn" else IMPLEMENTATIONS
     available = [(label, cmd) for label, cmd in impl_list if is_available(label)]
     print(f"Model: {args.model.upper()}")
     print(f"Available implementations: {[l for l, _ in available]}")
-    print(f"Mode: {args.mode}")
+    print(f"Mode: {mode}")
     if args.budget is not None:
         print(f"Budget: {args.budget}s (variance-weighted scheduling)")
     else:
-        print(f"Runs per config: {args.runs}")
+        print(f"Runs per config: {runs}")
     if not args.no_cache:
         print(f"Cache: {CACHE_FILE}")
     print()
 
-    if args.mode == "scaling":
+    if mode == "scaling":
+        # Build scaling cfg from YAML defaults, CLI args override
+        def _parse_list(arg):
+            return [int(x) for x in arg.split(",")] if arg else None
+
         if args.model == "cnn":
             # CNN: only batch size scaling (MNIST is fixed 60K, architecture is fixed)
             cfg = {
-                "epochs": args.scaling_epochs,
-                "batch_sizes": ([int(x) for x in args.scaling_batch_sizes.split(",")]
-                                if args.scaling_batch_sizes
-                                else [2**n for n in range(4, 11)]),    # 16 .. 1024
+                "epochs": args.scaling_epochs or scale_cfg["epochs"],
+                "batch_sizes": _parse_list(args.scaling_batch_sizes) or scale_cfg["batch_sizes"],
             }
         else:
             cfg = {
-                "epochs": args.scaling_epochs,
-                "fixed_batch_size": args.scaling_fixed_bs,
-                "fixed_num_samples": args.scaling_fixed_ns,
-                "dataset_sizes": ([int(x) for x in args.scaling_dataset_sizes.split(",")]
-                                  if args.scaling_dataset_sizes
-                                  else [2**n for n in range(13, 23)]),     # 8K .. 4M
-                "batch_sizes": ([int(x) for x in args.scaling_batch_sizes.split(",")]
-                                if args.scaling_batch_sizes
-                                else [2**n for n in range(8, 16)]),        # 256 .. 32K
-                "hidden_sizes": ([int(x) for x in args.scaling_hidden_sizes.split(",")]
-                                 if args.scaling_hidden_sizes
-                                 else [2**n for n in range(6, 13)]),       # 64 .. 4096
+                "epochs": args.scaling_epochs or scale_cfg["epochs"],
+                "fixed_batch_size": args.scaling_fixed_bs or scale_cfg["fixed_batch_size"],
+                "fixed_num_samples": args.scaling_fixed_ns or scale_cfg["fixed_num_samples"],
+                "dataset_sizes": _parse_list(args.scaling_dataset_sizes) or scale_cfg["dataset_sizes"],
+                "batch_sizes": _parse_list(args.scaling_batch_sizes) or scale_cfg["batch_sizes"],
+                "hidden_sizes": _parse_list(args.scaling_hidden_sizes) or scale_cfg["hidden_sizes"],
             }
         if args.budget is not None:
-            cfg["budget_seconds"] = args.budget * 60 if args.budget is not None else None
-        run_scaling_experiment(available, args.runs, figs_dir, cfg,
+            cfg["budget_seconds"] = args.budget * 60
+        run_scaling_experiment(available, runs, figs_dir, cfg,
                                model=args.model, use_cache=not args.no_cache)
     else:
         if args.model == "cnn":
-            # CNN standard mode: run on MNIST only
-            datasets = ["mnist"]
-        else:
+            datasets = bench_cfg.get("datasets", ["mnist"])
+        elif args.datasets:
             datasets = [d.strip() for d in args.datasets.split(",")]
+        else:
+            datasets = bench_cfg.get("datasets", ["generated", "iris", "breast-cancer"])
         print(f"Datasets: {datasets}\n")
-        run_standard(datasets, available, args.runs, figs_dir)
+        run_standard(datasets, available, runs, figs_dir, model=args.model)
 
 
 if __name__ == "__main__":
