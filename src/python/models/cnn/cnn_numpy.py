@@ -368,7 +368,14 @@ def main():
     parser.add_argument("--batch-size", type=int, default=4096)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--learning-rate", type=float, default=0.32)
+    parser.add_argument("--optimizer", default="sgd", choices=["sgd", "adam"])
+    parser.add_argument("--scheduler", default="none", choices=["none", "cosine"])
     args = parser.parse_args()
+
+    if args.optimizer == "adam":
+        print("Warning: Adam not yet implemented for NumPy, using SGD")
+    if args.scheduler == "cosine":
+        print("Warning: Cosine scheduler not yet implemented for NumPy, using constant LR")
 
     X, y, num_classes = load_dataset(args.dataset)
     X_train, y_train, X_test, y_test = shuffle_and_split(X, y)

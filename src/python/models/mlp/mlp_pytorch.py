@@ -76,7 +76,8 @@ class MLP(nn.Module):
 
 
 def train_model(model, X_train, y_train, device,
-                batch_size=32, num_epochs=1000, learning_rate=0.01):
+                batch_size=32, num_epochs=1000, learning_rate=0.01,
+                optimizer_name="sgd", scheduler_name="none"):
     """Train with mini-batch SGD matching C batch structure.
 
     Key optimizations vs naive loop:
@@ -90,7 +91,18 @@ def train_model(model, X_train, y_train, device,
 
     # reduction='mean' gives gradient/batch_size, matching C's lr_scaled = lr/batch_size
     criterion = nn.CrossEntropyLoss(reduction="mean")
-    optimizer = optim.SGD(model.parameters(), lr=learning_rate)
+    if optimizer_name == "adam":
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    else:
+        optimizer = optim.SGD(model.parameters(), lr=learning_rate)
+
+    lr_scheduler = None
+    if scheduler_name == "cosine":
+        from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+        warmup_epochs = max(1, int(num_epochs * 0.05))
+        warmup_sched = LinearLR(optimizer, start_factor=1.0 / warmup_epochs, total_iters=warmup_epochs)
+        cosine_sched = CosineAnnealingLR(optimizer, T_max=num_epochs - warmup_epochs, eta_min=1e-6)
+        lr_scheduler = SequentialLR(optimizer, [warmup_sched, cosine_sched], milestones=[warmup_epochs])
 
     n = len(X_train)
     num_batches = (n + batch_size - 1) // batch_size
@@ -112,6 +124,9 @@ def train_model(model, X_train, y_train, device,
             # Only synchronize on print epochs to avoid blocking GPU pipeline
             if should_print:
                 epoch_loss += loss.item() * (end - start)
+
+        if lr_scheduler is not None:
+            lr_scheduler.step()
 
         if should_print:
             print(f"  Epoch {epoch:4d}  loss: {epoch_loss / n:.4f}")
@@ -149,6 +164,8 @@ def main():
     parser.add_argument("--hidden-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--learning-rate", type=float, default=0.02)
+    parser.add_argument("--optimizer", default="sgd", choices=["sgd", "adam"])
+    parser.add_argument("--scheduler", default="none", choices=["none", "cosine"])
     args = parser.parse_args()
 
     if args.device == "cuda" and not torch.cuda.is_available():
@@ -196,7 +213,8 @@ def main():
         torch.cuda.synchronize()
     t_start = time.monotonic()
     train_model(model, X_train, y_train, device,
-                batch_size=batch_size, num_epochs=num_epochs, learning_rate=learning_rate)
+                batch_size=batch_size, num_epochs=num_epochs, learning_rate=learning_rate,
+                optimizer_name=args.optimizer, scheduler_name=args.scheduler)
     if args.device == "cuda":
         torch.cuda.synchronize()
     t_train = time.monotonic() - t_start

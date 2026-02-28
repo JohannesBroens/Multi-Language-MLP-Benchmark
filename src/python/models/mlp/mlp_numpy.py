@@ -162,7 +162,14 @@ def main():
     parser.add_argument("--hidden-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--learning-rate", type=float, default=0.02)
+    parser.add_argument("--optimizer", default="sgd", choices=["sgd", "adam"])
+    parser.add_argument("--scheduler", default="none", choices=["none", "cosine"])
     args = parser.parse_args()
+
+    if args.optimizer == "adam":
+        print("Warning: Adam not yet implemented for NumPy, using SGD")
+    if args.scheduler == "cosine":
+        print("Warning: Cosine scheduler not yet implemented for NumPy, using constant LR")
 
     num_epochs = args.epochs
     batch_size = args.batch_size
