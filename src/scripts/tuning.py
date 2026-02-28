@@ -1,9 +1,9 @@
 """Hyperparameter tuning via grid search on PyTorch CUDA.
 
-Selection strategy: Pareto-optimal on (accuracy, training_time).
+Selection strategy: Pareto-optimal on (accuracy, throughput).
 Among configs within `acc_tolerance` of the best accuracy, pick the
-fastest. This avoids chasing marginal accuracy gains that cost 10x
-training time.
+highest throughput. This naturally favors large batch sizes that
+saturate the GPU — unless they hurt convergence too much.
 """
 import itertools
 import os
@@ -18,15 +18,15 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 
 PATTERN_ACC = re.compile(r"Test Accuracy:\s+([\d.]+)%")
 PATTERN_LOSS = re.compile(r"Test Loss:\s+([\d.]+)")
-PATTERN_TIME = re.compile(r"Train time:\s+([\d.]+)\s*s")
+PATTERN_THROUGHPUT = re.compile(r"Throughput:\s+([\d.]+)\s*samples/s")
 
 
 def run_tuning(config, model, cache_path):
     """Grid search over optimizer x scheduler x batch_size x learning_rate.
 
-    Captures accuracy, loss, and training time per trial.  Selects the
-    Pareto-optimal config: fastest among those within `acc_tolerance`
-    of peak accuracy.
+    Captures accuracy, loss, and throughput per trial.  Selects the
+    Pareto-optimal config: highest throughput among those within
+    `acc_tolerance` of peak accuracy.
     """
     tuning = config.get("tuning", {})
     search = tuning.get("search_space", {})
@@ -72,13 +72,13 @@ def run_tuning(config, model, cache_path):
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
             m_acc = PATTERN_ACC.search(result.stdout)
             m_loss = PATTERN_LOSS.search(result.stdout)
-            m_time = PATTERN_TIME.search(result.stdout)
+            m_thr = PATTERN_THROUGHPUT.search(result.stdout)
 
-            if m_acc and m_time:
+            if m_acc and m_thr:
                 acc = float(m_acc.group(1))
                 loss = float(m_loss.group(1)) if m_loss else float("inf")
-                train_time = float(m_time.group(1))
-                print(f"acc={acc:.2f}%  loss={loss:.4f}  time={train_time:.3f}s")
+                throughput = float(m_thr.group(1))
+                print(f"acc={acc:.2f}%  loss={loss:.4f}  {throughput:.0f} samples/s")
                 trials.append({
                     "batch_size": bs,
                     "learning_rate": lr,
@@ -86,7 +86,7 @@ def run_tuning(config, model, cache_path):
                     "scheduler": sched_str,
                     "accuracy": acc,
                     "loss": loss,
-                    "train_time": train_time,
+                    "throughput": throughput,
                 })
             else:
                 print("FAILED (missing output fields)")
@@ -101,13 +101,13 @@ def run_tuning(config, model, cache_path):
         print("No successful trials.")
         return {}
 
-    # --- Selection: Pareto-optimal (accuracy, time) ---
+    # --- Selection: Pareto-optimal (accuracy, throughput) ---
     best_acc = max(t["accuracy"] for t in trials)
     threshold = best_acc - acc_tolerance
 
-    # Among configs within tolerance of best accuracy, pick fastest
+    # Among configs within tolerance of best accuracy, pick highest throughput
     candidates = [t for t in trials if t["accuracy"] >= threshold]
-    selected = min(candidates, key=lambda t: t["train_time"])
+    selected = max(candidates, key=lambda t: t["throughput"])
 
     best_params = {
         "batch_size": selected["batch_size"],
@@ -117,17 +117,17 @@ def run_tuning(config, model, cache_path):
     }
 
     # --- Save full results ---
-    # Sort trials by accuracy descending for readability
-    trials.sort(key=lambda t: (-t["accuracy"], t["train_time"]))
+    # Sort trials by accuracy descending, throughput descending
+    trials.sort(key=lambda t: (-t["accuracy"], -t["throughput"]))
 
     output = {
         "selected": {
             **best_params,
             "accuracy": selected["accuracy"],
             "loss": selected["loss"],
-            "train_time": selected["train_time"],
+            "throughput": selected["throughput"],
         },
-        "selection_strategy": f"fastest within {acc_tolerance}% of peak accuracy ({best_acc:.2f}%)",
+        "selection_strategy": f"highest throughput within {acc_tolerance}% of peak accuracy ({best_acc:.2f}%)",
         "peak_accuracy": best_acc,
         "acc_tolerance": acc_tolerance,
         "tune_epochs": tune_epochs,
@@ -140,11 +140,11 @@ def run_tuning(config, model, cache_path):
         yaml.dump(output, f, default_flow_style=False, sort_keys=False)
 
     print(f"\n{'='*60}")
-    print(f"Peak accuracy:  {best_acc:.2f}%")
-    print(f"Selected:       acc={selected['accuracy']:.2f}%  "
-          f"loss={selected['loss']:.4f}  time={selected['train_time']:.3f}s")
+    print(f"Peak accuracy:    {best_acc:.2f}%")
+    print(f"Selected:         acc={selected['accuracy']:.2f}%  "
+          f"loss={selected['loss']:.4f}  {selected['throughput']:.0f} samples/s")
     print(f"  bs={best_params['batch_size']}, lr={best_params['learning_rate']}, "
           f"opt={best_params['optimizer']}, sched={best_params['scheduler']}")
-    print(f"Strategy:       fastest within {acc_tolerance}% of peak")
+    print(f"Strategy:         highest throughput within {acc_tolerance}% of peak")
     print(f"Saved to {cache_path}")
     return best_params

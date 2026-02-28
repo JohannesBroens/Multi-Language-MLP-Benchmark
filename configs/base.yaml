@@ -15,8 +15,8 @@ build:
   python_pytorch_cuda: true
 
 training:
-  epochs: 1000
-  learning_rate: 0.02
+  epochs: 500
+  learning_rate: 0.03
   batch_size: 8192
   hidden_size: 128
   optimizer: sgd
@@ -32,8 +32,8 @@ tuning:
   epochs: 50
   acc_tolerance: 1.0     # pick fastest config within this % of peak accuracy
   search_space:
-    batch_size: [512, 1024, 2048, 4096, 8192]
-    learning_rate: [0.001, 0.005, 0.01, 0.02, 0.05, 0.1]
+    batch_size: [1024, 2048, 4096, 8192, 16384]
+    learning_rate: [0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2]
     optimizer: [sgd, adam]
     scheduler: [none, cosine]
 
@@ -46,7 +46,7 @@ benchmark:
 
 scaling:
   epochs: 200
-  fixed_batch_size: 4096
+  fixed_batch_size: 8192
   fixed_num_samples: 262144
   dataset_sizes: [8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152, 4194304]
   batch_sizes: [256, 512, 1024, 2048, 4096, 8192, 16384, 32768]

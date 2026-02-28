@@ -99,8 +99,10 @@ def phase_benchmark(config, model):
             config["training"]["optimizer"] = best.get("optimizer", "sgd")
             config["training"]["scheduler"] = best.get("scheduler", "none")
             extra = ""
-            if "accuracy" in best and "train_time" in best:
-                extra = f" (acc={best['accuracy']:.2f}%, time={best['train_time']:.3f}s)"
+            if "accuracy" in best and "throughput" in best:
+                extra = f" (acc={best['accuracy']:.2f}%, {best['throughput']:.0f} samples/s)"
+            elif "accuracy" in best:
+                extra = f" (acc={best['accuracy']:.2f}%)"
             print(f"Loaded tuned params: bs={best.get('batch_size')}, "
                   f"lr={best.get('learning_rate')}, opt={best.get('optimizer')}, "
                   f"sched={best.get('scheduler')}{extra}")
