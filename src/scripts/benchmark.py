@@ -1061,7 +1061,7 @@ def main():
     print(f"Available implementations: {[l for l, _ in available]}")
     print(f"Mode: {mode}")
     if args.budget is not None:
-        print(f"Budget: {args.budget}s (variance-weighted scheduling)")
+        print(f"Budget: {args.budget} min (variance-weighted scheduling)")
     else:
         print(f"Runs per config: {runs}")
     if not args.no_cache:
