@@ -7,6 +7,8 @@ if(USE_CUDA)
     set_target_properties(mlp PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
     set_property(TARGET mlp PROPERTY CUDA_ARCHITECTURES native)
 
+    target_link_libraries(mlp PUBLIC nn_ops)
+
     # Link cuBLAS for batched GEMM operations
     find_library(CUBLAS_LIB cublas HINTS ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES} /usr/local/cuda/lib64)
     if(CUBLAS_LIB)
