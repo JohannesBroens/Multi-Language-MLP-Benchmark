@@ -11,7 +11,8 @@ A multi-language machine learning benchmark comparing neural network implementat
 | Output activation | Softmax | Produces class probabilities for multi-class classification |
 | Loss | Cross-entropy | Standard for classification; clean gradient with softmax |
 | Initialization | Xavier uniform (sqrt(2/fan_in)) | Keeps activation variance stable across layers |
-| Optimizer | Mini-batch SGD (configurable lr/batch) | Simple, no dependencies, easy to implement identically across languages |
+| Optimizer | Mini-batch SGD or Adam (configurable) | SGD: simple baseline; Adam: adaptive per-parameter learning rates |
+| Scheduler | None or cosine annealing with warmup | Optional cosine decay (5% linear warmup, decay to lr_min=1e-6) |
 
 ## Implementations
 
@@ -40,7 +41,8 @@ All 8 MLP implementations produce identical standardized output for benchmark pa
 | Activations | ReLU (all layers) | Modern replacement for LeNet-5's original sigmoid/tanh |
 | Output | Softmax + Cross-entropy | Same as MLP for consistent loss computation |
 | Initialization | Xavier uniform | Same sqrt(2/fan_in) scale as MLP, adapted for conv fan_in = C_in x kH x kW |
-| Optimizer | Mini-batch SGD (lr=0.01) | Identical to MLP for fair comparison |
+| Optimizer | Mini-batch SGD or Adam | Same optimizer support as MLP |
+| Scheduler | None or cosine annealing | Same scheduler support as MLP |
 
 ### CNN Implementations
 
@@ -88,9 +90,29 @@ The build script detects available toolchains and builds all possible targets:
 
 This downloads datasets, installs Python dependencies, and builds all C, Rust, and CUDA targets. Targets whose toolchains are missing are skipped with a warning.
 
+### Unified Pipeline
+
+The pipeline handles build, tuning, benchmarking, and plot generation in one command:
+
+```bash
+# Full pipeline for all models (build -> tune -> benchmark -> plot)
+python3 src/scripts/pipeline.py all
+
+# Single model only
+python3 src/scripts/pipeline.py all --model mlp
+python3 src/scripts/pipeline.py all --model cnn
+
+# Individual phases
+python3 src/scripts/pipeline.py tune --model mlp      # Two-phase successive halving
+python3 src/scripts/pipeline.py benchmark --model cnn  # Run benchmarks with tuned params
+python3 src/scripts/pipeline.py plot --model mlp       # Regenerate plots from cache
+```
+
+Tuning uses two-phase successive halving: throughput sweep for batch size, then LR halving per optimizer track (SGD + Adam). Results are cached to `results/cache/tuning_{model}.yaml` and automatically loaded by the benchmark phase.
+
 ### Run Individual Implementations
 
-All implementations accept `--batch-size`, `--num-samples`, `--hidden-size`, and `--epochs` flags for configurable hyperparameters.
+All implementations accept `--batch-size`, `--num-samples`, `--hidden-size`, `--epochs`, `--optimizer sgd|adam`, and `--scheduler none|cosine` flags.
 
 ```bash
 # C (CPU)
@@ -305,11 +327,13 @@ ML-in-C/
 │   │   │   └── cnn_pytorch.py     # PyTorch CNN (CPU + CUDA)
 │   │   └── setup.py
 │   └── scripts/
+│       ├── pipeline.py            # Unified pipeline: build -> tune -> benchmark -> plot
+│       ├── config.py              # Layered YAML config loader (base + model overrides)
+│       ├── tuning.py              # Two-phase successive halving hyperparameter tuning
 │       ├── benchmark.py           # Benchmark runner (MLP + CNN, standard + scaling)
-│       ├── tune_benchmark.py      # OMP threshold tuning script
+│       ├── plotting.py            # Plot generation from cached benchmark data
 │       ├── download_datasets.sh   # Download UCI + MNIST datasets
-│       ├── preprocess_iris.py     # Preprocess Iris data
-│       └── run_pipeline.sh        # Full pipeline (download + build + run)
+│       └── preprocess_iris.py     # Preprocess Iris data
 ├── build.sh                       # One-command build (detects toolchains)
 ├── mathematical_foundations.md    # Math derivations for MLP and CNN algorithms
 ├── requirements.txt               # Python dependencies
