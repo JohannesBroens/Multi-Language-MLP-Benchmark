@@ -220,7 +220,7 @@ def run_implementation(label, cmd_template, dataset, batch_size=4096,
     try:
         result = subprocess.run(
             cmd.split(), capture_output=True, text=True,
-            timeout=600, cwd=PROJECT_ROOT, env=env)
+            timeout=1800, cwd=PROJECT_ROOT, env=env)
         output = result.stdout + result.stderr
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
         print(f"  SKIP {label}: {e}")
