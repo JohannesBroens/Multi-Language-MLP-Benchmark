@@ -113,12 +113,18 @@ def phase_benchmark(config, model):
 
     print(f"=== Benchmarking {model.upper()} ===")
     bench = config.get("benchmark", {})
+    training = config.get("training", {})
     cmd = [
         PYTHON, os.path.join(SCRIPT_DIR, "benchmark.py"),
         "--mode", bench.get("mode", "standard"),
         "--model", model,
         "--datasets", ",".join(bench.get("datasets", ["generated"])),
         "--runs", str(bench.get("runs", 3)),
+        "--epochs", str(training.get("epochs", 500)),
+        "--batch-size", str(training.get("batch_size", 4096)),
+        "--learning-rate", str(training.get("learning_rate", 0.02)),
+        "--optimizer", str(training.get("optimizer", "sgd")),
+        "--scheduler", str(training.get("scheduler") or "none"),
     ]
     budget = bench.get("budget_minutes")
     if budget:

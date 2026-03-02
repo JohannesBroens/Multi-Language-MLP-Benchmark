@@ -709,7 +709,8 @@ def print_markdown_table(results):
 
 
 def run_standard(datasets, available, runs, figs_dir, model="mlp",
-                 learning_rate=0.02, optimizer="sgd", scheduler="none"):
+                 epochs=500, batch_size=4096, learning_rate=0.02,
+                 optimizer="sgd", scheduler="none"):
     results = defaultdict(dict)
     for dataset in datasets:
         print(f"--- {dataset} ---")
@@ -719,6 +720,8 @@ def run_standard(datasets, available, runs, figs_dir, model="mlp",
                 tag = f" (run {run + 1}/{runs})" if runs > 1 else ""
                 print(f"  {label}{tag}...")
                 r = run_implementation(label, cmd_template, dataset,
+                                       batch_size=batch_size,
+                                       epochs=epochs,
                                        learning_rate=learning_rate,
                                        optimizer=optimizer,
                                        scheduler=scheduler)
@@ -1037,6 +1040,13 @@ def main():
     parser.add_argument("--no-cache", action="store_true",
                         help="Disable result caching (re-run everything)")
 
+    # Training parameter overrides (used by pipeline.py to pass tuned params)
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--learning-rate", type=float, default=None)
+    parser.add_argument("--optimizer", default=None, choices=["sgd", "adam"])
+    parser.add_argument("--scheduler", default=None, choices=["none", "cosine"])
+
     # Scaling parameters -- None means "use config value"
     parser.add_argument("--scaling-epochs", type=int, default=None)
     parser.add_argument("--scaling-fixed-bs", type=int, default=None)
@@ -1165,9 +1175,11 @@ def main():
         print(f"Datasets: {datasets}\n")
         train_cfg = config.get("training", {})
         run_standard(datasets, available, runs, figs_dir, model=args.model,
-                     learning_rate=train_cfg.get("learning_rate", 0.02),
-                     optimizer=train_cfg.get("optimizer", "sgd"),
-                     scheduler=train_cfg.get("scheduler") or "none")
+                     epochs=args.epochs or train_cfg.get("epochs", 500),
+                     batch_size=args.batch_size or train_cfg.get("batch_size", 4096),
+                     learning_rate=args.learning_rate or train_cfg.get("learning_rate", 0.02),
+                     optimizer=args.optimizer or train_cfg.get("optimizer", "sgd"),
+                     scheduler=args.scheduler or train_cfg.get("scheduler") or "none")
 
 
 if __name__ == "__main__":

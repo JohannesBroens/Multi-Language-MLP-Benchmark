@@ -2,7 +2,7 @@
 
 pipeline:
   phases: [tune, benchmark]
-  force_retune: true
+  force_retune: false
 
 build:
   c_cpu: true
