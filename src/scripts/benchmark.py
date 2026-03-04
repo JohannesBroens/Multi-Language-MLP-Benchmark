@@ -7,7 +7,7 @@ standardized output parsing, comparison tables, scaling charts, and result cachi
 Modes:
     standard — bar charts for real datasets (accuracy + train time)
     scaling  — throughput scaling with GPU speedup plots and ranked legends
-               MLP: dataset size, batch size, hidden size
+               MLP: dataset size, batch size, hidden size, network depth
                CNN: batch size only (fixed MNIST dataset, fixed architecture)
 
 Usage:
@@ -36,6 +36,7 @@ except ImportError:
     pass
 
 import numpy as np
+from tqdm import tqdm
 
 from plotting import (
     HAS_MATPLOTLIB, IMPL_STYLES, CNN_IMPL_STYLES, SPEEDUP_PAIRS, CNN_SPEEDUP_PAIRS,
@@ -57,21 +58,21 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..
 # Implementation definitions with configurable placeholders.
 IMPLEMENTATIONS = [
     ("C (CPU)",
-     "./src/c/build_cpu/main --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler}"),
+     "./src/c/build_cpu/main --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --num-hidden-layers {num_hidden_layers} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler}"),
     ("C (CUDA)",
-     "./src/c/build_cuda/main --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler}"),
+     "./src/c/build_cuda/main --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --num-hidden-layers {num_hidden_layers} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler}"),
     ("NumPy",
-     "{python} src/python/models/mlp/mlp_numpy.py --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler}"),
+     "{python} src/python/models/mlp/mlp_numpy.py --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --num-hidden-layers {num_hidden_layers} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler}"),
     ("PyTorch (CPU)",
-     "{python} src/python/models/mlp/mlp_pytorch.py --dataset {dataset} --device cpu --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler}"),
+     "{python} src/python/models/mlp/mlp_pytorch.py --dataset {dataset} --device cpu --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --num-hidden-layers {num_hidden_layers} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler}"),
     ("PyTorch (CUDA)",
-     "{python} src/python/models/mlp/mlp_pytorch.py --dataset {dataset} --device cuda --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler}"),
+     "{python} src/python/models/mlp/mlp_pytorch.py --dataset {dataset} --device cuda --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --num-hidden-layers {num_hidden_layers} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler}"),
     ("Rust (CPU)",
-     "./src/rust/target/release/mlp-cpu --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler}"),
+     "./src/rust/target/release/mlp-cpu --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --num-hidden-layers {num_hidden_layers} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler}"),
     ("Rust (cuBLAS)",
-     "./src/rust/target/release/mlp-cuda-cublas --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler}"),
+     "./src/rust/target/release/mlp-cuda-cublas --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --num-hidden-layers {num_hidden_layers} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler}"),
     ("Rust (CUDA Kernels)",
-     "./src/rust/target/release/mlp-cuda-kernels --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler}"),
+     "./src/rust/target/release/mlp-cuda-kernels --dataset {dataset} --batch-size {batch_size} --num-samples {num_samples} --hidden-size {hidden_size} --num-hidden-layers {num_hidden_layers} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler}"),
 ]
 
 # CNN implementations — fixed architecture (LeNet-5), MNIST only.
@@ -94,6 +95,12 @@ CNN_IMPLEMENTATIONS = [
      "./src/rust/target/release/cnn-cuda-cublas --dataset mnist --batch-size {batch_size} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler}"),
     ("CNN Rust (CUDA Kernels)",
      "./src/rust/target/release/cnn-cuda-kernels --dataset mnist --batch-size {batch_size} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler}"),
+    ("CNN C (cuDNN)",
+     "./src/c/build_cuda/cnn_main --dataset mnist --batch-size {batch_size} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler} --backend cudnn"),
+    ("CNN Rust cuBLAS (cuDNN)",
+     "./src/rust/target/release/cnn-cuda-cublas --dataset mnist --batch-size {batch_size} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler} --backend cudnn"),
+    ("CNN Rust Kernels (cuDNN)",
+     "./src/rust/target/release/cnn-cuda-kernels --dataset mnist --batch-size {batch_size} --epochs {epochs} --learning-rate {learning_rate} --optimizer {optimizer} --scheduler {scheduler} --backend cudnn"),
 ]
 
 # Regex patterns for parsing standardized output
@@ -173,11 +180,14 @@ def is_available(label):
         "Rust (CPU)":           "src/rust/target/release/mlp-cpu",
         "Rust (cuBLAS)":        "src/rust/target/release/mlp-cuda-cublas",
         "Rust (CUDA Kernels)":  "src/rust/target/release/mlp-cuda-kernels",
-        "CNN C (CPU)":          "src/c/build_cpu/cnn_main",
-        "CNN C (CUDA)":         "src/c/build_cuda/cnn_main",
-        "CNN Rust (CPU)":       "src/rust/target/release/cnn-cpu",
-        "CNN Rust (cuBLAS)":    "src/rust/target/release/cnn-cuda-cublas",
-        "CNN Rust (CUDA Kernels)": "src/rust/target/release/cnn-cuda-kernels",
+        "CNN C (CPU)":              "src/c/build_cpu/cnn_main",
+        "CNN C (CUDA)":             "src/c/build_cuda/cnn_main",
+        "CNN C (cuDNN)":            "src/c/build_cuda/cnn_main",
+        "CNN Rust (CPU)":           "src/rust/target/release/cnn-cpu",
+        "CNN Rust (cuBLAS)":        "src/rust/target/release/cnn-cuda-cublas",
+        "CNN Rust (CUDA Kernels)":  "src/rust/target/release/cnn-cuda-kernels",
+        "CNN Rust cuBLAS (cuDNN)":  "src/rust/target/release/cnn-cuda-cublas",
+        "CNN Rust Kernels (cuDNN)": "src/rust/target/release/cnn-cuda-kernels",
     }
     if label in binary_map:
         return os.path.isfile(os.path.join(PROJECT_ROOT, binary_map[label]))
@@ -193,8 +203,9 @@ def is_available(label):
 
 
 def run_implementation(label, cmd_template, dataset, batch_size=4096,
-                       num_samples=0, hidden_size=512, epochs=1000,
-                       learning_rate=0.02, optimizer="sgd", scheduler="none"):
+                       num_samples=0, hidden_size=512, num_hidden_layers=1,
+                       epochs=1000, learning_rate=0.02, optimizer="sgd",
+                       scheduler="none", timeout=1800):
     """Run a single implementation and parse its output."""
     cmd = (cmd_template
            .replace("{dataset}", dataset)
@@ -202,6 +213,7 @@ def run_implementation(label, cmd_template, dataset, batch_size=4096,
            .replace("{batch_size}", str(batch_size))
            .replace("{num_samples}", str(num_samples))
            .replace("{hidden_size}", str(hidden_size))
+           .replace("{num_hidden_layers}", str(num_hidden_layers))
            .replace("{epochs}", str(epochs))
            .replace("{learning_rate}", str(learning_rate))
            .replace("{optimizer}", str(optimizer))
@@ -212,7 +224,7 @@ def run_implementation(label, cmd_template, dataset, batch_size=4096,
         build_dir = os.path.join(PROJECT_ROOT, "src", "c", "build_cpu")
         lib_dirs = [build_dir, os.path.join(build_dir, "utils"), os.path.join(build_dir, "models", "mlp"), os.path.join(build_dir, "models", "cnn")]
         env["LD_LIBRARY_PATH"] = ":".join(lib_dirs) + ":" + env.get("LD_LIBRARY_PATH", "")
-    elif label in ("C (CUDA)", "CNN C (CUDA)"):
+    elif label in ("C (CUDA)", "CNN C (CUDA)", "CNN C (cuDNN)"):
         build_dir = os.path.join(PROJECT_ROOT, "src", "c", "build_cuda")
         lib_dirs = [build_dir, os.path.join(build_dir, "utils"), os.path.join(build_dir, "models", "mlp"), os.path.join(build_dir, "models", "cnn")]
         env["LD_LIBRARY_PATH"] = ":".join(lib_dirs) + ":" + env.get("LD_LIBRARY_PATH", "")
@@ -220,17 +232,17 @@ def run_implementation(label, cmd_template, dataset, batch_size=4096,
     try:
         result = subprocess.run(
             cmd.split(), capture_output=True, text=True,
-            timeout=1800, cwd=PROJECT_ROOT, env=env)
+            timeout=timeout, cwd=PROJECT_ROOT, env=env)
         output = result.stdout + result.stderr
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-        print(f"  SKIP {label}: {e}")
+        tqdm.write(f"  SKIP {label}: {e}")
         return None
 
     if result.returncode != 0:
-        print(f"  FAIL {label}: exit code {result.returncode}")
+        tqdm.write(f"  FAIL {label}: exit code {result.returncode}")
         if result.stderr:
             for line in result.stderr.strip().split("\n")[:5]:
-                print(f"    {line}")
+                tqdm.write(f"    {line}")
         return None
 
     m_loss = PATTERN_LOSS.search(output)
@@ -240,7 +252,7 @@ def run_implementation(label, cmd_template, dataset, batch_size=4096,
     m_throughput = PATTERN_THROUGHPUT.search(output)
 
     if not all([m_loss, m_acc, m_train, m_eval]):
-        print(f"  FAIL {label}: could not parse output")
+        tqdm.write(f"  FAIL {label}: could not parse output")
         return None
 
     parsed = {
@@ -264,7 +276,7 @@ def run_implementation(label, cmd_template, dataset, batch_size=4096,
 # ---------------------------------------------------------------------------
 
 def _collect_throughput(available, runs, vary_param, vary_values, fixed_params,
-                        cache=None, cache_key=None):
+                        cache=None, cache_key=None, timeout=1800):
     """Run benchmarks varying one parameter, return {label: [throughputs]}.
 
     Cache format per entry: {"samples": [float, ...], "wall_times": [float, ...]}
@@ -279,13 +291,19 @@ def _collect_throughput(available, runs, vary_param, vary_values, fixed_params,
     if cache is not None and cache_key is not None:
         cached_exp = cache.get(cache_key, {})
 
+    total = len(vary_values) * len(available)
+    pbar = tqdm(total=total, desc=f"Scaling {vary_param}", unit="cfg",
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
+
     for val in vary_values:
         val_str = str(val)
-        print(f"\n--- {vary_param}={val} ---")
+        tqdm.write(f"\n--- {vary_param}={val} ---")
         params = dict(fixed_params)
         params[vary_param] = val
 
         for label, cmd_template in available:
+            pbar.set_postfix_str(f"{label} {vary_param}={val}")
+
             # Check cache first
             if label in cached_exp and val_str in cached_exp[label]:
                 entry = cached_exp[label][val_str]
@@ -296,33 +314,35 @@ def _collect_throughput(available, runs, vary_param, vary_values, fixed_params,
                     cv = float(np.std(samples) / mean_tp * 100) if n > 1 and mean_tp > 0 else 0.0
                     # Converged: CV < 3% with at least 3 samples — skip
                     if n >= 3 and cv < 3.0:
-                        print(f"  {label}... converged ({mean_tp:.0f} samples/s, n={n}, CV={cv:.1f}%)")
+                        tqdm.write(f"  {label}... converged ({mean_tp:.0f} samples/s, n={n}, CV={cv:.1f}%)")
                         throughput[label].append(mean_tp)
+                        pbar.update(1)
                         continue
                     # Not converged — use cached mean for throughput but fall through to re-run
                     cv_str = f", CV={cv:.1f}%" if n > 1 else ""
-                    print(f"  {label}... n={n}{cv_str}, running again...")
+                    tqdm.write(f"  {label}... n={n}{cv_str}, running again...")
                     # Fall through to run more samples
                 else:
-                    print(f"  {label}... cached (None)")
+                    tqdm.write(f"  {label}... cached (None)")
                     throughput[label].append(None)
+                    pbar.update(1)
                     continue
 
             runs_tp = []
             wall_times = []
             for run_idx in range(runs):
-                tag = f" (run {run_idx+1}/{runs})" if runs > 1 else ""
-                print(f"  {label}{tag}...")
                 t0 = time.monotonic()
                 r = run_implementation(
                     label, cmd_template, "generated",
                     batch_size=params.get("batch_size", 2048),
                     num_samples=params.get("num_samples", 100000),
                     hidden_size=params.get("hidden_size", 512),
+                    num_hidden_layers=params.get("num_hidden_layers", 1),
                     epochs=params.get("epochs", 500),
                     learning_rate=params.get("learning_rate", 0.02),
                     optimizer=params.get("optimizer", "sgd"),
                     scheduler=params.get("scheduler", "none"),
+                    timeout=timeout,
                 )
                 elapsed = time.monotonic() - t0
                 if r and "throughput" in r:
@@ -347,14 +367,17 @@ def _collect_throughput(available, runs, vary_param, vary_values, fixed_params,
                 n = len(all_samples)
                 if n > 1 and result and result > 0:
                     cv = float(np.std(all_samples) / np.mean(all_samples) * 100)
-                    print(f"    -> stored n={n}, CV={cv:.1f}%")
+                    tqdm.write(f"    -> stored n={n}, CV={cv:.1f}%")
                 elif n > 0:
-                    print(f"    -> stored n={n}")
+                    tqdm.write(f"    -> stored n={n}")
+
+            pbar.update(1)
 
         # Save cache after each x_value completes (ctrl-C safe)
         if cache is not None and cache_key is not None:
             _save_cache(cache)
 
+    pbar.close()
     return throughput
 
 
@@ -519,7 +542,9 @@ def _run_scheduled(schedule, cache):
         cache: the cache dict (modified in-place)
     """
     total = len(schedule)
-    for idx, item in enumerate(schedule, 1):
+    pbar = tqdm(total=total, desc="Scaling", unit="run",
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
+    for item in schedule:
         label = item["label"]
         params = item["params"]
         cache_key = item["cache_key"]
@@ -529,7 +554,7 @@ def _run_scheduled(schedule, cache):
         entry = cache.get(cache_key, {}).get(label, {}).get(val_str, {})
         n_before = len(entry.get("samples", []) if isinstance(entry, dict) else [])
 
-        print(f"\n  [{idx}/{total}] {label} {val_str} (n={n_before})...")
+        pbar.set_postfix_str(f"{label} {val_str} n={n_before}")
 
         t0 = time.monotonic()
         r = run_implementation(
@@ -537,6 +562,7 @@ def _run_scheduled(schedule, cache):
             batch_size=params.get("batch_size", 2048),
             num_samples=params.get("num_samples", 100000),
             hidden_size=params.get("hidden_size", 512),
+            num_hidden_layers=params.get("num_hidden_layers", 1),
             epochs=params.get("epochs", 500),
             learning_rate=params.get("learning_rate", 0.02),
             optimizer=params.get("optimizer", "sgd"),
@@ -560,12 +586,14 @@ def _run_scheduled(schedule, cache):
             n = len(all_samples)
             mean_tp = float(np.mean(all_samples))
             cv = float(np.std(all_samples) / mean_tp * 100) if n > 1 and mean_tp > 0 else 0.0
-            print(f"    -> {tp:.0f} samples/s, n={n}, CV={cv:.1f}%")
+            tqdm.write(f"    -> {tp:.0f} samples/s, n={n}, CV={cv:.1f}%")
         else:
-            print(f"    -> FAILED")
+            tqdm.write(f"    -> FAILED")
 
+        pbar.update(1)
         # Save cache after every run (ctrl-C safe)
         _save_cache(cache)
+    pbar.close()
 
 
 # ---------------------------------------------------------------------------
@@ -591,6 +619,7 @@ def run_scaling_experiment(available, runs, figs_dir, cfg, model="mlp",
     epochs = cfg["epochs"]
     labels = [l for l, _ in available]
     budget_seconds = cfg.get("budget_seconds", None)
+    scaling_timeout = cfg.get("scaling_timeout", 1800)
 
     # ================================================================
     #  Budget mode: variance-weighted scheduler
@@ -620,6 +649,9 @@ def run_scaling_experiment(available, runs, figs_dir, cfg, model="mlp",
                 _cache_key(model, "hidden_size"), "hidden_size",
                 cfg.get("hidden_size_range", (6, 12)),
                 {"num_samples": fixed_ns, "batch_size": fixed_bs, "epochs": epochs}))
+            # Note: num_hidden_layers is excluded from budget mode because it's a
+            # small discrete set [1..5] that doesn't benefit from log2 gap-filling.
+            # It runs via the grid-based _collect_throughput path instead.
 
         schedule = _build_schedule(cache, budget_experiments, available, budget_seconds)
         print(f"  Scheduled {len(schedule)} runs (est. {sum(s['est_wall'] for s in schedule):.0f}s)")
@@ -635,8 +667,12 @@ def run_scaling_experiment(available, runs, figs_dir, cfg, model="mlp",
 
         _collect_throughput(
             available, runs, "batch_size", batch_sizes,
-            {"epochs": epochs, "learning_rate": 0.32},
-            cache=cache, cache_key=_cache_key(model, "batch_size"))
+            {"epochs": epochs,
+             "learning_rate": cfg.get("learning_rate", 0.01),
+             "optimizer": cfg.get("optimizer", "sgd"),
+             "scheduler": cfg.get("scheduler", "none")},
+            cache=cache, cache_key=_cache_key(model, "batch_size"),
+            timeout=scaling_timeout)
 
     else:
         # MLP: full three-axis scaling
@@ -647,10 +683,17 @@ def run_scaling_experiment(available, runs, figs_dir, cfg, model="mlp",
         print(f"  Experiment 1: Dataset Size Scaling  (batch={fixed_bs}, epochs={epochs})")
         print("=" * 70)
 
+        train_params = {
+            "learning_rate": cfg.get("learning_rate", 0.02),
+            "optimizer": cfg.get("optimizer", "sgd"),
+            "scheduler": cfg.get("scheduler", "none"),
+        }
+
         _collect_throughput(
             available, runs, "num_samples", dataset_sizes,
-            {"batch_size": fixed_bs, "epochs": epochs},
-            cache=cache, cache_key=_cache_key(model, "dataset_size"))
+            {"batch_size": fixed_bs, "epochs": epochs, **train_params},
+            cache=cache, cache_key=_cache_key(model, "dataset_size"),
+            timeout=scaling_timeout)
 
         batch_sizes = cfg["batch_sizes"]
         fixed_ns = cfg["fixed_num_samples"]
@@ -661,8 +704,9 @@ def run_scaling_experiment(available, runs, figs_dir, cfg, model="mlp",
 
         _collect_throughput(
             available, runs, "batch_size", batch_sizes,
-            {"num_samples": fixed_ns, "epochs": epochs},
-            cache=cache, cache_key=_cache_key(model, "batch_size"))
+            {"num_samples": fixed_ns, "epochs": epochs, **train_params},
+            cache=cache, cache_key=_cache_key(model, "batch_size"),
+            timeout=scaling_timeout)
 
         hidden_sizes = cfg["hidden_sizes"]
 
@@ -672,8 +716,23 @@ def run_scaling_experiment(available, runs, figs_dir, cfg, model="mlp",
 
         _collect_throughput(
             available, runs, "hidden_size", hidden_sizes,
-            {"num_samples": fixed_ns, "batch_size": fixed_bs, "epochs": epochs},
-            cache=cache, cache_key=_cache_key(model, "hidden_size"))
+            {"num_samples": fixed_ns, "batch_size": fixed_bs, "epochs": epochs, **train_params},
+            cache=cache, cache_key=_cache_key(model, "hidden_size"),
+            timeout=scaling_timeout)
+
+        num_layers_values = cfg.get("num_hidden_layers", [1, 2, 3, 4, 5])
+        depth_hs = cfg.get("depth_fixed_hidden_size", 256)
+
+        print("\n" + "=" * 70)
+        print(f"  Experiment 4: Depth Scaling  (samples={fixed_ns}, batch={fixed_bs}, hidden={depth_hs}, epochs={epochs})")
+        print("=" * 70)
+
+        _collect_throughput(
+            available, runs, "num_hidden_layers", num_layers_values,
+            {"num_samples": fixed_ns, "batch_size": fixed_bs,
+             "hidden_size": depth_hs, "epochs": epochs, **train_params},
+            cache=cache, cache_key=_cache_key(model, "num_hidden_layers"),
+            timeout=scaling_timeout)
 
     # Save cache
     if use_cache:
@@ -712,13 +771,15 @@ def run_standard(datasets, available, runs, figs_dir, model="mlp",
                  epochs=500, batch_size=4096, learning_rate=0.02,
                  optimizer="sgd", scheduler="none"):
     results = defaultdict(dict)
+    total = len(datasets) * len(available) * runs
+    pbar = tqdm(total=total, desc="Benchmarking", unit="run",
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
     for dataset in datasets:
-        print(f"--- {dataset} ---")
+        tqdm.write(f"--- {dataset} ---")
         for label, cmd_template in available:
             run_results = []
             for run in range(runs):
-                tag = f" (run {run + 1}/{runs})" if runs > 1 else ""
-                print(f"  {label}{tag}...")
+                pbar.set_postfix_str(f"{label}" + (f" run {run+1}/{runs}" if runs > 1 else ""))
                 r = run_implementation(label, cmd_template, dataset,
                                        batch_size=batch_size,
                                        epochs=epochs,
@@ -727,6 +788,7 @@ def run_standard(datasets, available, runs, figs_dir, model="mlp",
                                        scheduler=scheduler)
                 if r is not None:
                     run_results.append(r)
+                pbar.update(1)
             if run_results:
                 accs = [r["accuracy"] for r in run_results]
                 losses = [r["loss"] for r in run_results]
@@ -740,7 +802,8 @@ def run_standard(datasets, available, runs, figs_dir, model="mlp",
                     "std_train": np.std(trains) if len(trains) > 1 else None,
                     "mean_eval": np.mean(evals),
                 }
-        print()
+    pbar.close()
+    print()
     print_markdown_table(results)
     generate_charts(results, figs_dir, model=model)
 
@@ -826,6 +889,8 @@ def run_unified_scaling(budget_seconds, bench_cfg, figs_dir_root, cfg_by_model,
                     "label": label,
                     "cmd_template": cmd_template,
                 })
+                # Note: num_hidden_layers excluded from unified budget scheduling —
+                # small discrete set [1..5], runs via grid-based path instead.
 
     # 2. Count samples per experiment from cache and compute stats
     def _experiment_stats(exp):
@@ -900,6 +965,7 @@ def run_unified_scaling(budget_seconds, bench_cfg, figs_dir_root, cfg_by_model,
                 batch_size=params.get("batch_size", 2048),
                 num_samples=params.get("num_samples", 100000),
                 hidden_size=params.get("hidden_size", 512),
+                num_hidden_layers=params.get("num_hidden_layers", 1),
                 epochs=params.get("epochs", 500),
                 learning_rate=params.get("learning_rate", 0.02),
                 optimizer=params.get("optimizer", "sgd"),
@@ -976,6 +1042,7 @@ def run_unified_scaling(budget_seconds, bench_cfg, figs_dir_root, cfg_by_model,
                 batch_size=params.get("batch_size", 2048),
                 num_samples=params.get("num_samples", 100000),
                 hidden_size=params.get("hidden_size", 512),
+                num_hidden_layers=params.get("num_hidden_layers", 1),
                 epochs=params.get("epochs", 500),
                 learning_rate=params.get("learning_rate", 0.02),
                 optimizer=params.get("optimizer", "sgd"),
@@ -1058,6 +1125,10 @@ def main():
                         help="Comma-separated (config default: 256..32K)")
     parser.add_argument("--scaling-hidden-sizes", type=str, default=None,
                         help="Comma-separated (config default: 64..4096)")
+    parser.add_argument("--scaling-num-layers", type=str, default=None,
+                        help="Comma-separated num_hidden_layers values (config default: 1,2,3,4,5)")
+    parser.add_argument("--scaling-timeout", type=int, default=None,
+                        help="Timeout in seconds per scaling run (config default: 120)")
     args = parser.parse_args()
 
     # Load layered config: base.yaml <- models/{model}.yaml <- local.yaml
@@ -1115,6 +1186,8 @@ def main():
                 "dataset_sizes": _parse_list(args.scaling_dataset_sizes) or mlp_scale["dataset_sizes"],
                 "batch_sizes": _parse_list(args.scaling_batch_sizes) or mlp_scale["batch_sizes"],
                 "hidden_sizes": _parse_list(args.scaling_hidden_sizes) or mlp_scale["hidden_sizes"],
+                "num_hidden_layers": _parse_list(args.scaling_num_layers) or mlp_scale.get("num_hidden_layers", [1, 2, 3, 4, 5]),
+                "depth_fixed_hidden_size": mlp_scale.get("depth_fixed_hidden_size", 256),
             },
             "cnn": {
                 "epochs": args.scaling_epochs or cnn_scale["epochs"],
@@ -1146,13 +1219,21 @@ def main():
         def _parse_list(arg):
             return [int(x) for x in arg.split(",")] if arg else None
 
+        scaling_timeout = args.scaling_timeout or scale_cfg.get("timeout", 120)
+
         if args.model == "cnn":
             # CNN: only batch size scaling (MNIST is fixed 60K, architecture is fixed)
+            train_cfg = config.get("training", {})
             cfg = {
-                "epochs": args.scaling_epochs or scale_cfg["epochs"],
+                "epochs": args.scaling_epochs or scale_cfg.get("epochs", 5),
                 "batch_sizes": _parse_list(args.scaling_batch_sizes) or scale_cfg["batch_sizes"],
+                "learning_rate": args.learning_rate or train_cfg.get("learning_rate", 0.01),
+                "optimizer": args.optimizer or train_cfg.get("optimizer", "sgd"),
+                "scheduler": args.scheduler or train_cfg.get("scheduler") or "none",
+                "scaling_timeout": scaling_timeout,
             }
         else:
+            train_cfg = config.get("training", {})
             cfg = {
                 "epochs": args.scaling_epochs or scale_cfg["epochs"],
                 "fixed_batch_size": args.scaling_fixed_bs or scale_cfg["fixed_batch_size"],
@@ -1160,6 +1241,12 @@ def main():
                 "dataset_sizes": _parse_list(args.scaling_dataset_sizes) or scale_cfg["dataset_sizes"],
                 "batch_sizes": _parse_list(args.scaling_batch_sizes) or scale_cfg["batch_sizes"],
                 "hidden_sizes": _parse_list(args.scaling_hidden_sizes) or scale_cfg["hidden_sizes"],
+                "num_hidden_layers": _parse_list(args.scaling_num_layers) or scale_cfg.get("num_hidden_layers", [1, 2, 3, 4, 5]),
+                "depth_fixed_hidden_size": scale_cfg.get("depth_fixed_hidden_size", 256),
+                "learning_rate": args.learning_rate or train_cfg.get("learning_rate", 0.02),
+                "optimizer": args.optimizer or train_cfg.get("optimizer", "sgd"),
+                "scheduler": args.scheduler or train_cfg.get("scheduler") or "none",
+                "scaling_timeout": scaling_timeout,
             }
         if args.budget is not None:
             cfg["budget_seconds"] = args.budget * 60

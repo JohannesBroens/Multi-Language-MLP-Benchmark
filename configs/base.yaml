@@ -1,8 +1,8 @@
 # Base configuration — MLP defaults (all models inherit from this)
 
 pipeline:
-  phases: [tune, benchmark]
-  force_retune: false
+  phases: [tune, benchmark, scaling, plot]
+  force_retune: true
 
 build:
   c_cpu: true
@@ -17,10 +17,10 @@ build:
 training:
   epochs: 500
   learning_rate: 0.03
-  batch_size: 8192
-  hidden_size: 128
-  optimizer: sgd
-  scheduler: null
+  batch_size: 4096
+  hidden_size: 256
+  optimizer: adam # sgd | adam
+  scheduler: cosine # null | cosine
   warmup_fraction: 0.05
   lr_min: 1.0e-6
   adam_beta1: 0.9
@@ -33,24 +33,29 @@ tuning:
   sweep_epochs: 5              # epochs for Phase 1 throughput sweep
   acc_tolerance: 1.0           # pick highest-throughput config within this % of peak accuracy
   throughput_tolerance: 0.05   # pick largest batch_size within 5% of peak throughput
-  batch_sizes: [1024, 2048, 4096, 8192, 16384]
-  sgd_lr_range: [0.01, 0.02, 0.05, 0.1, 0.2, 0.5]
+  min_batch_size: 256              # Phase 1 starts here, doubles until OOM/VRAM limit
+  vram_safety: 0.85               # stop doubling when VRAM usage >= 90%
+  sgd_lr_range: [0.01, 0.05, 0.1, 0.2, 0.5, 1.0]
   adam_lr_range: [0.0001, 0.0005, 0.001, 0.005, 0.01]
 
 benchmark:
   mode: standard
   datasets: [generated, iris, breast-cancer]
-  runs: 3
+  runs: 1 # number of runs per dataset per model (for averaging)
   unified: true
   min_samples: 3
+  max_batch_size: 16384  # cap tuned batch_size for standard benchmarks (GPU-tuned values OOM on CPU)
 
 scaling:
-  epochs: 200
-  fixed_batch_size: 8192
+  timeout: 120  # seconds per run; CPU implementations timeout gracefully at large param values
+  epochs: 10
+  fixed_batch_size: 2048
   fixed_num_samples: 262144
   dataset_sizes: [8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152, 4194304]
-  batch_sizes: [256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
-  hidden_sizes: [64, 128, 256, 512, 1024, 2048, 4096]
+  batch_sizes: [256, 512, 1024, 2048, 4096, 8192, 16384]
+  hidden_sizes: [64, 128, 256, 512, 1024, 2048, 4096, 8192]
+  num_hidden_layers: [1, 2, 3, 4, 5]
+  depth_fixed_hidden_size: 256
 
 plotting:
   dpi: 150

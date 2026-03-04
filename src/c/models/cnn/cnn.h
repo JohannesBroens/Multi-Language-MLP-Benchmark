@@ -48,11 +48,12 @@ void cnn_free(CNN *cnn);
 /* Mini-batch training with cross-entropy loss */
 void cnn_train(CNN *cnn, float *inputs, int *targets, int num_samples,
                int batch_size, int num_epochs, float learning_rate,
-               OptimizerType optimizer, SchedulerType scheduler);
+               OptimizerType optimizer, SchedulerType scheduler,
+               int use_cudnn);
 
 /* Compute average loss and accuracy on a dataset */
 void cnn_evaluate(CNN *cnn, float *inputs, int *targets, int num_samples,
-                  float *loss, float *accuracy);
+                  float *loss, float *accuracy, int use_cudnn);
 
 /* --- im2col / col2im utilities --- */
 

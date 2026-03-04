@@ -14,61 +14,122 @@ const DEFAULT_LR: f32 = 0.02;
 // ---------------------------------------------------------------------------
 
 struct Mlp {
-    input_size: usize,
-    hidden_size: usize,
-    output_size: usize,
-    input_weights: Vec<f32>,   // [input_size  x hidden_size]
-    output_weights: Vec<f32>,  // [hidden_size x output_size]
-    hidden_biases: Vec<f32>,   // [hidden_size]
-    output_biases: Vec<f32>,   // [output_size]
+    layer_sizes: Vec<usize>,    // [input, hid, ..., hid, output]
+    weights: Vec<Vec<f32>>,     // weights[i]: [layer_sizes[i] x layer_sizes[i+1]]
+    biases: Vec<Vec<f32>>,      // biases[i]:  [layer_sizes[i+1]]
 }
 
 impl Mlp {
     /// Allocate parameters and apply Xavier uniform initialization.
-    fn new(input_size: usize, hidden_size: usize, output_size: usize) -> Self {
+    fn new(input_size: usize, hidden_size: usize, output_size: usize,
+           num_hidden_layers: usize) -> Self {
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as u32;
         let mut rng = Xorshift32::new(seed);
 
-        let mut input_weights = vec![0.0f32; input_size * hidden_size];
-        xavier_init(&mut input_weights, input_size, &mut rng);
+        let mut layer_sizes = Vec::with_capacity(num_hidden_layers + 2);
+        layer_sizes.push(input_size);
+        for _ in 0..num_hidden_layers {
+            layer_sizes.push(hidden_size);
+        }
+        layer_sizes.push(output_size);
 
-        let mut output_weights = vec![0.0f32; hidden_size * output_size];
-        xavier_init(&mut output_weights, hidden_size, &mut rng);
+        let num_layers = layer_sizes.len() - 1;
+        let mut weights = Vec::with_capacity(num_layers);
+        let mut biases = Vec::with_capacity(num_layers);
 
-        Mlp {
-            input_size,
-            hidden_size,
-            output_size,
-            input_weights,
-            output_weights,
-            hidden_biases: vec![0.0; hidden_size],
-            output_biases: vec![0.0; output_size],
+        for i in 0..num_layers {
+            let fan_in = layer_sizes[i];
+            let fan_out = layer_sizes[i + 1];
+            let mut w = vec![0.0f32; fan_in * fan_out];
+            xavier_init(&mut w, fan_in, &mut rng);
+            weights.push(w);
+            biases.push(vec![0.0f32; fan_out]);
+        }
+
+        Mlp { layer_sizes, weights, biases }
+    }
+
+    fn num_layers(&self) -> usize {
+        self.layer_sizes.len() - 1
+    }
+
+    fn num_hidden(&self) -> usize {
+        self.num_layers() - 1
+    }
+
+    /// Batched forward pass storing all hidden activations for backward.
+    fn forward_batch(&self, x: &[f32], bs: usize, acts: &mut [Vec<f32>], output: &mut [f32]) {
+        let nl = self.num_layers();
+        let num_hidden = self.num_hidden();
+
+        for i in 0..nl {
+            let in_dim = self.layer_sizes[i];
+            let out_dim = self.layer_sizes[i + 1];
+
+            if i < num_hidden {
+                // Use split_at_mut to get disjoint borrows of acts[i-1] and acts[i]
+                if i == 0 {
+                    sgemm_nn(bs, out_dim, in_dim, x, &self.weights[i], &mut acts[i]);
+                    bias_relu(&mut acts[i][..bs * out_dim], &self.biases[i], bs, out_dim);
+                } else {
+                    let (prev, cur_and_rest) = acts.split_at_mut(i);
+                    let input_act = &prev[i - 1];
+                    let act = &mut cur_and_rest[0];
+                    sgemm_nn(bs, out_dim, in_dim, input_act, &self.weights[i], act);
+                    bias_relu(&mut act[..bs * out_dim], &self.biases[i], bs, out_dim);
+                }
+            } else {
+                let input_act: &[f32] = if i == 0 { x } else { &acts[i - 1] };
+                sgemm_nn(bs, out_dim, in_dim, input_act, &self.weights[i], output);
+                bias_softmax(&mut output[..bs * out_dim], &self.biases[i], bs, out_dim);
+            }
         }
     }
 
-    /// Batched forward pass: hidden = relu(X @ W1 + b1), output = softmax(hidden @ W2 + b2).
-    fn forward_batch(&self, x: &[f32], bs: usize, hidden: &mut [f32], output: &mut [f32]) {
-        let inp = self.input_size;
-        let hid = self.hidden_size;
-        let out = self.output_size;
+    /// Forward pass for evaluation (ping-pong buffers, no activation storage).
+    fn forward_eval(&self, x: &[f32], bs: usize, output: &mut [f32]) {
+        let nl = self.num_layers();
+        let num_hidden = self.num_hidden();
+        let hid = if num_hidden > 0 { self.layer_sizes[1] } else { 0 };
 
-        // hidden[bs, hid] = X[bs, inp] @ W1[inp, hid]
-        sgemm_nn(bs, hid, inp, x, &self.input_weights, hidden);
+        // Combined buffer: [buf0 | buf1], split with split_at_mut for disjoint access.
+        let buf_len = bs * hid;
+        let mut bufs = vec![0.0f32; 2 * buf_len];
 
-        // Add hidden bias + ReLU
-        bias_relu(&mut hidden[..bs * hid], &self.hidden_biases, bs, hid);
+        for i in 0..nl {
+            let in_dim = self.layer_sizes[i];
+            let out_dim = self.layer_sizes[i + 1];
 
-        // output[bs, out] = hidden[bs, hid] @ W2[hid, out]
-        sgemm_nn(bs, out, hid, &hidden[..bs * hid], &self.output_weights, output);
-
-        // Add output bias + softmax per row
-        bias_softmax(&mut output[..bs * out], &self.output_biases, bs, out);
+            if i < num_hidden {
+                let (b0, b1) = bufs.split_at_mut(buf_len);
+                if i == 0 {
+                    // input from x, output to buf0 (even layer 0)
+                    sgemm_nn(bs, out_dim, in_dim, x, &self.weights[i], b0);
+                    bias_relu(&mut b0[..bs * out_dim], &self.biases[i], bs, out_dim);
+                } else {
+                    // Ping-pong: read from previous, write to current
+                    let (src, dst) = if i % 2 == 0 { (b1 as &[f32], b0) } else { (b0 as &[f32], b1) };
+                    sgemm_nn(bs, out_dim, in_dim, src, &self.weights[i], dst);
+                    bias_relu(&mut dst[..bs * out_dim], &self.biases[i], bs, out_dim);
+                }
+            } else {
+                let input_act: &[f32] = if i == 0 {
+                    x
+                } else if (i - 1) % 2 == 0 {
+                    &bufs[..buf_len]
+                } else {
+                    &bufs[buf_len..]
+                };
+                sgemm_nn(bs, out_dim, in_dim, input_act, &self.weights[i], output);
+                bias_softmax(&mut output[..bs * out_dim], &self.biases[i], bs, out_dim);
+            }
+        }
     }
 
-    /// Mini-batch SGD training with cross-entropy loss.
+    /// Mini-batch training with cross-entropy loss.
     fn train(
         &mut self,
         inputs: &[f32],
@@ -80,24 +141,48 @@ impl Mlp {
         optimizer: &str,
         scheduler: &str,
     ) {
-        let inp = self.input_size;
-        let hid = self.hidden_size;
-        let out = self.output_size;
+        let nl = self.num_layers();
+        let num_hidden = self.num_hidden();
+        let out = *self.layer_sizes.last().unwrap();
+        let hid = if num_hidden > 0 { self.layer_sizes[1] } else { 0 };
 
-        let mut hidden = vec![0.0f32; batch_size * hid];
+        // Hidden activation buffers
+        let mut acts: Vec<Vec<f32>> = (0..num_hidden)
+            .map(|_| vec![0.0f32; batch_size * hid])
+            .collect();
+
         let mut output = vec![0.0f32; batch_size * out];
         let mut d_output = vec![0.0f32; batch_size * out];
-        let mut d_hidden = vec![0.0f32; batch_size * hid];
-        let mut grad_w1 = vec![0.0f32; inp * hid];
-        let mut grad_w2 = vec![0.0f32; hid * out];
-        let mut grad_b1 = vec![0.0f32; hid];
-        let mut grad_b2 = vec![0.0f32; out];
 
+        // Gradient propagation (ping-pong via combined buffer + split_at_mut)
+        let max_dim = if hid > out { hid } else { out };
+        let grad_buf_len = batch_size * max_dim;
+        let mut d_grad_bufs = vec![0.0f32; 2 * grad_buf_len];
+
+        // Per-layer gradients
+        let mut grad_w: Vec<Vec<f32>> = (0..nl)
+            .map(|i| vec![0.0f32; self.layer_sizes[i] * self.layer_sizes[i + 1]])
+            .collect();
+        let mut grad_b: Vec<Vec<f32>> = (0..nl)
+            .map(|i| vec![0.0f32; self.layer_sizes[i + 1]])
+            .collect();
+
+        // Adam state
         let use_adam = optimizer == "adam";
-        let mut adam_w1 = if use_adam { Some(AdamState::new(inp * hid)) } else { None };
-        let mut adam_w2 = if use_adam { Some(AdamState::new(hid * out)) } else { None };
-        let mut adam_b1 = if use_adam { Some(AdamState::new(hid)) } else { None };
-        let mut adam_b2 = if use_adam { Some(AdamState::new(out)) } else { None };
+        let mut adam_w: Vec<Option<AdamState>> = (0..nl).map(|i| {
+            if use_adam {
+                Some(AdamState::new(self.layer_sizes[i] * self.layer_sizes[i + 1]))
+            } else {
+                None
+            }
+        }).collect();
+        let mut adam_b: Vec<Option<AdamState>> = (0..nl).map(|i| {
+            if use_adam {
+                Some(AdamState::new(self.layer_sizes[i + 1]))
+            } else {
+                None
+            }
+        }).collect();
         let mut step: u32 = 0;
 
         let num_batches = (num_samples + batch_size - 1) / batch_size;
@@ -118,14 +203,15 @@ impl Mlp {
             for batch in 0..num_batches {
                 let start = batch * batch_size;
                 let bs = batch_size.min(num_samples - start);
+                let inp = self.layer_sizes[0];
 
                 let x = &inputs[start * inp..];
                 let y = &targets[start..];
 
                 // ---- Forward ----
-                self.forward_batch(x, bs, &mut hidden, &mut output);
+                self.forward_batch(x, bs, &mut acts, &mut output);
 
-                // ---- Loss + d_output = softmax - one_hot ----
+                // ---- Loss + d_output ----
                 let batch_loss = cross_entropy_grad(
                     &output[..bs * out], &y[..bs],
                     &mut d_output[..bs * out], bs, out,
@@ -133,48 +219,81 @@ impl Mlp {
                 epoch_loss += batch_loss;
 
                 // ---- Backward ----
+                // dcur_id tracks which buffer holds the current gradient
+                // 0 = d_output, 1 = d_grad_bufs[..grad_buf_len], 2 = d_grad_bufs[grad_buf_len..]
+                let mut dcur_id: u8 = 0;
 
-                // grad_W2[hid, out] = hidden^T @ d_output
-                sgemm_tn(hid, out, bs, &hidden, &d_output, &mut grad_w2);
+                for layer in (0..nl).rev() {
+                    let fan_in = self.layer_sizes[layer];
+                    let fan_out = self.layer_sizes[layer + 1];
+                    let input_act: &[f32] = if layer == 0 { x } else { &acts[layer - 1] };
 
-                // grad_b2 = column sum of d_output
-                col_sum(&d_output[..bs * out], &mut grad_b2, bs, out);
+                    let dcur_slice: &[f32] = match dcur_id {
+                        0 => &d_output,
+                        1 => &d_grad_bufs[..grad_buf_len],
+                        _ => &d_grad_bufs[grad_buf_len..],
+                    };
 
-                // d_hidden = d_output @ W2^T, then ReLU mask
-                sgemm_nt(bs, hid, out, &d_output, &self.output_weights, &mut d_hidden);
+                    // grad_W = input_act^T @ dcur
+                    sgemm_tn(fan_in, fan_out, bs, input_act, dcur_slice, &mut grad_w[layer]);
 
-                let elem = bs as i64 * hid as i64;
-                if elem > OMP_ELEM_THRESHOLD {
-                    d_hidden[..bs * hid]
-                        .par_iter_mut()
-                        .zip(hidden[..bs * hid].par_iter())
-                        .for_each(|(dh, &h)| {
-                            if h <= 0.0 { *dh = 0.0; }
-                        });
-                } else {
-                    relu_backward(&mut d_hidden[..bs * hid], &hidden[..bs * hid]);
+                    // grad_b = col_sum(dcur)
+                    col_sum(&dcur_slice[..bs * fan_out], &mut grad_b[layer], bs, fan_out);
+
+                    if layer > 0 {
+                        // d_next = dcur @ W^T
+                        let next_id: u8 = match dcur_id {
+                            0 => 1,
+                            1 => 2,
+                            _ => 1,
+                        };
+
+                        {
+                            // Use split_at_mut for disjoint access to the two gradient buffers.
+                            // When dcur_id == 0, source is d_output (separate), dest is buf 1.
+                            let (gb0, gb1) = d_grad_bufs.split_at_mut(grad_buf_len);
+                            let (dcur_ref, dnext): (&[f32], &mut [f32]) = match (dcur_id, next_id) {
+                                (0, 1) => (&d_output, gb0),
+                                (0, _) => (&d_output, gb1),
+                                (1, 2) => (gb0 as &[f32], gb1),
+                                (2, 1) => (gb1 as &[f32], gb0),
+                                // Shouldn't happen, but be safe
+                                _ => (&d_output, gb0),
+                            };
+                            sgemm_nt(bs, fan_in, fan_out, dcur_ref, &self.weights[layer], dnext);
+
+                            let elem = bs as i64 * fan_in as i64;
+                            if elem > OMP_ELEM_THRESHOLD {
+                                dnext[..bs * fan_in]
+                                    .par_iter_mut()
+                                    .zip(acts[layer - 1][..bs * fan_in].par_iter())
+                                    .for_each(|(dh, &h)| {
+                                        if h <= 0.0 { *dh = 0.0; }
+                                    });
+                            } else {
+                                relu_backward(&mut dnext[..bs * fan_in], &acts[layer - 1][..bs * fan_in]);
+                            }
+                        }
+                        dcur_id = next_id;
+                    }
                 }
-
-                // grad_W1[inp, hid] = X^T @ d_hidden
-                sgemm_tn(inp, hid, bs, x, &d_hidden, &mut grad_w1);
-
-                // grad_b1 = column sum of d_hidden
-                col_sum(&d_hidden[..bs * hid], &mut grad_b1, bs, hid);
 
                 // ---- Parameter update ----
                 let lr_s = lr / bs as f32;
 
-                if let Some(ref mut a) = adam_w1 {
+                if use_adam {
                     step += 1;
-                    adam_update(&mut self.input_weights, &grad_w1, a, lr_s, 0.9, 0.999, 1e-8, step);
-                    adam_update(&mut self.output_weights, &grad_w2, adam_w2.as_mut().unwrap(), lr_s, 0.9, 0.999, 1e-8, step);
-                    adam_update(&mut self.hidden_biases, &grad_b1, adam_b1.as_mut().unwrap(), lr_s, 0.9, 0.999, 1e-8, step);
-                    adam_update(&mut self.output_biases, &grad_b2, adam_b2.as_mut().unwrap(), lr_s, 0.9, 0.999, 1e-8, step);
+                    for i in 0..nl {
+                        adam_update(&mut self.weights[i], &grad_w[i],
+                                    adam_w[i].as_mut().unwrap(), lr, 0.9, 0.999, 1e-8, step);
+                        adam_update(&mut self.biases[i], &grad_b[i],
+                                    adam_b[i].as_mut().unwrap(), lr, 0.9, 0.999, 1e-8, step);
+                    }
                 } else {
-                    sgd_update(&mut self.input_weights, &grad_w1, lr_s);
-                    sgd_update(&mut self.output_weights, &grad_w2, lr_s);
-                    sgd_update(&mut self.hidden_biases, &grad_b1, lr_s);
-                    sgd_update(&mut self.output_biases, &grad_b2, lr_s);
+                    for i in 0..nl {
+                        sgd_update(&mut self.weights[i], &grad_w[i], lr_s);
+                        sgd_update(&mut self.biases[i], &grad_b[i], lr_s);
+                    }
                 }
             }
 
@@ -190,13 +309,10 @@ impl Mlp {
 
     /// Evaluate on test set: average cross-entropy loss and accuracy %.
     fn evaluate(&self, inputs: &[f32], targets: &[i32], num_samples: usize) -> (f32, f32) {
-        let hid = self.hidden_size;
-        let out = self.output_size;
+        let out = *self.layer_sizes.last().unwrap();
 
-        let mut hidden = vec![0.0f32; num_samples * hid];
         let mut output = vec![0.0f32; num_samples * out];
-
-        self.forward_batch(inputs, num_samples, &mut hidden, &mut output);
+        self.forward_eval(inputs, num_samples, &mut output);
 
         let mut total_loss = 0.0f32;
         let mut correct = 0i32;
@@ -257,12 +373,13 @@ fn main() {
 
     println!("Train: {} samples, Test: {} samples", train_size, test_size);
 
-    let mut mlp = Mlp::new(dataset.input_size, args.hidden_size, dataset.output_size);
+    let mut mlp = Mlp::new(dataset.input_size, args.hidden_size, dataset.output_size,
+                           args.num_hidden_layers);
     let learning_rate = if args.learning_rate > 0.0 { args.learning_rate } else { DEFAULT_LR };
 
     println!(
-        "\nTraining ({} epochs, batch_size={}, hidden={}, lr={:.4})...",
-        args.epochs, args.batch_size, args.hidden_size, learning_rate
+        "\nTraining ({} epochs, batch_size={}, hidden={}, layers={}, lr={:.4})...",
+        args.epochs, args.batch_size, args.hidden_size, args.num_hidden_layers, learning_rate
     );
 
     let t_start = Instant::now();

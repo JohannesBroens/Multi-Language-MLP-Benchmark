@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """PyTorch MLP implementation — same architecture and hyperparameters as C.
 
-Single hidden layer, ReLU activation, softmax output, cross-entropy loss.
+Multi-hidden-layer MLP, ReLU activation, softmax output, cross-entropy loss.
 Manual Xavier uniform initialization to match C's sqrt(2/fan_in) scale.
 
 Usage:
@@ -54,25 +54,27 @@ torch.set_num_interop_threads(min(_phys_cores, 4))
 
 
 class MLP(nn.Module):
-    """Single hidden-layer MLP matching C architecture."""
+    """Multi-hidden-layer MLP matching C architecture."""
 
-    def __init__(self, input_size, hidden_size, output_size):
+    def __init__(self, input_size, hidden_size, output_size, num_hidden_layers=1):
         super().__init__()
-        self.fc1 = nn.Linear(input_size, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, output_size)
+        sizes = [input_size] + [hidden_size] * num_hidden_layers + [output_size]
+        self.layers = nn.ModuleList(
+            nn.Linear(sizes[i], sizes[i + 1]) for i in range(len(sizes) - 1)
+        )
 
         # Manual Xavier init matching C: scale = sqrt(2/fan_in), uniform [-scale, +scale]
-        scale_ih = (2.0 / input_size) ** 0.5
-        nn.init.uniform_(self.fc1.weight, -scale_ih, scale_ih)
-        nn.init.zeros_(self.fc1.bias)
-
-        scale_ho = (2.0 / hidden_size) ** 0.5
-        nn.init.uniform_(self.fc2.weight, -scale_ho, scale_ho)
-        nn.init.zeros_(self.fc2.bias)
+        for layer in self.layers:
+            scale = (2.0 / layer.in_features) ** 0.5
+            nn.init.uniform_(layer.weight, -scale, scale)
+            nn.init.zeros_(layer.bias)
 
     def forward(self, x):
-        h = torch.relu(self.fc1(x))
-        return self.fc2(h)  # raw logits — CrossEntropyLoss applies softmax
+        for i, layer in enumerate(self.layers):
+            x = layer(x)
+            if i < len(self.layers) - 1:
+                x = torch.relu(x)
+        return x  # raw logits — CrossEntropyLoss applies softmax
 
 
 def train_model(model, X_train, y_train, device,
@@ -162,6 +164,7 @@ def main():
     parser.add_argument("--num-samples", type=int, default=0,
                         help="Number of samples for generated dataset (0 = default)")
     parser.add_argument("--hidden-size", type=int, default=64)
+    parser.add_argument("--num-hidden-layers", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--learning-rate", type=float, default=0.02)
     parser.add_argument("--optimizer", default="sgd", choices=["sgd", "adam"])
@@ -193,9 +196,9 @@ def main():
     input_size = X.shape[1]
     print(f"Dataset: {args.dataset}  ({len(X)} samples, {input_size} features, {num_classes} classes)")
     print(f"Train: {len(X_train)} samples, Test: {len(X_test)} samples")
-    print(f"\nTraining ({num_epochs} epochs, batch_size={batch_size}, hidden={hidden_size}, lr={learning_rate:.4f})...")
+    print(f"\nTraining ({num_epochs} epochs, batch_size={batch_size}, hidden={hidden_size}, layers={args.num_hidden_layers}, lr={learning_rate:.4f})...")
 
-    model = MLP(input_size, hidden_size, num_classes).to(device)
+    model = MLP(input_size, hidden_size, num_classes, num_hidden_layers=args.num_hidden_layers).to(device)
 
     # CUDA warmup: trigger JIT compilation before timing
     if args.device == "cuda":

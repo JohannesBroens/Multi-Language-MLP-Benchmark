@@ -88,9 +88,8 @@ def phase_tune(config, model):
     run_tuning(config, model, cache_path)
 
 
-def phase_benchmark(config, model):
-    """Run benchmarks using config values (with tuned params if available)."""
-    # Load tuned hyperparameters if available
+def _load_tuned_params(config, model):
+    """Load tuned hyperparameters into config['training'] if available."""
     tuning_path = os.path.join(PROJECT_ROOT, "results", "cache", f"tuning_{model}.yaml")
     if os.path.exists(tuning_path):
         import yaml
@@ -110,6 +109,20 @@ def phase_benchmark(config, model):
             print(f"Loaded tuned params: bs={best.get('batch_size')}, "
                   f"lr={best.get('learning_rate')}, opt={best.get('optimizer')}, "
                   f"sched={best.get('scheduler')}{extra}")
+
+            # Cap batch_size for standard benchmarks — tuning optimizes for GPU
+            # throughput, but CPU implementations OOM at very large batch sizes.
+            max_bs = config.get("benchmark", {}).get("max_batch_size",
+                         config.get("scaling", {}).get("batch_sizes", [16384])[-1])
+            if config["training"]["batch_size"] > max_bs:
+                print(f"  Capping batch_size {config['training']['batch_size']} -> {max_bs} "
+                      f"(benchmark.max_batch_size)")
+                config["training"]["batch_size"] = max_bs
+
+
+def phase_benchmark(config, model):
+    """Run standard benchmarks using config values (with tuned params if available)."""
+    _load_tuned_params(config, model)
 
     print(f"=== Benchmarking {model.upper()} ===")
     bench = config.get("benchmark", {})
@@ -133,6 +146,36 @@ def phase_benchmark(config, model):
     subprocess.run(cmd, check=True)
 
 
+def phase_scaling(config, model):
+    """Run scaling benchmarks (throughput vs batch/dataset/hidden size)."""
+    _load_tuned_params(config, model)
+
+    print(f"=== Scaling benchmark {model.upper()} ===")
+    training = config.get("training", {})
+    scaling = config.get("scaling", {})
+    bench = config.get("benchmark", {})
+
+    cmd = [
+        PYTHON, os.path.join(SCRIPT_DIR, "benchmark.py"),
+        "--mode", "scaling",
+        "--model", model,
+        "--runs", str(bench.get("scaling_runs", 1)),
+        "--learning-rate", str(training.get("learning_rate", 0.02)),
+        "--optimizer", str(training.get("optimizer", "sgd")),
+        "--scheduler", str(training.get("scheduler") or "none"),
+    ]
+    # Pass scaling-specific epochs if configured
+    scale_epochs = scaling.get("epochs")
+    if scale_epochs:
+        cmd.extend(["--scaling-epochs", str(scale_epochs)])
+
+    scale_timeout = scaling.get("timeout")
+    if scale_timeout:
+        cmd.extend(["--scaling-timeout", str(scale_timeout)])
+
+    subprocess.run(cmd, check=True)
+
+
 def phase_plot(config, model):
     """Generate plots from cached benchmark data."""
     print(f"=== Generating {model.upper()} plots ===")
@@ -146,16 +189,15 @@ def run_for_model(model, command, phases):
 
     if command == "all":
         # Build is handled separately (once for all models)
-        for phase_name in config.get("pipeline", {}).get("phases", ["tune", "benchmark"]):
+        for phase_name in config.get("pipeline", {}).get("phases", ["tune", "benchmark", "plot"]):
             phases[phase_name](config, model)
-        phase_plot(config, model)
     else:
         phases[command](config, model)
 
 
 def main():
     parser = argparse.ArgumentParser(description="ML-in-C unified pipeline")
-    parser.add_argument("command", choices=["all", "build", "tune", "benchmark", "plot"],
+    parser.add_argument("command", choices=["all", "build", "tune", "benchmark", "scaling", "plot"],
                         help="Pipeline phase to run")
     parser.add_argument("--model", default="all", choices=["all", "mlp", "cnn"],
                         help="Model to operate on (default: all)")
@@ -168,6 +210,7 @@ def main():
         "build": lambda config, model: None,  # handled separately
         "tune": phase_tune,
         "benchmark": phase_benchmark,
+        "scaling": phase_scaling,
         "plot": phase_plot,
     }
 

@@ -467,16 +467,16 @@ impl Cnn {
 
                 if use_adam {
                     step += 1;
-                    adam_update(&mut self.conv1_weights, &grad_conv1_w, &mut adam_states[0], lr_s, 0.9, 0.999, 1e-8, step);
-                    adam_update(&mut self.conv1_biases, &grad_conv1_b, &mut adam_states[1], lr_s, 0.9, 0.999, 1e-8, step);
-                    adam_update(&mut self.conv2_weights, &grad_conv2_w, &mut adam_states[2], lr_s, 0.9, 0.999, 1e-8, step);
-                    adam_update(&mut self.conv2_biases, &grad_conv2_b, &mut adam_states[3], lr_s, 0.9, 0.999, 1e-8, step);
-                    adam_update(&mut self.fc1_weights, &grad_fc1_w, &mut adam_states[4], lr_s, 0.9, 0.999, 1e-8, step);
-                    adam_update(&mut self.fc1_biases, &grad_fc1_b, &mut adam_states[5], lr_s, 0.9, 0.999, 1e-8, step);
-                    adam_update(&mut self.fc2_weights, &grad_fc2_w, &mut adam_states[6], lr_s, 0.9, 0.999, 1e-8, step);
-                    adam_update(&mut self.fc2_biases, &grad_fc2_b, &mut adam_states[7], lr_s, 0.9, 0.999, 1e-8, step);
-                    adam_update(&mut self.out_weights, &grad_out_w, &mut adam_states[8], lr_s, 0.9, 0.999, 1e-8, step);
-                    adam_update(&mut self.out_biases, &grad_out_b, &mut adam_states[9], lr_s, 0.9, 0.999, 1e-8, step);
+                    adam_update(&mut self.conv1_weights, &grad_conv1_w, &mut adam_states[0], lr, 0.9, 0.999, 1e-8, step);
+                    adam_update(&mut self.conv1_biases, &grad_conv1_b, &mut adam_states[1], lr, 0.9, 0.999, 1e-8, step);
+                    adam_update(&mut self.conv2_weights, &grad_conv2_w, &mut adam_states[2], lr, 0.9, 0.999, 1e-8, step);
+                    adam_update(&mut self.conv2_biases, &grad_conv2_b, &mut adam_states[3], lr, 0.9, 0.999, 1e-8, step);
+                    adam_update(&mut self.fc1_weights, &grad_fc1_w, &mut adam_states[4], lr, 0.9, 0.999, 1e-8, step);
+                    adam_update(&mut self.fc1_biases, &grad_fc1_b, &mut adam_states[5], lr, 0.9, 0.999, 1e-8, step);
+                    adam_update(&mut self.fc2_weights, &grad_fc2_w, &mut adam_states[6], lr, 0.9, 0.999, 1e-8, step);
+                    adam_update(&mut self.fc2_biases, &grad_fc2_b, &mut adam_states[7], lr, 0.9, 0.999, 1e-8, step);
+                    adam_update(&mut self.out_weights, &grad_out_w, &mut adam_states[8], lr, 0.9, 0.999, 1e-8, step);
+                    adam_update(&mut self.out_biases, &grad_out_b, &mut adam_states[9], lr, 0.9, 0.999, 1e-8, step);
                 } else {
                     sgd_update(&mut self.out_weights, &grad_out_w, lr_s);
                     sgd_update(&mut self.out_biases, &grad_out_b, lr_s);

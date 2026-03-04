@@ -1,17 +1,22 @@
 # CNN model config — overrides base.yaml defaults for LeNet-5 on MNIST
 
 training:
-  epochs: 200
-  learning_rate: 0.32
-  batch_size: 4096
+  epochs: 50
+  learning_rate: 0.005
+  batch_size: 2048
+  optimizer: adam
+  scheduler: cosine
 
 benchmark:
   datasets: [mnist]
 
 scaling:
-  batch_sizes: [16, 32, 64, 128, 256, 512, 1024]
+  epochs: 5
+  fixed_batch_size: 2048
+  batch_sizes: [256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+  dataset_sizes: [4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152]
 
 tuning:
-  batch_sizes: [32, 64, 128, 256, 512, 1024]
-  sgd_lr_range: [0.01, 0.05, 0.1, 0.2, 0.5, 1.0]
+  min_batch_size: 256
+  sgd_lr_range: [0.001, 0.005, 0.01, 0.05, 0.1, 0.2, 0.5]
   adam_lr_range: [0.0005, 0.001, 0.005, 0.01, 0.05]

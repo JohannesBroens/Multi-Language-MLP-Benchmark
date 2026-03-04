@@ -3,7 +3,7 @@
 #include <math.h>
 
 /* ------------------------------------------------------------------ */
-/*  CNN-specific kernels: im2col, col2im, avg_pool, add_bias          */
+/*  CNN-specific kernels: NCHW direct convolution + pool               */
 /* ------------------------------------------------------------------ */
 
 /* ---- Per-sample kernels (kept for interface compatibility) ---- */
@@ -143,246 +143,394 @@ extern "C" void launch_avg_pool_backward(const float *grad_output, float *grad_i
         grad_output, grad_input, C, H, W, pool_size, OH, OW);
 }
 
-/* ---- Batched kernels: channel-major [C, B*spatial] layout ---- */
+/* ------------------------------------------------------------------ */
+/*  NCHW batched kernels — direct convolution (no im2col)             */
+/* ------------------------------------------------------------------ */
 
 /*
- * Batched im2col: input [C, B*H*W] -> col [K, B*OH*OW]
- * One thread per output element.
+ * Fused conv + bias + ReLU.  NCHW layout.
+ * input  [B, C_in, H, W]
+ * weight [C_out, C_in*K*K]
+ * bias   [C_out]
+ * output [B, C_out, OH, OW]
  */
-__global__ void im2col_batch_kernel(const float *input, float *col,
-                                      int C, int B, int H, int W,
-                                      int kH, int kW, int stride,
-                                      int OH, int OW) {
-    int spatial_out = B * OH * OW;
-    int K = C * kH * kW;
-    int total = K * spatial_out;
+__global__ void conv_fwd_bias_relu_nchw(
+        const float *input, const float *weight, const float *bias,
+        float *output,
+        int B, int C_in, int H, int W, int C_out, int K, int OH, int OW) {
+    extern __shared__ float s_filter[];
+    int CKK = C_in * K * K;
+    int co = blockIdx.y;
+
+    /* Cooperatively load filter for this output channel into shared mem */
+    for (int i = threadIdx.x; i < CKK; i += blockDim.x)
+        s_filter[i] = weight[co * CKK + i];
+    __syncthreads();
+
+    int spatial = B * OH * OW;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total) return;
+    if (idx >= spatial) return;
 
-    int col_row = idx / spatial_out;
-    int col_col = idx % spatial_out;
+    int ow_idx = idx % OW;
+    int tmp = idx / OW;
+    int oh_idx = tmp % OH;
+    int b = tmp / OH;
 
-    int kw_idx = col_row % kW;
-    int tmp = col_row / kW;
-    int kh_idx = tmp % kH;
-    int c = tmp / kH;
-
-    int per_sample = OH * OW;
-    int b = col_col / per_sample;
-    int spatial_idx = col_col % per_sample;
-    int oh = spatial_idx / OW;
-    int ow = spatial_idx % OW;
-
-    int h = oh * stride + kh_idx;
-    int w = ow * stride + kw_idx;
-
-    col[idx] = input[c * B * H * W + b * H * W + h * W + w];
+    float sum = bias[co];
+    for (int ci = 0; ci < C_in; ci++) {
+        const float *in_bci = input + b * C_in * H * W + ci * H * W;
+        const float *w_ci = s_filter + ci * K * K;
+        for (int kh = 0; kh < K; kh++) {
+            int ih = oh_idx + kh;
+            for (int kw = 0; kw < K; kw++) {
+                sum += in_bci[ih * W + (ow_idx + kw)] * w_ci[kh * K + kw];
+            }
+        }
+    }
+    output[b * C_out * OH * OW + co * OH * OW + oh_idx * OW + ow_idx] =
+        (sum > 0.0f) ? sum : 0.0f;
 }
 
-extern "C" void launch_im2col_batch(const float *input, float *col,
-                                      int C, int B, int H, int W,
-                                      int kH, int kW, int stride,
-                                      int OH, int OW) {
-    int total = C * kH * kW * B * OH * OW;
+extern "C" void launch_conv_fwd_bias_relu_nchw(
+        const float *input, const float *weight, const float *bias,
+        float *output,
+        int B, int C_in, int H, int W, int C_out, int K, int OH, int OW) {
+    int spatial = B * OH * OW;
     int threads = 256;
-    im2col_batch_kernel<<<(total + threads - 1) / threads, threads>>>(
-        input, col, C, B, H, W, kH, kW, stride, OH, OW);
+    int CKK = C_in * K * K;
+    dim3 grid((spatial + threads - 1) / threads, C_out);
+    conv_fwd_bias_relu_nchw<<<grid, threads, CKK * sizeof(float)>>>(
+        input, weight, bias, output, B, C_in, H, W, C_out, K, OH, OW);
 }
 
 /*
- * Batched col2im: col [K, B*OH*OW] -> output [C, B*H*W]  (atomicAdd)
+ * Avg pool forward NCHW.  [B, C, H, W] -> [B, C, PH, PW].
  */
-__global__ void col2im_batch_kernel(const float *col, float *output,
-                                      int C, int B, int H, int W,
-                                      int kH, int kW, int stride,
-                                      int OH, int OW) {
-    int spatial_out = B * OH * OW;
-    int K = C * kH * kW;
-    int total = K * spatial_out;
+__global__ void avg_pool_fwd_nchw_kernel(
+        const float *input, float *output,
+        int B, int C, int H, int W, int pool, int PH, int PW) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total) return;
-
-    int col_row = idx / spatial_out;
-    int col_col = idx % spatial_out;
-
-    int kw_idx = col_row % kW;
-    int tmp = col_row / kW;
-    int kh_idx = tmp % kH;
-    int c = tmp / kH;
-
-    int per_sample = OH * OW;
-    int b = col_col / per_sample;
-    int spatial_idx = col_col % per_sample;
-    int oh = spatial_idx / OW;
-    int ow = spatial_idx % OW;
-
-    int h = oh * stride + kh_idx;
-    int w = ow * stride + kw_idx;
-
-    atomicAdd(&output[c * B * H * W + b * H * W + h * W + w], col[idx]);
-}
-
-extern "C" void launch_col2im_batch(const float *col, float *output,
-                                      int C, int B, int H, int W,
-                                      int kH, int kW, int stride,
-                                      int OH, int OW) {
-    int total = C * kH * kW * B * OH * OW;
-    int threads = 256;
-    col2im_batch_kernel<<<(total + threads - 1) / threads, threads>>>(
-        col, output, C, B, H, W, kH, kW, stride, OH, OW);
-}
-
-/*
- * Batched avg pool forward: input [C, B*H*W] -> output [C, B*PH*PW]
- */
-__global__ void avg_pool_forward_batch_kernel(const float *input, float *output,
-                                                int C, int B, int H, int W,
-                                                int pool_size, int PH, int PW) {
-    int total = C * B * PH * PW;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * C * PH * PW;
     if (idx >= total) return;
 
     int pw_idx = idx % PW;
     int tmp = idx / PW;
-    int ph_idx = tmp % PH;
+    int ph = tmp % PH;
     int tmp2 = tmp / PH;
-    int b = tmp2 % B;
-    int c = tmp2 / B;
+    int c = tmp2 % C;
+    int b = tmp2 / C;
 
-    float scale = 1.0f / (pool_size * pool_size);
+    float scale = 1.0f / (pool * pool);
     float sum = 0.0f;
-    for (int i = 0; i < pool_size; i++) {
-        for (int j = 0; j < pool_size; j++) {
-            int h = ph_idx * pool_size + i;
-            int w = pw_idx * pool_size + j;
-            sum += input[c * B * H * W + b * H * W + h * W + w];
-        }
-    }
+    const float *in_bc = input + b * C * H * W + c * H * W;
+    int h0 = ph * pool, w0 = pw_idx * pool;
+    for (int i = 0; i < pool; i++)
+        for (int j = 0; j < pool; j++)
+            sum += in_bc[(h0 + i) * W + w0 + j];
     output[idx] = sum * scale;
 }
 
-extern "C" void launch_avg_pool_forward_batch(const float *input, float *output,
-                                                int C, int B, int H, int W,
-                                                int pool_size, int PH, int PW) {
-    int total = C * B * PH * PW;
+extern "C" void launch_avg_pool_fwd_nchw(
+        const float *input, float *output,
+        int B, int C, int H, int W, int pool, int PH, int PW) {
+    int total = B * C * PH * PW;
     int threads = 256;
-    avg_pool_forward_batch_kernel<<<(total + threads - 1) / threads, threads>>>(
-        input, output, C, B, H, W, pool_size, PH, PW);
+    avg_pool_fwd_nchw_kernel<<<(total + threads - 1) / threads, threads>>>(
+        input, output, B, C, H, W, pool, PH, PW);
 }
 
 /*
- * Batched avg pool backward: grad_output [C, B*PH*PW] -> grad_input [C, B*H*W]
+ * Avg pool backward NCHW.
+ * grad_output [B, C, PH, PW] -> grad_input [B, C, H, W].
  */
-__global__ void avg_pool_backward_batch_kernel(const float *grad_output, float *grad_input,
-                                                 int C, int B, int H, int W,
-                                                 int pool_size, int PH, int PW) {
-    int total = C * B * H * W;
+__global__ void avg_pool_bwd_nchw_kernel(
+        const float *grad_output, float *grad_input,
+        int B, int C, int H, int W, int pool, int PH, int PW) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * C * H * W;
     if (idx >= total) return;
 
     int w = idx % W;
     int tmp = idx / W;
     int h = tmp % H;
     int tmp2 = tmp / H;
-    int b = tmp2 % B;
-    int c = tmp2 / B;
+    int c = tmp2 % C;
+    int b = tmp2 / C;
 
-    int oh = h / pool_size;
-    int ow = w / pool_size;
-
+    int oh = h / pool;
+    int ow = w / pool;
     if (oh < PH && ow < PW) {
-        float scale = 1.0f / (pool_size * pool_size);
-        grad_input[idx] = grad_output[c * B * PH * PW + b * PH * PW + oh * PW + ow] * scale;
+        float scale = 1.0f / (pool * pool);
+        grad_input[idx] = grad_output[b * C * PH * PW + c * PH * PW + oh * PW + ow] * scale;
+    } else {
+        grad_input[idx] = 0.0f;
     }
 }
 
-extern "C" void launch_avg_pool_backward_batch(const float *grad_output, float *grad_input,
-                                                 int C, int B, int H, int W,
-                                                 int pool_size, int PH, int PW) {
-    int total = C * B * H * W;
+extern "C" void launch_avg_pool_bwd_nchw(
+        const float *grad_output, float *grad_input,
+        int B, int C, int H, int W, int pool, int PH, int PW) {
+    int total = B * C * H * W;
     int threads = 256;
-    avg_pool_backward_batch_kernel<<<(total + threads - 1) / threads, threads>>>(
-        grad_output, grad_input, C, B, H, W, pool_size, PH, PW);
+    avg_pool_bwd_nchw_kernel<<<(total + threads - 1) / threads, threads>>>(
+        grad_output, grad_input, B, C, H, W, pool, PH, PW);
 }
 
 /*
- * Transpose [C, B*S] -> [B, C*S]  (channel-major to batch-major)
+ * Direct conv input gradient NCHW.  No col2im, no atomicAdd.
+ * d_output [B, C_out, OH, OW]
+ * weight   [C_out, C_in*K*K]
+ * d_input  [B, C_in, H, W]
  */
-__global__ void transpose_cb_to_bc_kernel(const float *src, float *dst,
-                                            int C, int B, int S) {
-    int total = C * B * S;
+__global__ void conv_input_grad_nchw_kernel(
+        const float *d_output, const float *weight, float *d_input,
+        int B, int C_out, int C_in, int H, int W, int K, int OH, int OW) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = B * C_in * H * W;
     if (idx >= total) return;
 
-    int s = idx % S;
-    int tmp = idx / S;
-    int b = tmp % B;
-    int c = tmp / B;
+    int iw = idx % W;
+    int tmp = idx / W;
+    int ih = tmp % H;
+    int tmp2 = tmp / H;
+    int ci = tmp2 % C_in;
+    int b  = tmp2 / C_in;
 
-    dst[b * C * S + c * S + s] = src[idx];
+    int CKK = C_in * K * K;
+    float sum = 0.0f;
+
+    for (int co = 0; co < C_out; co++) {
+        const float *d_bco = d_output + b * C_out * OH * OW + co * OH * OW;
+        const float *w_coci = weight + co * CKK + ci * K * K;
+        for (int kh = 0; kh < K; kh++) {
+            int o_h = ih - kh;
+            if (o_h < 0 || o_h >= OH) continue;
+            for (int kw = 0; kw < K; kw++) {
+                int o_w = iw - kw;
+                if (o_w < 0 || o_w >= OW) continue;
+                sum += d_bco[o_h * OW + o_w] * w_coci[kh * K + kw];
+            }
+        }
+    }
+    d_input[idx] = sum;
 }
 
-extern "C" void launch_transpose_cb_to_bc(const float *src, float *dst,
-                                            int C, int B, int S) {
-    int total = C * B * S;
+extern "C" void launch_conv_input_grad_nchw(
+        const float *d_output, const float *weight, float *d_input,
+        int B, int C_out, int C_in, int H, int W, int K, int OH, int OW) {
+    int total = B * C_in * H * W;
     int threads = 256;
-    transpose_cb_to_bc_kernel<<<(total + threads - 1) / threads, threads>>>(src, dst, C, B, S);
+    conv_input_grad_nchw_kernel<<<(total + threads - 1) / threads, threads>>>(
+        d_output, weight, d_input, B, C_out, C_in, H, W, K, OH, OW);
 }
 
 /*
- * Transpose [B, C*S] -> [C, B*S]  (batch-major to channel-major)
+ * Conv weight gradient via parallel reduction.  NCHW.
+ * One block per weight element.  Threads reduce over B*OH*OW.
  */
-__global__ void transpose_bc_to_cb_kernel(const float *src, float *dst,
-                                            int B, int C, int S) {
-    int total = B * C * S;
+__global__ void conv_weight_grad_nchw_kernel(
+        const float *d_output, const float *input, float *grad_w,
+        int B, int C_out, int C_in, int H, int W, int K, int OH, int OW) {
+    extern __shared__ float sdata[];
+
+    int w_idx = blockIdx.x;
+    int CKK = C_in * K * K;
+    int co = w_idx / CKK;
+    int rem = w_idx % CKK;
+    int ci = rem / (K * K);
+    int kk = rem % (K * K);
+    int kh = kk / K;
+    int kw = kk % K;
+
+    int spatial = B * OH * OW;
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < spatial; i += blockDim.x) {
+        int b  = i / (OH * OW);
+        int s  = i % (OH * OW);
+        int oh = s / OW;
+        int ow = s % OW;
+        float d = d_output[b * C_out * OH * OW + co * OH * OW + oh * OW + ow];
+        float x = input[b * C_in * H * W + ci * H * W + (oh + kh) * W + (ow + kw)];
+        sum += d * x;
+    }
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) grad_w[w_idx] = sdata[0];
+}
+
+extern "C" void launch_conv_weight_grad_nchw(
+        const float *d_output, const float *input, float *grad_w,
+        int num_weights, int B, int C_out, int C_in, int H, int W, int K, int OH, int OW) {
+    int threads = 256;
+    conv_weight_grad_nchw_kernel<<<num_weights, threads, threads * sizeof(float)>>>(
+        d_output, input, grad_w, B, C_out, C_in, H, W, K, OH, OW);
+}
+
+/*
+ * Conv bias gradient via parallel reduction.  NCHW.
+ * One block per output channel.
+ */
+__global__ void conv_bias_grad_nchw_kernel(
+        const float *d_output, float *grad_bias,
+        int B, int C_out, int OH, int OW) {
+    extern __shared__ float sdata[];
+
+    int co = blockIdx.x;
+    int spatial = B * OH * OW;
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < spatial; i += blockDim.x) {
+        int b  = i / (OH * OW);
+        int s  = i % (OH * OW);
+        int oh = s / OW;
+        int ow = s % OW;
+        sum += d_output[b * C_out * OH * OW + co * OH * OW + oh * OW + ow];
+    }
+    sdata[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) grad_bias[co] = sdata[0];
+}
+
+extern "C" void launch_conv_bias_grad_nchw(
+        const float *d_output, float *grad_bias,
+        int C_out, int B, int OH, int OW) {
+    int threads = 256;
+    conv_bias_grad_nchw_kernel<<<C_out, threads, threads * sizeof(float)>>>(
+        d_output, grad_bias, B, C_out, OH, OW);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Optimized backward pass kernels                                    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Batched im2col for NCHW input. Extracts patches for all samples.
+ * input [B, C_in, H, W] -> col [C_in*K*K, B*OH*OW]
+ */
+__global__ void im2col_nchw_batch_kernel(
+        const float *input, float *col,
+        int B, int C_in, int H, int W, int K, int OH, int OW) {
+    int total = C_in * K * K * B * OH * OW;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;
 
-    int s = idx % S;
-    int tmp = idx / S;
-    int c = tmp % C;
-    int b = tmp / C;
+    int col_cols = B * OH * OW;
+    int col_row = idx / col_cols;
+    int col_col = idx % col_cols;
 
-    dst[c * B * S + b * S + s] = src[idx];
+    int kw = col_row % K;
+    int tmp = col_row / K;
+    int kh = tmp % K;
+    int ci = tmp / K;
+
+    int ow = col_col % OW;
+    int tmp2 = col_col / OW;
+    int oh = tmp2 % OH;
+    int b  = tmp2 / OH;
+
+    col[idx] = input[b * C_in * H * W + ci * H * W + (oh + kh) * W + (ow + kw)];
 }
 
-extern "C" void launch_transpose_bc_to_cb(const float *src, float *dst,
-                                            int B, int C, int S) {
-    int total = B * C * S;
+extern "C" void launch_im2col_nchw_batch(
+        const float *input, float *col,
+        int B, int C_in, int H, int W, int K, int OH, int OW) {
+    int total = C_in * K * K * B * OH * OW;
     int threads = 256;
-    transpose_bc_to_cb_kernel<<<(total + threads - 1) / threads, threads>>>(src, dst, B, C, S);
+    im2col_nchw_batch_kernel<<<(total + threads - 1) / threads, threads>>>(
+        input, col, B, C_in, H, W, K, OH, OW);
 }
 
-/* Add bias to [channels, spatial] matrix */
-__global__ void add_bias_kernel(float *x, const float *bias, int channels, int spatial) {
-    int total = channels * spatial;
+/*
+ * Fused NCHW->CM transpose + bias gradient.
+ * Transposes [B, C, H, W] -> [C, B*H*W] while accumulating per-channel sums.
+ * bias_grad must be zeroed before launch (uses atomicAdd on global).
+ */
+__global__ void nchw_to_cm_bias_grad_kernel(
+        const float *input, float *output, float *bias_grad,
+        int B, int C, int H, int W) {
+    extern __shared__ float s_bias[];
+
+    for (int i = threadIdx.x; i < C; i += blockDim.x)
+        s_bias[i] = 0.0f;
+    __syncthreads();
+
+    int total = B * C * H * W;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < total) {
-        int c = idx / spatial;
-        x[idx] += bias[c];
+        int w_idx = idx % W;
+        int tmp = idx / W;
+        int h_idx = tmp % H;
+        int tmp2 = tmp / H;
+        int c = tmp2 % C;
+        int b = tmp2 / C;
+
+        float val = input[idx];
+        output[c * (B * H * W) + b * (H * W) + h_idx * W + w_idx] = val;
+        atomicAdd(&s_bias[c], val);
     }
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < C; i += blockDim.x)
+        atomicAdd(&bias_grad[i], s_bias[i]);
 }
 
-extern "C" void launch_add_bias(float *x, const float *bias, int channels, int spatial) {
-    int total = channels * spatial;
+extern "C" void launch_nchw_to_cm_bias_grad(
+        const float *input, float *output, float *bias_grad,
+        int B, int C, int H, int W) {
+    int total = B * C * H * W;
     int threads = 256;
-    add_bias_kernel<<<(total + threads - 1) / threads, threads>>>(x, bias, channels, spatial);
+    nchw_to_cm_bias_grad_kernel<<<(total + threads - 1) / threads, threads, C * sizeof(float)>>>(
+        input, output, bias_grad, B, C, H, W);
 }
 
-/* Bias gradient for conv: sum spatial dims per channel */
-__global__ void bias_grad_kernel(const float *grad, float *grad_bias, int channels, int spatial) {
-    int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= channels) return;
+/*
+ * Gather-based col2im for NCHW output. No atomicAdd.
+ * col [C_in*K*K, B*OH*OW] -> output [B, C_in, H, W]
+ */
+__global__ void col2im_gather_nchw_kernel(
+        const float *col, float *output,
+        int B, int C_in, int H, int W, int K, int OH, int OW) {
+    int total = B * C_in * H * W;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int iw = idx % W;
+    int tmp = idx / W;
+    int ih = tmp % H;
+    int tmp2 = tmp / H;
+    int ci = tmp2 % C_in;
+    int b  = tmp2 / C_in;
+
+    int N = B * OH * OW;
     float sum = 0.0f;
-    const float *gc = grad + c * spatial;
-    for (int j = 0; j < spatial; j++)
-        sum += gc[j];
-    grad_bias[c] = sum;
+    for (int kh = 0; kh < K; kh++) {
+        int oh = ih - kh;
+        if (oh < 0 || oh >= OH) continue;
+        for (int kw = 0; kw < K; kw++) {
+            int ow_val = iw - kw;
+            if (ow_val < 0 || ow_val >= OW) continue;
+            int col_row = ci * K * K + kh * K + kw;
+            int col_col = b * OH * OW + oh * OW + ow_val;
+            sum += col[col_row * N + col_col];
+        }
+    }
+    output[idx] = sum;
 }
 
-extern "C" void launch_bias_grad(const float *grad, float *grad_bias, int channels, int spatial) {
+extern "C" void launch_col2im_gather_nchw(
+        const float *col, float *output,
+        int B, int C_in, int H, int W, int K, int OH, int OW) {
+    int total = B * C_in * H * W;
     int threads = 256;
-    bias_grad_kernel<<<(channels + threads - 1) / threads, threads>>>(grad, grad_bias, channels, spatial);
+    col2im_gather_nchw_kernel<<<(total + threads - 1) / threads, threads>>>(
+        col, output, B, C_in, H, W, K, OH, OW);
 }
 
 /* ------------------------------------------------------------------ */

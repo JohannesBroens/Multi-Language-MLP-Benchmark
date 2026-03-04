@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """NumPy MLP implementation — exact replica of the C algorithm.
 
-Single hidden layer, ReLU activation, softmax output, cross-entropy loss.
+Multi-hidden-layer MLP, ReLU activation, softmax output, cross-entropy loss.
 Xavier uniform initialization, mini-batch SGD or Adam with gradient averaging.
 
 Usage:
@@ -73,16 +73,34 @@ def softmax(logits):
     return exp_z / exp_z.sum(axis=1, keepdims=True)
 
 
-def forward(X, W1, b1, W2, b2):
-    """Forward pass for a batch of samples.
+def forward(X, layers):
+    """Forward pass storing all activations for backprop.
 
-    Returns hidden activations and softmax output probabilities.
+    layers: list of (W, b) tuples
+    Returns: list of hidden activations + final softmax output
     """
-    z1 = X @ W1 + b1        # (batch, hidden)
-    hidden = relu(z1)        # (batch, hidden)
-    z2 = hidden @ W2 + b2   # (batch, output)
-    output = softmax(z2)     # (batch, output)
-    return hidden, output
+    acts = []  # hidden activations (after ReLU)
+    current = X
+    for i, (W, b) in enumerate(layers):
+        z = current @ W + b
+        if i < len(layers) - 1:
+            current = relu(z)
+            acts.append(current)
+        else:
+            current = softmax(z)
+    return acts, current
+
+
+def forward_eval(X, layers):
+    """Forward pass without storing activations (for evaluation)."""
+    current = X
+    for i, (W, b) in enumerate(layers):
+        z = current @ W + b
+        if i < len(layers) - 1:
+            current = relu(z)
+        else:
+            current = softmax(z)
+    return current
 
 
 def cross_entropy_loss(output, targets, num_classes):
@@ -94,16 +112,20 @@ def cross_entropy_loss(output, targets, num_classes):
 
 
 def train(X_train, y_train, input_size, num_classes,
-          hidden_size=64, batch_size=32, num_epochs=1000, learning_rate=0.01,
-          scheduler="none", optimizer="sgd"):
-    """Train MLP with mini-batch SGD or Adam, matching C implementation exactly."""
+          hidden_size=64, num_hidden_layers=1, batch_size=32, num_epochs=1000,
+          learning_rate=0.01, scheduler="none", optimizer="sgd"):
+    """Train multi-layer MLP with mini-batch SGD or Adam."""
     rng = np.random.default_rng()
 
-    W1 = xavier_init(input_size, hidden_size, rng)
-    b1 = np.zeros(hidden_size, dtype=np.float32)
-    W2 = xavier_init(hidden_size, num_classes, rng)
-    b2 = np.zeros(num_classes, dtype=np.float32)
+    # Build layer sizes and initialize weights
+    layer_sizes = [input_size] + [hidden_size] * num_hidden_layers + [num_classes]
+    layers = []
+    for i in range(len(layer_sizes) - 1):
+        W = xavier_init(layer_sizes[i], layer_sizes[i + 1], rng)
+        b = np.zeros(layer_sizes[i + 1], dtype=np.float32)
+        layers.append((W, b))
 
+    nl = len(layers)
     n = len(X_train)
     num_batches = (n + batch_size - 1) // batch_size
     warmup = max(1, int(num_epochs * 0.05)) if scheduler == "cosine" else 0
@@ -111,10 +133,10 @@ def train(X_train, y_train, input_size, num_classes,
     # Adam moment buffers
     if optimizer == "adam":
         beta1, beta2, eps_adam = 0.9, 0.999, 1e-8
-        m_W1, v_W1 = np.zeros_like(W1), np.zeros_like(W1)
-        m_b1, v_b1 = np.zeros_like(b1), np.zeros_like(b1)
-        m_W2, v_W2 = np.zeros_like(W2), np.zeros_like(W2)
-        m_b2, v_b2 = np.zeros_like(b2), np.zeros_like(b2)
+        adam_m_W = [np.zeros_like(layers[i][0]) for i in range(nl)]
+        adam_v_W = [np.zeros_like(layers[i][0]) for i in range(nl)]
+        adam_m_b = [np.zeros_like(layers[i][1]) for i in range(nl)]
+        adam_v_b = [np.zeros_like(layers[i][1]) for i in range(nl)]
         adam_step = 0
 
     for epoch in range(num_epochs):
@@ -130,7 +152,7 @@ def train(X_train, y_train, input_size, num_classes,
             y_batch = y_train[start:end]
 
             # Forward
-            hidden, output = forward(X_batch, W1, b1, W2, b2)
+            acts, output = forward(X_batch, layers)
 
             # Loss
             eps = 1e-7
@@ -140,47 +162,59 @@ def train(X_train, y_train, input_size, num_classes,
             # Backward: softmax + CE gradient shortcut
             one_hot = np.zeros_like(output)
             one_hot[np.arange(bs), y_batch] = 1.0
-            d_output = output - one_hot  # (batch, output)
+            d_current = output - one_hot  # (batch, output)
 
-            # Hidden gradient: backprop through ReLU
-            d_hidden = (d_output @ W2.T) * (hidden > 0)  # (batch, hidden)
+            # Backprop through all layers
+            grad_W_list = [None] * nl
+            grad_b_list = [None] * nl
 
-            # Accumulate gradients
-            grad_W2 = hidden.T @ d_output      # (hidden, output)
-            grad_b2 = d_output.sum(axis=0)     # (output,)
-            grad_W1 = X_batch.T @ d_hidden     # (input, hidden)
-            grad_b1 = d_hidden.sum(axis=0)     # (hidden,)
+            for layer in range(nl - 1, -1, -1):
+                input_act = X_batch if layer == 0 else acts[layer - 1]
+                W, b = layers[layer]
 
-            # Parameter update with gradient averaging (lr / batch_size)
+                grad_W_list[layer] = input_act.T @ d_current
+                grad_b_list[layer] = d_current.sum(axis=0)
+
+                if layer > 0:
+                    d_current = (d_current @ W.T) * (acts[layer - 1] > 0)
+
+            # Parameter update
             lr_scaled = lr / bs
             if optimizer == "adam":
                 adam_step += 1
                 bc1 = 1.0 - beta1 ** adam_step
                 bc2 = 1.0 - beta2 ** adam_step
-                for param, grad, m_buf, v_buf in [
-                    (W1, grad_W1, m_W1, v_W1), (b1, grad_b1, m_b1, v_b1),
-                    (W2, grad_W2, m_W2, v_W2), (b2, grad_b2, m_b2, v_b2),
-                ]:
-                    m_buf[:] = beta1 * m_buf + (1 - beta1) * grad
-                    v_buf[:] = beta2 * v_buf + (1 - beta2) * grad ** 2
-                    m_hat = m_buf / bc1
-                    v_hat = v_buf / bc2
-                    param -= lr_scaled * m_hat / (np.sqrt(v_hat) + eps_adam)
+                for i in range(nl):
+                    W, b = layers[i]
+                    adam_m_W[i] = beta1 * adam_m_W[i] + (1 - beta1) * grad_W_list[i]
+                    adam_v_W[i] = beta2 * adam_v_W[i] + (1 - beta2) * grad_W_list[i] ** 2
+                    m_hat = adam_m_W[i] / bc1
+                    v_hat = adam_v_W[i] / bc2
+                    W -= lr_scaled * m_hat / (np.sqrt(v_hat) + eps_adam)
+
+                    adam_m_b[i] = beta1 * adam_m_b[i] + (1 - beta1) * grad_b_list[i]
+                    adam_v_b[i] = beta2 * adam_v_b[i] + (1 - beta2) * grad_b_list[i] ** 2
+                    m_hat = adam_m_b[i] / bc1
+                    v_hat = adam_v_b[i] / bc2
+                    b -= lr_scaled * m_hat / (np.sqrt(v_hat) + eps_adam)
+
+                    layers[i] = (W, b)
             else:
-                W1 -= lr_scaled * grad_W1
-                b1 -= lr_scaled * grad_b1
-                W2 -= lr_scaled * grad_W2
-                b2 -= lr_scaled * grad_b2
+                for i in range(nl):
+                    W, b = layers[i]
+                    W -= lr_scaled * grad_W_list[i]
+                    b -= lr_scaled * grad_b_list[i]
+                    layers[i] = (W, b)
 
         if epoch % 100 == 0:
             print(f"  Epoch {epoch:4d}  loss: {epoch_loss / n:.4f}")
 
-    return W1, b1, W2, b2
+    return layers
 
 
-def evaluate(X, y, W1, b1, W2, b2, num_classes):
+def evaluate(X, y, layers, num_classes):
     """Evaluate model, returning average loss and accuracy percentage."""
-    hidden, output = forward(X, W1, b1, W2, b2)
+    output = forward_eval(X, layers)
     loss = cross_entropy_loss(output, y, num_classes)
     predictions = output.argmax(axis=1)
     accuracy = (predictions == y).mean() * 100.0
@@ -195,6 +229,7 @@ def main():
     parser.add_argument("--num-samples", type=int, default=0,
                         help="Number of samples for generated dataset (0 = default)")
     parser.add_argument("--hidden-size", type=int, default=64)
+    parser.add_argument("--num-hidden-layers", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--learning-rate", type=float, default=0.02)
     parser.add_argument("--optimizer", default="sgd", choices=["sgd", "adam"])
@@ -213,17 +248,18 @@ def main():
     input_size = X.shape[1]
     print(f"Dataset: {args.dataset}  ({len(X)} samples, {input_size} features, {num_classes} classes)")
     print(f"Train: {len(X_train)} samples, Test: {len(X_test)} samples")
-    print(f"\nTraining ({num_epochs} epochs, batch_size={batch_size}, hidden={hidden_size}, lr={learning_rate:.4f})...")
+    print(f"\nTraining ({num_epochs} epochs, batch_size={batch_size}, hidden={hidden_size}, layers={args.num_hidden_layers}, lr={learning_rate:.4f})...")
 
     t_start = time.monotonic()
-    W1, b1, W2, b2 = train(X_train, y_train, input_size, num_classes,
-                            hidden_size=hidden_size, batch_size=batch_size,
-                            num_epochs=num_epochs, learning_rate=learning_rate,
-                            scheduler=args.scheduler, optimizer=args.optimizer)
+    layers = train(X_train, y_train, input_size, num_classes,
+                   hidden_size=hidden_size, num_hidden_layers=args.num_hidden_layers,
+                   batch_size=batch_size, num_epochs=num_epochs,
+                   learning_rate=learning_rate,
+                   scheduler=args.scheduler, optimizer=args.optimizer)
     t_train = time.monotonic() - t_start
 
     t_eval_start = time.monotonic()
-    loss, accuracy = evaluate(X_test, y_test, W1, b1, W2, b2, num_classes)
+    loss, accuracy = evaluate(X_test, y_test, layers, num_classes)
     t_eval = time.monotonic() - t_eval_start
 
     throughput = len(X_train) * num_epochs / t_train

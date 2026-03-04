@@ -230,63 +230,50 @@ impl Drop for CudaAdamState {
 }
 
 // ---------------------------------------------------------------------------
-//  MLP struct — GPU pointers
+//  MLP struct — GPU pointers, multi-layer
 // ---------------------------------------------------------------------------
 
 struct GpuMlp {
-    input_size: i32,
-    hidden_size: i32,
-    output_size: i32,
-    // Managed memory (accessible from host + device)
-    input_weights: *mut f32,  // [input_size  x hidden_size]
-    output_weights: *mut f32, // [hidden_size x output_size]
-    hidden_biases: *mut f32,  // [hidden_size]
-    output_biases: *mut f32,  // [output_size]
+    layer_sizes: Vec<i32>,        // [input, hid, ..., hid, output]
+    weights: Vec<*mut f32>,       // managed memory
+    biases: Vec<*mut f32>,        // managed memory
     cublas: CublasHandle,
 }
 
 impl GpuMlp {
-    fn new(input_size: usize, hidden_size: usize, output_size: usize) -> Self {
-        let inp = input_size as i32;
-        let hid = hidden_size as i32;
-        let out = output_size as i32;
+    fn new(input_size: usize, hidden_size: usize, output_size: usize,
+           num_hidden_layers: usize) -> Self {
+        let mut layer_sizes: Vec<i32> = Vec::with_capacity(num_hidden_layers + 2);
+        layer_sizes.push(input_size as i32);
+        for _ in 0..num_hidden_layers {
+            layer_sizes.push(hidden_size as i32);
+        }
+        layer_sizes.push(output_size as i32);
 
-        // Managed memory for weights (accessible from both host and device)
-        let input_weights =
-            cuda_malloc_managed((input_size * hidden_size) * std::mem::size_of::<f32>());
-        let output_weights =
-            cuda_malloc_managed((hidden_size * output_size) * std::mem::size_of::<f32>());
-        let hidden_biases = cuda_malloc_managed(hidden_size * std::mem::size_of::<f32>());
-        let output_biases = cuda_malloc_managed(output_size * std::mem::size_of::<f32>());
+        let nl = layer_sizes.len() - 1;
+        let mut weights = Vec::with_capacity(nl);
+        let mut biases = Vec::with_capacity(nl);
 
-        // Zero biases
-        cuda_memset_zero(hidden_biases, hidden_size);
-        cuda_memset_zero(output_biases, output_size);
-
-        // Xavier init via GPU kernel
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
-        let scale_ih = (2.0f32 / input_size as f32).sqrt();
-        unsafe {
-            launch_init_weights(
-                input_weights,
-                inp * hid,
-                scale_ih,
-                seed,
-            );
-        }
+        for i in 0..nl {
+            let fan_in = layer_sizes[i] as usize;
+            let fan_out = layer_sizes[i + 1] as usize;
 
-        let scale_ho = (2.0f32 / hidden_size as f32).sqrt();
-        unsafe {
-            launch_init_weights(
-                output_weights,
-                hid * out,
-                scale_ho,
-                seed + 1,
-            );
+            let w = cuda_malloc_managed(fan_in * fan_out * std::mem::size_of::<f32>());
+            let b = cuda_malloc_managed(fan_out * std::mem::size_of::<f32>());
+            cuda_memset_zero(b, fan_out);
+
+            let scale = (2.0f32 / fan_in as f32).sqrt();
+            unsafe {
+                launch_init_weights(w, (fan_in * fan_out) as i32, scale, seed + i as u64);
+            }
+
+            weights.push(w);
+            biases.push(b);
         }
 
         cuda_sync();
@@ -298,16 +285,15 @@ impl GpuMlp {
             panic!("cublasCreate_v2 failed with error {}", err);
         }
 
-        GpuMlp {
-            input_size: inp,
-            hidden_size: hid,
-            output_size: out,
-            input_weights,
-            output_weights,
-            hidden_biases,
-            output_biases,
-            cublas,
-        }
+        GpuMlp { layer_sizes, weights, biases, cublas }
+    }
+
+    fn num_layers(&self) -> usize {
+        self.layer_sizes.len() - 1
+    }
+
+    fn num_hidden(&self) -> usize {
+        self.num_layers() - 1
     }
 
     fn train(
@@ -321,15 +307,27 @@ impl GpuMlp {
         optimizer: &str,
         scheduler: &str,
     ) {
-        let inp = self.input_size;
-        let hid = self.hidden_size;
-        let out = self.output_size;
+        let nl = self.num_layers();
+        let num_hidden = self.num_hidden();
+        let inp = self.layer_sizes[0];
+        let hid = if num_hidden > 0 { self.layer_sizes[1] } else { 0 };
+        let out = *self.layer_sizes.last().unwrap();
 
         let use_adam = optimizer == "adam";
-        let adam_w1 = if use_adam { Some(CudaAdamState::new(inp * hid)) } else { None };
-        let adam_w2 = if use_adam { Some(CudaAdamState::new(hid * out)) } else { None };
-        let adam_b1 = if use_adam { Some(CudaAdamState::new(hid)) } else { None };
-        let adam_b2 = if use_adam { Some(CudaAdamState::new(out)) } else { None };
+        let adam_w: Vec<Option<CudaAdamState>> = (0..nl).map(|i| {
+            if use_adam {
+                Some(CudaAdamState::new(self.layer_sizes[i] * self.layer_sizes[i + 1]))
+            } else {
+                None
+            }
+        }).collect();
+        let adam_b: Vec<Option<CudaAdamState>> = (0..nl).map(|i| {
+            if use_adam {
+                Some(CudaAdamState::new(self.layer_sizes[i + 1]))
+            } else {
+                None
+            }
+        }).collect();
         let mut step: i32 = 0;
 
         // Copy training data to device
@@ -338,17 +336,27 @@ impl GpuMlp {
         cuda_memcpy_h2d(d_inputs, &inputs[..num_samples * inp as usize]);
         cuda_memcpy_h2d_i32(d_targets, &targets[..num_samples]);
 
-        // Workspace buffers on device
-        let d_hidden = cuda_malloc(batch_size * hid as usize * std::mem::size_of::<f32>());
+        // Hidden activation buffers
+        let d_acts: Vec<*mut f32> = (0..num_hidden)
+            .map(|_| cuda_malloc(batch_size * hid as usize * std::mem::size_of::<f32>()))
+            .collect();
+
         let d_output = cuda_malloc(batch_size * out as usize * std::mem::size_of::<f32>());
         let d_d_output = cuda_malloc(batch_size * out as usize * std::mem::size_of::<f32>());
-        let d_d_hidden = cuda_malloc(batch_size * hid as usize * std::mem::size_of::<f32>());
-        let d_grad_w1 =
-            cuda_malloc(inp as usize * hid as usize * std::mem::size_of::<f32>());
-        let d_grad_w2 =
-            cuda_malloc(hid as usize * out as usize * std::mem::size_of::<f32>());
-        let d_grad_b1 = cuda_malloc(hid as usize * std::mem::size_of::<f32>());
-        let d_grad_b2 = cuda_malloc(out as usize * std::mem::size_of::<f32>());
+
+        // Gradient propagation (ping-pong)
+        let max_dim = if hid > out { hid } else { out };
+        let d_grad_cur = cuda_malloc(batch_size * max_dim as usize * std::mem::size_of::<f32>());
+        let d_grad_prev = cuda_malloc(batch_size * max_dim as usize * std::mem::size_of::<f32>());
+
+        // Per-layer gradient buffers
+        let d_grad_w: Vec<*mut f32> = (0..nl)
+            .map(|i| cuda_malloc(self.layer_sizes[i] as usize * self.layer_sizes[i + 1] as usize * std::mem::size_of::<f32>()))
+            .collect();
+        let d_grad_b: Vec<*mut f32> = (0..nl)
+            .map(|i| cuda_malloc(self.layer_sizes[i + 1] as usize * std::mem::size_of::<f32>()))
+            .collect();
+
         let d_losses = cuda_malloc(batch_size * std::mem::size_of::<f32>());
         let d_loss_sum = cuda_malloc_managed(std::mem::size_of::<f32>());
 
@@ -366,10 +374,7 @@ impl GpuMlp {
                 learning_rate
             };
 
-            // Reset epoch loss
-            unsafe {
-                *d_loss_sum = 0.0f32;
-            }
+            unsafe { *d_loss_sum = 0.0f32; }
 
             for batch in 0..num_batches {
                 let start = batch * batch_size;
@@ -377,78 +382,82 @@ impl GpuMlp {
                 let bs_i = bs as i32;
 
                 let x = unsafe { d_inputs.add(start * inp as usize) };
-                let y = unsafe { (d_targets).add(start) };
+                let y = unsafe { d_targets.add(start) };
 
-                // ---- Forward: hidden = ReLU(X @ W1 + b1) ----
-                sgemm_nn(self.cublas, bs_i, hid, inp, x, self.input_weights, d_hidden);
-                let n_hid = bs_i * hid;
-                unsafe {
-                    launch_bias_relu(d_hidden, self.hidden_biases, n_hid, hid);
-                }
+                // ---- Forward ----
+                for i in 0..nl {
+                    let in_dim = self.layer_sizes[i];
+                    let out_dim = self.layer_sizes[i + 1];
+                    let input_act: *const f32 = if i == 0 { x } else { d_acts[i - 1] };
+                    let out_act: *mut f32 = if i < num_hidden { d_acts[i] } else { d_output };
 
-                // ---- Forward: output = softmax(hidden @ W2 + b2) ----
-                sgemm_nn(self.cublas, bs_i, out, hid, d_hidden, self.output_weights, d_output);
-                unsafe {
-                    launch_bias_softmax(d_output, self.output_biases, bs_i, out);
+                    sgemm_nn(self.cublas, bs_i, out_dim, in_dim, input_act, self.weights[i], out_act);
+
+                    if i < num_hidden {
+                        let n_elem = bs_i * out_dim;
+                        unsafe { launch_bias_relu(out_act, self.biases[i], n_elem, out_dim); }
+                    } else {
+                        unsafe { launch_bias_softmax(out_act, self.biases[i], bs_i, out_dim); }
+                    }
                 }
 
                 // ---- Loss + d_output gradient ----
                 unsafe {
                     launch_ce_grad(d_output, y, d_d_output, d_losses, bs_i, out);
-                }
-
-                // Accumulate batch loss
-                unsafe {
                     launch_reduce_sum(d_losses, d_loss_sum, bs_i);
                 }
 
-                // ---- Backward: GEMM for gradients ----
+                // ---- Backward ----
+                // 0=d_d_output, 1=d_grad_cur, 2=d_grad_prev
+                let mut dcur_id: u8 = 0;
 
-                // grad_W2 = hidden^T @ d_output
-                sgemm_tn(self.cublas, hid, out, bs_i, d_hidden, d_d_output, d_grad_w2);
+                for layer in (0..nl).rev() {
+                    let fan_in = self.layer_sizes[layer];
+                    let fan_out = self.layer_sizes[layer + 1];
+                    let input_act: *const f32 = if layer == 0 { x } else { d_acts[layer - 1] };
 
-                // grad_b2 = colsum(d_output)
-                unsafe {
-                    launch_col_sum(d_d_output, d_grad_b2, bs_i, out);
-                }
+                    let dcur: *const f32 = match dcur_id {
+                        0 => d_d_output,
+                        1 => d_grad_cur,
+                        _ => d_grad_prev,
+                    };
 
-                // d_hidden = d_output @ W2^T
-                sgemm_nt(self.cublas, bs_i, hid, out, d_d_output, self.output_weights, d_d_hidden);
+                    sgemm_tn(self.cublas, fan_in, fan_out, bs_i, input_act, dcur, d_grad_w[layer]);
+                    unsafe { launch_col_sum(dcur, d_grad_b[layer], bs_i, fan_out); }
 
-                // Apply ReLU mask
-                unsafe {
-                    launch_relu_mask(d_d_hidden, d_hidden, n_hid);
-                }
+                    if layer > 0 {
+                        let next_id: u8 = match dcur_id { 0 => 1, 1 => 2, _ => 1 };
+                        let dnext: *mut f32 = if next_id == 1 { d_grad_cur } else { d_grad_prev };
 
-                // grad_W1 = X^T @ d_hidden
-                sgemm_tn(self.cublas, inp, hid, bs_i, x, d_d_hidden, d_grad_w1);
-
-                // grad_b1 = colsum(d_hidden)
-                unsafe {
-                    launch_col_sum(d_d_hidden, d_grad_b1, bs_i, hid);
+                        sgemm_nt(self.cublas, bs_i, fan_in, fan_out, dcur, self.weights[layer], dnext);
+                        let n_elem = bs_i * fan_in;
+                        unsafe { launch_relu_mask(dnext, d_acts[layer - 1], n_elem); }
+                        dcur_id = next_id;
+                    }
                 }
 
                 // ---- Parameter update ----
                 let lr_s = lr / bs as f32;
-                let n_iw = inp * hid;
-                let n_ow = hid * out;
-                if let Some(ref a) = adam_w1 {
+                if use_adam {
                     step += 1;
-                    let aw2 = adam_w2.as_ref().unwrap();
-                    let ab1 = adam_b1.as_ref().unwrap();
-                    let ab2 = adam_b2.as_ref().unwrap();
-                    unsafe {
-                        launch_adam(self.input_weights, d_grad_w1, a.m, a.v, lr_s, 0.9, 0.999, 1e-8, step, n_iw);
-                        launch_adam(self.output_weights, d_grad_w2, aw2.m, aw2.v, lr_s, 0.9, 0.999, 1e-8, step, n_ow);
-                        launch_adam(self.hidden_biases, d_grad_b1, ab1.m, ab1.v, lr_s, 0.9, 0.999, 1e-8, step, hid);
-                        launch_adam(self.output_biases, d_grad_b2, ab2.m, ab2.v, lr_s, 0.9, 0.999, 1e-8, step, out);
+                    for i in 0..nl {
+                        let n_w = self.layer_sizes[i] * self.layer_sizes[i + 1];
+                        let aw = adam_w[i].as_ref().unwrap();
+                        let ab = adam_b[i].as_ref().unwrap();
+                        unsafe {
+                            launch_adam(self.weights[i], d_grad_w[i], aw.m, aw.v,
+                                        lr, 0.9, 0.999, 1e-8, step, n_w);
+                            launch_adam(self.biases[i], d_grad_b[i], ab.m, ab.v,
+                                        lr, 0.9, 0.999, 1e-8, step, self.layer_sizes[i + 1]);
+                        }
                     }
                 } else {
-                    unsafe {
-                        launch_sgd(self.input_weights, d_grad_w1, lr_s, n_iw);
-                        launch_sgd(self.output_weights, d_grad_w2, lr_s, n_ow);
-                        launch_sgd(self.hidden_biases, d_grad_b1, lr_s, hid);
-                        launch_sgd(self.output_biases, d_grad_b2, lr_s, out);
+                    for i in 0..nl {
+                        let n_w = self.layer_sizes[i] * self.layer_sizes[i + 1];
+                        unsafe {
+                            launch_sgd(self.weights[i], d_grad_w[i], lr_s, n_w);
+                            launch_sgd(self.biases[i], d_grad_b[i], lr_s, self.layer_sizes[i + 1]);
+                        }
                     }
                 }
             }
@@ -465,32 +474,75 @@ impl GpuMlp {
         // Free workspace
         cuda_free(d_inputs);
         cuda_free(d_targets as *mut f32);
-        cuda_free(d_hidden);
+        for p in &d_acts { cuda_free(*p); }
         cuda_free(d_output);
         cuda_free(d_d_output);
-        cuda_free(d_d_hidden);
-        cuda_free(d_grad_w1);
-        cuda_free(d_grad_w2);
-        cuda_free(d_grad_b1);
-        cuda_free(d_grad_b2);
+        cuda_free(d_grad_cur);
+        cuda_free(d_grad_prev);
+        for p in &d_grad_w { cuda_free(*p); }
+        for p in &d_grad_b { cuda_free(*p); }
         cuda_free(d_losses);
         cuda_free(d_loss_sum);
     }
 
     fn evaluate(&self, inputs: &[f32], targets: &[i32], num_samples: usize) -> (f32, f32) {
-        let inp = self.input_size;
-        let hid = self.hidden_size;
-        let out = self.output_size;
+        let nl = self.num_layers();
+        let num_hidden = self.num_hidden();
+        let inp = self.layer_sizes[0];
+        let hid = if num_hidden > 0 { self.layer_sizes[1] } else { 0 };
+        let out = *self.layer_sizes.last().unwrap();
 
-        // Copy test data to device
         let d_inputs = cuda_malloc(num_samples * inp as usize * std::mem::size_of::<f32>());
         let d_targets = cuda_malloc(num_samples * std::mem::size_of::<i32>()) as *mut i32;
         cuda_memcpy_h2d(d_inputs, &inputs[..num_samples * inp as usize]);
         cuda_memcpy_h2d_i32(d_targets, &targets[..num_samples]);
 
-        // Workspace
-        let d_hidden = cuda_malloc(num_samples * hid as usize * std::mem::size_of::<f32>());
+        // Ping-pong buffers
+        let d_buf0 = if num_hidden > 0 {
+            cuda_malloc(num_samples * hid as usize * std::mem::size_of::<f32>())
+        } else {
+            std::ptr::null_mut()
+        };
+        let d_buf1 = if num_hidden > 0 {
+            cuda_malloc(num_samples * hid as usize * std::mem::size_of::<f32>())
+        } else {
+            std::ptr::null_mut()
+        };
+
         let d_output = cuda_malloc(num_samples * out as usize * std::mem::size_of::<f32>());
+
+        let ns = num_samples as i32;
+
+        // Forward through all layers
+        for i in 0..nl {
+            let in_dim = self.layer_sizes[i];
+            let out_dim = self.layer_sizes[i + 1];
+
+            let input_act: *const f32 = if i == 0 {
+                d_inputs
+            } else if (i - 1) % 2 == 0 {
+                d_buf0
+            } else {
+                d_buf1
+            };
+
+            let out_act: *mut f32 = if i < num_hidden {
+                if i % 2 == 0 { d_buf0 } else { d_buf1 }
+            } else {
+                d_output
+            };
+
+            sgemm_nn(self.cublas, ns, out_dim, in_dim, input_act, self.weights[i], out_act);
+
+            if i < num_hidden {
+                let n_elem = ns * out_dim;
+                unsafe { launch_bias_relu(out_act, self.biases[i], n_elem, out_dim); }
+            } else {
+                unsafe { launch_bias_softmax(out_act, self.biases[i], ns, out_dim); }
+            }
+        }
+
+        // Metrics
         let d_losses = cuda_malloc(num_samples * std::mem::size_of::<f32>());
         let d_loss_sum = cuda_malloc_managed(std::mem::size_of::<f32>());
         let d_correct = cuda_malloc_managed(std::mem::size_of::<i32>()) as *mut i32;
@@ -500,22 +552,6 @@ impl GpuMlp {
             *d_correct = 0i32;
         }
 
-        let ns = num_samples as i32;
-
-        // Forward: hidden = ReLU(X @ W1 + b1)
-        sgemm_nn(self.cublas, ns, hid, inp, d_inputs, self.input_weights, d_hidden);
-        let n_hid = ns * hid;
-        unsafe {
-            launch_bias_relu(d_hidden, self.hidden_biases, n_hid, hid);
-        }
-
-        // Forward: output = softmax(hidden @ W2 + b2)
-        sgemm_nn(self.cublas, ns, out, hid, d_hidden, self.output_weights, d_output);
-        unsafe {
-            launch_bias_softmax(d_output, self.output_biases, ns, out);
-        }
-
-        // Metrics
         unsafe {
             launch_eval_metrics(d_output, d_targets, d_losses, d_correct, ns, out);
             launch_reduce_sum(d_losses, d_loss_sum, ns);
@@ -526,10 +562,10 @@ impl GpuMlp {
         let loss = unsafe { *d_loss_sum } / num_samples as f32;
         let accuracy = unsafe { *d_correct } as f32 / num_samples as f32 * 100.0;
 
-        // Free
         cuda_free(d_inputs);
         cuda_free(d_targets as *mut f32);
-        cuda_free(d_hidden);
+        if !d_buf0.is_null() { cuda_free(d_buf0); }
+        if !d_buf1.is_null() { cuda_free(d_buf1); }
         cuda_free(d_output);
         cuda_free(d_losses);
         cuda_free(d_loss_sum);
@@ -541,10 +577,8 @@ impl GpuMlp {
 
 impl Drop for GpuMlp {
     fn drop(&mut self) {
-        cuda_free(self.input_weights);
-        cuda_free(self.output_weights);
-        cuda_free(self.hidden_biases);
-        cuda_free(self.output_biases);
+        for w in &self.weights { cuda_free(*w); }
+        for b in &self.biases { cuda_free(*b); }
         if !self.cublas.is_null() {
             unsafe {
                 cublasDestroy_v2(self.cublas);
@@ -580,12 +614,13 @@ fn main() {
 
     println!("Train: {} samples, Test: {} samples", train_size, test_size);
 
-    let mut mlp = GpuMlp::new(dataset.input_size, args.hidden_size, dataset.output_size);
+    let mut mlp = GpuMlp::new(dataset.input_size, args.hidden_size, dataset.output_size,
+                               args.num_hidden_layers);
     let learning_rate = if args.learning_rate > 0.0 { args.learning_rate } else { DEFAULT_LR };
 
     println!(
-        "\nTraining ({} epochs, batch_size={}, hidden={}, lr={:.4})...",
-        args.epochs, args.batch_size, args.hidden_size, learning_rate
+        "\nTraining ({} epochs, batch_size={}, hidden={}, layers={}, lr={:.4})...",
+        args.epochs, args.batch_size, args.hidden_size, args.num_hidden_layers, learning_rate
     );
 
     let t_start = Instant::now();

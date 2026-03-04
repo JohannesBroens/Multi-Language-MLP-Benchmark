@@ -12,6 +12,7 @@ static void print_usage(const char *prog) {
     printf("  --batch-size N    Mini-batch size (default: 8192)\n");
     printf("  --num-samples N   Number of samples for generated dataset (default: 1000)\n");
     printf("  --hidden-size N   Hidden layer size (default: 64)\n");
+    printf("  --num-hidden-layers N  Number of hidden layers (default: 1)\n");
     printf("  --epochs N        Number of training epochs (default: 1000)\n");
     printf("  --learning-rate F Learning rate (default: 0.02)\n");
     printf("  --optimizer S     Optimizer: sgd, adam (default: sgd)\n");
@@ -71,6 +72,7 @@ int main(int argc, char *argv[]) {
     int batch_size = 8192;
     int num_samples_requested = 0;  /* 0 = use dataset default */
     int hidden_size = 64;
+    int num_hidden_layers = 1;
     int num_epochs = 1000;
     float learning_rate = 0.02f;
     OptimizerType optimizer = OPT_SGD;
@@ -85,6 +87,8 @@ int main(int argc, char *argv[]) {
             num_samples_requested = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--hidden-size") == 0 && i + 1 < argc) {
             hidden_size = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--num-hidden-layers") == 0 && i + 1 < argc) {
+            num_hidden_layers = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--epochs") == 0 && i + 1 < argc) {
             num_epochs = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--learning-rate") == 0 && i + 1 < argc) {
@@ -158,10 +162,10 @@ int main(int argc, char *argv[]) {
     printf("Train: %d samples, Test: %d samples\n", train_size, test_size);
 
     MLP mlp;
-    mlp_initialize(&mlp, input_size, hidden_size, output_size);
+    mlp_initialize(&mlp, input_size, hidden_size, output_size, num_hidden_layers);
 
-    printf("\nTraining (%d epochs, batch_size=%d, hidden=%d, lr=%.4f)...\n",
-           num_epochs, batch_size, hidden_size, learning_rate);
+    printf("\nTraining (%d epochs, batch_size=%d, hidden=%d, layers=%d, lr=%.4f)...\n",
+           num_epochs, batch_size, hidden_size, num_hidden_layers, learning_rate);
 
     double t_start = get_time_sec();
     mlp_train(&mlp, train_inputs, train_labels, train_size, batch_size, num_epochs, learning_rate, optimizer, scheduler);

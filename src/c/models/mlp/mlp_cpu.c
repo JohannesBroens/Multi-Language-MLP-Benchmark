@@ -11,55 +11,128 @@
 /*  Init / Free                                                       */
 /* ------------------------------------------------------------------ */
 
-void mlp_initialize(MLP *mlp, int input_size, int hidden_size, int output_size) {
+void mlp_initialize(MLP *mlp, int input_size, int hidden_size, int output_size,
+                    int num_hidden_layers) {
     mlp->input_size = input_size;
     mlp->hidden_size = hidden_size;
     mlp->output_size = output_size;
+    mlp->num_layers = num_hidden_layers + 1;
 
-    mlp->input_weights  = (float *)malloc(input_size  * hidden_size * sizeof(float));
-    mlp->output_weights = (float *)malloc(hidden_size * output_size * sizeof(float));
-    mlp->hidden_biases  = (float *)calloc(hidden_size, sizeof(float));
-    mlp->output_biases  = (float *)calloc(output_size, sizeof(float));
+    int nl = mlp->num_layers;
 
-    if (!mlp->input_weights || !mlp->output_weights ||
-        !mlp->hidden_biases || !mlp->output_biases) {
-        fprintf(stderr, "Failed to allocate MLP parameters.\n");
-        exit(EXIT_FAILURE);
-    }
+    /* Build layer_sizes: [input, hid, ..., hid, output] */
+    mlp->layer_sizes = (int *)malloc((nl + 1) * sizeof(int));
+    mlp->layer_sizes[0] = input_size;
+    for (int i = 1; i <= num_hidden_layers; ++i)
+        mlp->layer_sizes[i] = hidden_size;
+    mlp->layer_sizes[nl] = output_size;
+
+    /* Allocate weight and bias arrays */
+    mlp->weights = (float **)malloc(nl * sizeof(float *));
+    mlp->biases  = (float **)malloc(nl * sizeof(float *));
 
     uint32_t rng = (uint32_t)time(NULL);
-    nn_xavier_init(mlp->input_weights, input_size * hidden_size, input_size, &rng);
-    nn_xavier_init(mlp->output_weights, hidden_size * output_size, hidden_size, &rng);
+
+    for (int i = 0; i < nl; ++i) {
+        int fan_in  = mlp->layer_sizes[i];
+        int fan_out = mlp->layer_sizes[i + 1];
+        mlp->weights[i] = (float *)malloc(fan_in * fan_out * sizeof(float));
+        mlp->biases[i]  = (float *)calloc(fan_out, sizeof(float));
+
+        if (!mlp->weights[i] || !mlp->biases[i]) {
+            fprintf(stderr, "Failed to allocate MLP parameters for layer %d.\n", i);
+            exit(EXIT_FAILURE);
+        }
+
+        nn_xavier_init(mlp->weights[i], fan_in * fan_out, fan_in, &rng);
+    }
 }
 
 void mlp_free(MLP *mlp) {
-    free(mlp->input_weights);
-    free(mlp->output_weights);
-    free(mlp->hidden_biases);
-    free(mlp->output_biases);
+    for (int i = 0; i < mlp->num_layers; ++i) {
+        free(mlp->weights[i]);
+        free(mlp->biases[i]);
+    }
+    free(mlp->weights);
+    free(mlp->biases);
+    free(mlp->layer_sizes);
 }
 
 /* ------------------------------------------------------------------ */
 /*  Batched forward pass                                              */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Forward pass storing all intermediate activations for backprop.
+ * acts[0] = hidden layer 0, ..., acts[num_hidden-1] = last hidden layer
+ * output = final softmax output
+ */
 static void forward_batch(const MLP *mlp, const float *X, int bs,
-                          float *hidden, float *output) {
-    int in  = mlp->input_size;
-    int hid = mlp->hidden_size;
-    int out = mlp->output_size;
+                          float **acts, float *output) {
+    int nl = mlp->num_layers;
+    int num_hidden = nl - 1;
 
-    /* hidden = X @ W1 */
-    nn_sgemm_nn(bs, hid, in, X, mlp->input_weights, hidden);
+    for (int i = 0; i < nl; ++i) {
+        int in_dim  = mlp->layer_sizes[i];
+        int out_dim = mlp->layer_sizes[i + 1];
+        const float *input_act = (i == 0) ? X : acts[i - 1];
+        float *out_act = (i < num_hidden) ? acts[i] : output;
 
-    /* Add bias + ReLU */
-    nn_bias_relu(hidden, mlp->hidden_biases, bs, hid);
+        nn_sgemm_nn(bs, out_dim, in_dim, input_act, mlp->weights[i], out_act);
 
-    /* output = hidden @ W2 */
-    nn_sgemm_nn(bs, out, hid, hidden, mlp->output_weights, output);
+        if (i < num_hidden) {
+            nn_bias_relu(out_act, mlp->biases[i], bs, out_dim);
+        } else {
+            nn_bias_softmax(out_act, mlp->biases[i], bs, out_dim);
+        }
+    }
+}
 
-    /* Add bias + softmax (per sample) */
-    nn_bias_softmax(output, mlp->output_biases, bs, out);
+/* Forward pass for evaluation (no activation storage needed for single hidden) */
+static void forward_eval(const MLP *mlp, const float *X, int bs, float *output) {
+    int nl = mlp->num_layers;
+    int num_hidden = nl - 1;
+
+    /* Allocate temp buffers for hidden activations */
+    float *cur = NULL, *prev = NULL;
+    int max_hid = mlp->hidden_size;
+
+    if (num_hidden > 0) {
+        cur  = (float *)malloc(bs * max_hid * sizeof(float));
+        prev = (float *)malloc(bs * max_hid * sizeof(float));
+    }
+
+    for (int i = 0; i < nl; ++i) {
+        int in_dim  = mlp->layer_sizes[i];
+        int out_dim = mlp->layer_sizes[i + 1];
+        const float *input_act;
+        float *out_act;
+
+        if (i == 0) {
+            input_act = X;
+        } else if (i % 2 == 1) {
+            input_act = cur;
+        } else {
+            input_act = prev;
+        }
+
+        if (i < num_hidden) {
+            out_act = (i % 2 == 0) ? cur : prev;
+        } else {
+            out_act = output;
+        }
+
+        nn_sgemm_nn(bs, out_dim, in_dim, input_act, mlp->weights[i], out_act);
+
+        if (i < num_hidden) {
+            nn_bias_relu(out_act, mlp->biases[i], bs, out_dim);
+        } else {
+            nn_bias_softmax(out_act, mlp->biases[i], bs, out_dim);
+        }
+    }
+
+    free(cur);
+    free(prev);
 }
 
 /* ------------------------------------------------------------------ */
@@ -69,35 +142,48 @@ static void forward_batch(const MLP *mlp, const float *X, int bs,
 void mlp_train(MLP *mlp, float *inputs, int *targets, int num_samples,
                int batch_size, int num_epochs, float learning_rate,
                OptimizerType optimizer, SchedulerType scheduler) {
-    int in  = mlp->input_size;
+    int nl = mlp->num_layers;
+    int num_hidden = nl - 1;
     int hid = mlp->hidden_size;
     int out = mlp->output_size;
 
-    float *hidden   = (float *)malloc(batch_size * hid * sizeof(float));
+    /* Allocate hidden activation buffers for forward pass */
+    float **acts = (float **)malloc(num_hidden * sizeof(float *));
+    for (int i = 0; i < num_hidden; ++i)
+        acts[i] = (float *)malloc(batch_size * hid * sizeof(float));
+
     float *output   = (float *)malloc(batch_size * out * sizeof(float));
     float *d_output = (float *)malloc(batch_size * out * sizeof(float));
-    float *d_hidden = (float *)malloc(batch_size * hid * sizeof(float));
-    float *grad_W1  = (float *)malloc(in  * hid * sizeof(float));
-    float *grad_W2  = (float *)malloc(hid * out * sizeof(float));
-    float *grad_b1  = (float *)malloc(hid * sizeof(float));
-    float *grad_b2  = (float *)malloc(out * sizeof(float));
     float *losses   = (float *)malloc(batch_size * sizeof(float));
 
-    if (!hidden || !output || !d_output || !d_hidden ||
-        !grad_W1 || !grad_W2 || !grad_b1 || !grad_b2 || !losses) {
-        fprintf(stderr, "Failed to allocate training workspace.\n");
-        exit(EXIT_FAILURE);
+    /* d_current and d_prev for gradient propagation */
+    int max_dim = hid > out ? hid : out;
+    float *d_current = (float *)malloc(batch_size * max_dim * sizeof(float));
+    float *d_prev    = (float *)malloc(batch_size * max_dim * sizeof(float));
+
+    /* Per-layer gradient buffers */
+    float **grad_W = (float **)malloc(nl * sizeof(float *));
+    float **grad_b = (float **)malloc(nl * sizeof(float *));
+    for (int i = 0; i < nl; ++i) {
+        int fan_in  = mlp->layer_sizes[i];
+        int fan_out = mlp->layer_sizes[i + 1];
+        grad_W[i] = (float *)malloc(fan_in * fan_out * sizeof(float));
+        grad_b[i] = (float *)malloc(fan_out * sizeof(float));
     }
 
     /* Adam optimizer state */
-    AdamState adam_W1 = {0}, adam_W2 = {0}, adam_b1 = {0}, adam_b2 = {0};
+    AdamState *adam_W = NULL, *adam_b = NULL;
     int step = 0;
     float beta1 = 0.9f, beta2 = 0.999f, eps = 1e-8f;
     if (optimizer == OPT_ADAM) {
-        nn_adam_state_init(&adam_W1, in * hid);
-        nn_adam_state_init(&adam_W2, hid * out);
-        nn_adam_state_init(&adam_b1, hid);
-        nn_adam_state_init(&adam_b2, out);
+        adam_W = (AdamState *)calloc(nl, sizeof(AdamState));
+        adam_b = (AdamState *)calloc(nl, sizeof(AdamState));
+        for (int i = 0; i < nl; ++i) {
+            int fan_in  = mlp->layer_sizes[i];
+            int fan_out = mlp->layer_sizes[i + 1];
+            nn_adam_state_init(&adam_W[i], fan_in * fan_out);
+            nn_adam_state_init(&adam_b[i], fan_out);
+        }
     }
 
     int num_batches = (num_samples + batch_size - 1) / batch_size;
@@ -115,11 +201,11 @@ void mlp_train(MLP *mlp, float *inputs, int *targets, int num_samples,
             int bs = batch_size;
             if (start + bs > num_samples) bs = num_samples - start;
 
-            const float *X = inputs + start * in;
+            const float *X = inputs + start * mlp->input_size;
             const int *Y   = targets + start;
 
             /* ---- Forward ---- */
-            forward_batch(mlp, X, bs, hidden, output);
+            forward_batch(mlp, X, bs, acts, output);
 
             /* ---- Loss + d_output = softmax - one_hot ---- */
             nn_cross_entropy_grad(output, Y, d_output, losses, bs, out);
@@ -127,37 +213,46 @@ void mlp_train(MLP *mlp, float *inputs, int *targets, int num_samples,
                 epoch_loss += losses[i];
 
             /* ---- Backward ---- */
+            /* Start with d_output as the current gradient */
+            float *dcur = d_output;
 
-            /* grad_W2[hid,out] = hidden^T @ d_output */
-            nn_sgemm_tn(hid, out, bs, hidden, d_output, grad_W2);
+            for (int layer = nl - 1; layer >= 0; --layer) {
+                int fan_in  = mlp->layer_sizes[layer];
+                int fan_out = mlp->layer_sizes[layer + 1];
+                const float *input_act = (layer == 0) ? X : acts[layer - 1];
 
-            /* grad_b2 = column sum of d_output */
-            nn_col_sum(d_output, grad_b2, bs, out);
+                /* grad_W[layer] = input_act^T @ dcur */
+                nn_sgemm_tn(fan_in, fan_out, bs, input_act, dcur, grad_W[layer]);
 
-            /* d_hidden = d_output @ W2^T, then ReLU mask */
-            nn_sgemm_nt(bs, hid, out, d_output, mlp->output_weights, d_hidden);
-            nn_relu_backward(d_hidden, hidden, bs * hid);
+                /* grad_b[layer] = col_sum(dcur) */
+                nn_col_sum(dcur, grad_b[layer], bs, fan_out);
 
-            /* grad_W1[in,hid] = X^T @ d_hidden */
-            nn_sgemm_tn(in, hid, bs, X, d_hidden, grad_W1);
-
-            /* grad_b1 = column sum of d_hidden */
-            nn_col_sum(d_hidden, grad_b1, bs, hid);
+                /* Propagate gradient to previous layer (skip for layer 0) */
+                if (layer > 0) {
+                    /* d_prev = dcur @ W[layer]^T */
+                    float *dnext = (dcur == d_output) ? d_current :
+                                   (dcur == d_current) ? d_prev : d_current;
+                    nn_sgemm_nt(bs, fan_in, fan_out, dcur, mlp->weights[layer], dnext);
+                    /* ReLU backward */
+                    nn_relu_backward(dnext, acts[layer - 1], bs * fan_in);
+                    dcur = dnext;
+                }
+            }
 
             /* ---- Parameter update ---- */
             float lr_s = lr / (float)bs;
             step++;
 
-            if (optimizer == OPT_ADAM) {
-                nn_adam_update(mlp->input_weights, grad_W1, &adam_W1, lr_s, beta1, beta2, eps, step);
-                nn_adam_update(mlp->output_weights, grad_W2, &adam_W2, lr_s, beta1, beta2, eps, step);
-                nn_adam_update(mlp->hidden_biases, grad_b1, &adam_b1, lr_s, beta1, beta2, eps, step);
-                nn_adam_update(mlp->output_biases, grad_b2, &adam_b2, lr_s, beta1, beta2, eps, step);
-            } else {
-                nn_sgd_update(mlp->input_weights, grad_W1, lr_s, in * hid);
-                nn_sgd_update(mlp->output_weights, grad_W2, lr_s, hid * out);
-                nn_sgd_update(mlp->hidden_biases, grad_b1, lr_s, hid);
-                nn_sgd_update(mlp->output_biases, grad_b2, lr_s, out);
+            for (int i = 0; i < nl; ++i) {
+                int fan_in  = mlp->layer_sizes[i];
+                int fan_out = mlp->layer_sizes[i + 1];
+                if (optimizer == OPT_ADAM) {
+                    nn_adam_update(mlp->weights[i], grad_W[i], &adam_W[i], lr, beta1, beta2, eps, step);
+                    nn_adam_update(mlp->biases[i], grad_b[i], &adam_b[i], lr, beta1, beta2, eps, step);
+                } else {
+                    nn_sgd_update(mlp->weights[i], grad_W[i], lr_s, fan_in * fan_out);
+                    nn_sgd_update(mlp->biases[i], grad_b[i], lr_s, fan_out);
+                }
             }
         }
 
@@ -166,17 +261,28 @@ void mlp_train(MLP *mlp, float *inputs, int *targets, int num_samples,
     }
 
     if (optimizer == OPT_ADAM) {
-        nn_adam_state_free(&adam_W1);
-        nn_adam_state_free(&adam_W2);
-        nn_adam_state_free(&adam_b1);
-        nn_adam_state_free(&adam_b2);
+        for (int i = 0; i < nl; ++i) {
+            nn_adam_state_free(&adam_W[i]);
+            nn_adam_state_free(&adam_b[i]);
+        }
+        free(adam_W);
+        free(adam_b);
     }
 
-    free(hidden);  free(output);
-    free(d_output); free(d_hidden);
-    free(grad_W1); free(grad_W2);
-    free(grad_b1); free(grad_b2);
+    for (int i = 0; i < num_hidden; ++i)
+        free(acts[i]);
+    free(acts);
+    free(output);
+    free(d_output);
     free(losses);
+    free(d_current);
+    free(d_prev);
+    for (int i = 0; i < nl; ++i) {
+        free(grad_W[i]);
+        free(grad_b[i]);
+    }
+    free(grad_W);
+    free(grad_b);
 }
 
 /* ------------------------------------------------------------------ */
@@ -185,18 +291,15 @@ void mlp_train(MLP *mlp, float *inputs, int *targets, int num_samples,
 
 void mlp_evaluate(MLP *mlp, float *inputs, int *targets, int num_samples,
                   float *loss, float *accuracy) {
-    int hid = mlp->hidden_size;
     int out = mlp->output_size;
 
-    float *hidden = (float *)malloc(num_samples * hid * sizeof(float));
     float *output = (float *)malloc(num_samples * out * sizeof(float));
-
-    if (!hidden || !output) {
+    if (!output) {
         fprintf(stderr, "Failed to allocate evaluation workspace.\n");
         exit(EXIT_FAILURE);
     }
 
-    forward_batch(mlp, inputs, num_samples, hidden, output);
+    forward_eval(mlp, inputs, num_samples, output);
 
     float total_loss = 0.0f;
     int correct = 0;
@@ -216,6 +319,5 @@ void mlp_evaluate(MLP *mlp, float *inputs, int *targets, int num_samples,
     *loss = total_loss / num_samples;
     *accuracy = (float)correct / num_samples * 100.0f;
 
-    free(hidden);
     free(output);
 }

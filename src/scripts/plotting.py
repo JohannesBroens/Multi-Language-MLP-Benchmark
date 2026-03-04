@@ -51,6 +51,9 @@ CNN_IMPL_STYLES = {
     "CNN Rust (CPU)":          {"color": "#f39c12", "marker": "P", "linewidth": 2.2, "markersize": 8,  "zorder": 5},
     "CNN Rust (cuBLAS)":       {"color": "#1abc9c", "marker": "H", "linewidth": 2.8, "markersize": 9,  "zorder": 9},
     "CNN Rust (CUDA Kernels)": {"color": "#e91e63", "marker": "X", "linewidth": 2.8, "markersize": 9,  "zorder": 8},
+    "CNN C (cuDNN)":            {"color": "#27ae60", "marker": "d", "linewidth": 2.2, "markersize": 8, "zorder": 7, "linestyle": "--"},
+    "CNN Rust cuBLAS (cuDNN)":  {"color": "#16a085", "marker": "h", "linewidth": 2.2, "markersize": 8, "zorder": 7, "linestyle": "--"},
+    "CNN Rust Kernels (cuDNN)": {"color": "#c2185b", "marker": "x", "linewidth": 2.2, "markersize": 8, "zorder": 7, "linestyle": "--"},
 }
 
 CNN_SPEEDUP_PAIRS = [
@@ -59,6 +62,9 @@ CNN_SPEEDUP_PAIRS = [
     ("CNN Rust (CUDA Kernels)", "CNN Rust (CPU)", "#e91e63", "Rust Kernels / Rust CPU"),
     ("CNN PyTorch (CUDA)", "CNN PyTorch (CPU)", "#9b59b6", "PyTorch CUDA / CPU"),
     ("CNN Rust (cuBLAS)", "CNN C (CUDA)", "#f39c12", "Rust cuBLAS / C CUDA"),
+    ("CNN C (CUDA)", "CNN C (cuDNN)", "#2ecc71", "C Custom / C cuDNN"),
+    ("CNN Rust (cuBLAS)", "CNN Rust cuBLAS (cuDNN)", "#1abc9c", "Rust cuBLAS Custom / cuDNN"),
+    ("CNN Rust (CUDA Kernels)", "CNN Rust Kernels (cuDNN)", "#e91e63", "Rust Kernels Custom / cuDNN"),
 ]
 
 
@@ -190,11 +196,12 @@ def _fit_gp(cache, cache_key, label, x_values=None):
 
 
 def _plot_throughput(ax, xs, throughput_data, available_labels, title, xlabel,
-                     cache=None, cache_key=None, styles=None):
+                     cache=None, cache_key=None, styles=None, linear_x=False):
     """Plot throughput lines with implementation-specific styling.
 
     When cache/cache_key are provided, attempts GP regression for smooth curves
     with confidence bands. Falls back to direct line plot if GP fails.
+    Set linear_x=True for small integer axes (e.g. num_hidden_layers 1–5).
     """
     active_styles = styles or IMPL_STYLES
     for label in available_labels:
@@ -206,12 +213,18 @@ def _plot_throughput(ax, xs, throughput_data, available_labels, title, xlabel,
 
         s = active_styles.get(label, {"color": "gray", "marker": ".", "linewidth": 1.5, "markersize": 6, "zorder": 1})
 
-        gp_result = _fit_gp(cache, cache_key, label) if cache is not None else None
+        # Skip GP for linear x-axis plots (few integer points, GP is overkill)
+        gp_result = None
+        if not linear_x and cache is not None:
+            gp_result = _fit_gp(cache, cache_key, label)
+
+        ls = s.get("linestyle", "-")
 
         if gp_result is not None:
             x_dense, y_mean, y_lower, y_upper, x_obs, y_obs_mean = gp_result
             ax.plot(x_dense, y_mean, color=s["color"],
-                    linewidth=s["linewidth"], zorder=s["zorder"], label=label)
+                    linewidth=s["linewidth"], zorder=s["zorder"], label=label,
+                    linestyle=ls)
             ax.fill_between(x_dense, y_lower, y_upper,
                             color=s["color"], alpha=0.18, zorder=s["zorder"] - 1)
             ax.scatter(x_obs, y_obs_mean, marker=s["marker"], color=s["color"],
@@ -220,9 +233,10 @@ def _plot_throughput(ax, xs, throughput_data, available_labels, title, xlabel,
         else:
             ax.plot(xf, yf, marker=s["marker"], color=s["color"],
                     linewidth=s["linewidth"], markersize=s["markersize"],
-                    zorder=s["zorder"], label=label)
+                    zorder=s["zorder"], label=label, linestyle=ls)
 
-    ax.set_xscale("log", base=2)
+    if not linear_x:
+        ax.set_xscale("log", base=2)
     ax.set_yscale("log")
     ax.set_xlabel(xlabel)
     ax.set_ylabel("Throughput (samples/s)")
@@ -442,6 +456,23 @@ def plot_scaling_results(cache, cfg, model, labels, figs_dir=None):
             plt.savefig(p); plt.close()
             print(f"  Saved: {p}")
 
+        # Network depth (num_hidden_layers)
+        num_layers = _discover_x_values(cache, _cache_key(model, "num_hidden_layers"))
+        if num_layers:
+            depth_hs = cfg.get("depth_fixed_hidden_size", 256)
+            tp_nl = _reconstruct_throughput(
+                cache, _cache_key(model, "num_hidden_layers"), num_layers, labels)
+            fig, ax = plt.subplots(figsize=(12, 7))
+            _plot_throughput(ax, num_layers, tp_nl, labels,
+                             f"{prefix}Throughput vs Network Depth\nsamples={fixed_ns:,}, batch={fixed_bs}, hidden={depth_hs}, epochs={epochs}",
+                             "Number of Hidden Layers",
+                             cache=cache, cache_key=_cache_key(model, "num_hidden_layers"),
+                             styles=styles, linear_x=True)
+            plt.tight_layout()
+            p = os.path.join(figs_dir, "scaling_num_hidden_layers.png")
+            plt.savefig(p); plt.close()
+            print(f"  Saved: {p}")
+
 
 def plot_speedup_results(cache, cfg, model, labels, figs_dir=None):
     """Generate GPU speedup plots from cached data."""
@@ -457,28 +488,35 @@ def plot_speedup_results(cache, cfg, model, labels, figs_dir=None):
     prefix = f"{model.upper()}: " if model != "mlp" else ""
 
     # Build experiments list from cache
+    # Each entry: (name, xs, tp_data, xlabel, use_sample_fmt, linear_x)
     experiments = []
     if model != "cnn":
         dataset_sizes = _discover_x_values(cache, _cache_key(model, "dataset_size"))
         if dataset_sizes:
             tp_ds = _reconstruct_throughput(
                 cache, _cache_key(model, "dataset_size"), dataset_sizes, labels)
-            experiments.append(("dataset_size", dataset_sizes, tp_ds, "Dataset Size (samples)", True))
+            experiments.append(("dataset_size", dataset_sizes, tp_ds, "Dataset Size (samples)", True, False))
 
     batch_sizes = _discover_x_values(cache, _cache_key(model, "batch_size"))
     if batch_sizes:
         tp_bs = _reconstruct_throughput(
             cache, _cache_key(model, "batch_size"), batch_sizes, labels)
-        experiments.append(("batch_size", batch_sizes, tp_bs, "Batch Size", False))
+        experiments.append(("batch_size", batch_sizes, tp_bs, "Batch Size", False, False))
 
     if model != "cnn":
         hidden_sizes = _discover_x_values(cache, _cache_key(model, "hidden_size"))
         if hidden_sizes:
             tp_hs = _reconstruct_throughput(
                 cache, _cache_key(model, "hidden_size"), hidden_sizes, labels)
-            experiments.append(("hidden_size", hidden_sizes, tp_hs, "Hidden Size", False))
+            experiments.append(("hidden_size", hidden_sizes, tp_hs, "Hidden Size", False, False))
 
-    for exp_name, xs, tp_data, xlabel, use_sample_fmt in experiments:
+        num_layers = _discover_x_values(cache, _cache_key(model, "num_hidden_layers"))
+        if num_layers:
+            tp_nl = _reconstruct_throughput(
+                cache, _cache_key(model, "num_hidden_layers"), num_layers, labels)
+            experiments.append(("num_hidden_layers", num_layers, tp_nl, "Number of Hidden Layers", False, True))
+
+    for exp_name, xs, tp_data, xlabel, use_sample_fmt, linear_x in experiments:
         fig, ax = plt.subplots(figsize=(12, 7))
         sp_cache_key = _cache_key(model, exp_name)
 
@@ -515,7 +553,8 @@ def plot_speedup_results(cache, cfg, model, labels, figs_dir=None):
             continue
 
         ax.axhline(y=1.0, color="#e74c3c", linestyle="--", alpha=0.7, linewidth=1.5, label="Break-even (1x)")
-        ax.set_xscale("log", base=2)
+        if not linear_x:
+            ax.set_xscale("log", base=2)
         ax.set_xlabel(xlabel)
         ax.set_ylabel("Speedup (x)")
         ax.set_title(f"{prefix}GPU Speedup vs {xlabel}\n(higher = GPU wins)", fontsize=14, fontweight="bold")
@@ -595,6 +634,7 @@ def plot_overview(cache, cfg, model, labels, figs_dir=None):
         dataset_sizes = _discover_x_values(cache, _cache_key(model, "dataset_size"))
         batch_sizes = _discover_x_values(cache, _cache_key(model, "batch_size"))
         hidden_sizes = _discover_x_values(cache, _cache_key(model, "hidden_size"))
+        num_layers = _discover_x_values(cache, _cache_key(model, "num_hidden_layers"))
 
         tp_ds = _reconstruct_throughput(
             cache, _cache_key(model, "dataset_size"), dataset_sizes, labels) if dataset_sizes else None
@@ -602,8 +642,10 @@ def plot_overview(cache, cfg, model, labels, figs_dir=None):
             cache, _cache_key(model, "batch_size"), batch_sizes, labels) if batch_sizes else None
         tp_hs = _reconstruct_throughput(
             cache, _cache_key(model, "hidden_size"), hidden_sizes, labels) if hidden_sizes else None
+        tp_nl = _reconstruct_throughput(
+            cache, _cache_key(model, "num_hidden_layers"), num_layers, labels) if num_layers else None
 
-        fig, axes = plt.subplots(2, 2, figsize=(18, 14))
+        fig, axes = plt.subplots(3, 2, figsize=(18, 21))
 
         if dataset_sizes and tp_ds:
             _plot_throughput(axes[0, 0], dataset_sizes, tp_ds, labels,
@@ -648,6 +690,34 @@ def plot_overview(cache, cfg, model, labels, figs_dir=None):
         else:
             axes[1, 0].set_visible(False)
             axes[1, 1].set_visible(False)
+
+        if num_layers and tp_nl:
+            depth_hs = cfg.get("depth_fixed_hidden_size", 256)
+            _plot_throughput(axes[2, 0], num_layers, tp_nl, labels,
+                             f"Depth Scaling (hidden={depth_hs}, batch={fixed_bs})",
+                             "Number of Hidden Layers",
+                             cache=cache, cache_key=_cache_key(model, "num_hidden_layers"),
+                             styles=styles, linear_x=True)
+
+            nl_cache_key = _cache_key(model, "num_hidden_layers")
+            for gpu_label, cpu_label, color, legend_name in speedup_pairs[:3]:
+                sp_result = _speedup_with_ci(cache, nl_cache_key, gpu_label, cpu_label) if cache else None
+                if sp_result is not None:
+                    x_pts, sp_mean, sp_lower, sp_upper = sp_result
+                    axes[2, 1].plot(x_pts, sp_mean, color=color, linewidth=2.5, label=legend_name)
+                    axes[2, 1].fill_between(x_pts, sp_lower, sp_upper, color=color, alpha=0.15)
+
+            axes[2, 1].axhline(y=1.0, color="#e74c3c", linestyle="--", alpha=0.7, linewidth=1.5)
+            axes[2, 1].set_xlabel("Number of Hidden Layers")
+            axes[2, 1].set_ylabel("Speedup (x)")
+            axes[2, 1].set_title("GPU Speedup vs Network Depth", fontweight="bold")
+            axes[2, 1].grid(True, which="both", alpha=0.3)
+            handles, leg_labels = axes[2, 1].get_legend_handles_labels()
+            if handles:
+                axes[2, 1].legend(loc="best")
+        else:
+            axes[2, 0].set_visible(False)
+            axes[2, 1].set_visible(False)
 
         fig.suptitle("MLP Benchmark: GPU Scaling Analysis", fontsize=18, fontweight="bold", y=0.98)
 
@@ -733,6 +803,11 @@ def print_peak_summary(cache, model, labels):
         if hs:
             tp = _reconstruct_throughput(cache, _cache_key(model, "hidden_size"), hs, labels)
             experiments.append(("Hidden Size", tp))
+
+        nl = _discover_x_values(cache, _cache_key(model, "num_hidden_layers"))
+        if nl:
+            tp = _reconstruct_throughput(cache, _cache_key(model, "num_hidden_layers"), nl, labels)
+            experiments.append(("Network Depth", tp))
 
     for exp_name, tp_data in experiments:
         print(f"\n  {exp_name} experiment:")

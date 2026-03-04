@@ -48,10 +48,12 @@ pub struct Args {
     pub batch_size: usize,
     pub num_samples: usize, // 0 = use dataset default
     pub hidden_size: usize,
+    pub num_hidden_layers: usize,
     pub epochs: usize,
     pub learning_rate: f32,  // 0.0 = use binary's default
     pub optimizer: String,   // "sgd" or "adam"
     pub scheduler: String,   // "none" or "cosine"
+    pub backend: String,     // "custom" or "cudnn"
 }
 
 fn print_usage(prog: &str) {
@@ -62,10 +64,12 @@ fn print_usage(prog: &str) {
     eprintln!("  --batch-size N    Mini-batch size (default: 4096)");
     eprintln!("  --num-samples N   Number of samples for generated dataset (default: 1000)");
     eprintln!("  --hidden-size N   Hidden layer size (default: 64)");
+    eprintln!("  --num-hidden-layers N  Number of hidden layers (default: 1)");
     eprintln!("  --epochs N        Number of training epochs (default: 1000)");
     eprintln!("  --learning-rate F Learning rate (default: model-specific)");
     eprintln!("  --optimizer STR   Optimizer: sgd|adam (default: sgd)");
     eprintln!("  --scheduler STR   LR scheduler: none|cosine (default: none)");
+    eprintln!("  --backend STR     Conv backend: custom|cudnn (default: custom)");
 }
 
 pub fn parse_args() -> Args {
@@ -76,10 +80,12 @@ pub fn parse_args() -> Args {
     let mut batch_size: usize = 4096;
     let mut num_samples: usize = 0;
     let mut hidden_size: usize = 64;
+    let mut num_hidden_layers: usize = 1;
     let mut epochs: usize = 1000;
     let mut learning_rate: f32 = 0.0;
     let mut optimizer: String = "sgd".to_string();
     let mut scheduler: String = "none".to_string();
+    let mut backend: String = "custom".to_string();
 
     let mut i = 1;
     while i < argv.len() {
@@ -125,6 +131,17 @@ pub fn parse_args() -> Args {
                     std::process::exit(1);
                 });
             }
+            "--num-hidden-layers" => {
+                i += 1;
+                if i >= argv.len() {
+                    print_usage(prog);
+                    std::process::exit(1);
+                }
+                num_hidden_layers = argv[i].parse().unwrap_or_else(|_| {
+                    eprintln!("Invalid --num-hidden-layers value: {}", argv[i]);
+                    std::process::exit(1);
+                });
+            }
             "--epochs" => {
                 i += 1;
                 if i >= argv.len() {
@@ -163,6 +180,14 @@ pub fn parse_args() -> Args {
                 }
                 scheduler = argv[i].clone();
             }
+            "--backend" => {
+                i += 1;
+                if i >= argv.len() {
+                    print_usage(prog);
+                    std::process::exit(1);
+                }
+                backend = argv[i].clone();
+            }
             _ => {
                 print_usage(prog);
                 std::process::exit(1);
@@ -181,10 +206,12 @@ pub fn parse_args() -> Args {
         batch_size,
         num_samples,
         hidden_size,
+        num_hidden_layers,
         epochs,
         learning_rate,
         optimizer,
         scheduler,
+        backend,
     }
 }
 

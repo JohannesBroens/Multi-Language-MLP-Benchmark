@@ -1,8 +1,9 @@
-"""Two-phase hyperparameter tuning with successive halving.
+"""Three-phase hyperparameter tuning with successive halving.
 
-Phase 1: Throughput sweep — find optimal batch size by measuring samples/s.
+Phase 1: Batch size sweep — double from min_batch_size until OOM or VRAM limit,
+         pick largest within throughput_tolerance of peak.
 Phase 2: LR sweep with successive halving — per optimizer track (SGD, Adam).
-Phase 3: Scheduler comparison — cosine vs none for the winner.
+Phase 3: Scheduler comparison — cosine vs none for the Phase 2 winner.
 
 Selection: highest throughput within acc_tolerance of peak accuracy.
 """
@@ -10,6 +11,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 
 import yaml
 
@@ -28,7 +30,8 @@ def _get_script(model):
     return os.path.join(PROJECT_ROOT, "src/python/models/mlp/mlp_pytorch.py"), "generated"
 
 
-def _run_trial(script, dataset, bs, lr, epochs, optimizer="sgd", scheduler="none"):
+def _run_trial(script, dataset, bs, lr, epochs, optimizer="sgd", scheduler="none",
+               num_samples=0, hidden_size=0):
     """Run one PyTorch CUDA trial, return dict with accuracy/loss/throughput or None."""
     cmd = [
         PYTHON, script,
@@ -40,6 +43,10 @@ def _run_trial(script, dataset, bs, lr, epochs, optimizer="sgd", scheduler="none
         "--optimizer", optimizer,
         "--scheduler", scheduler,
     ]
+    if num_samples > 0:
+        cmd.extend(["--num-samples", str(num_samples)])
+    if hidden_size > 0:
+        cmd.extend(["--hidden-size", str(hidden_size)])
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         m_acc = PATTERN_ACC.search(result.stdout)
@@ -56,25 +63,97 @@ def _run_trial(script, dataset, bs, lr, epochs, optimizer="sgd", scheduler="none
     return None
 
 
-def throughput_sweep(script, dataset, batch_sizes, lr, sweep_epochs):
-    """Phase 1: find optimal batch size by throughput.
+def _get_gpu_memory():
+    """Query GPU memory via nvidia-smi. Returns (used_mb, total_mb) or None."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total",
+             "--format=csv,noheader,nounits", "-i", "0"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            parts = result.stdout.strip().split(",")
+            return float(parts[0].strip()), float(parts[1].strip())
+    except (subprocess.TimeoutExpired, FileNotFoundError, ValueError):
+        pass
+    return None
+
+
+class _VRAMMonitor:
+    """Poll peak VRAM usage in a background thread during a trial."""
+
+    def __init__(self, poll_interval=0.3):
+        self.poll_interval = poll_interval
+        self.peak_used = 0.0
+        self.total = 0.0
+        self._stop = threading.Event()
+        self._thread = None
+
+    def _poll(self):
+        while not self._stop.is_set():
+            mem = _get_gpu_memory()
+            if mem:
+                self.peak_used = max(self.peak_used, mem[0])
+                self.total = mem[1]
+            self._stop.wait(self.poll_interval)
+
+    def start(self):
+        self.peak_used = 0.0
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._poll, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+        return self.peak_used, self.total
+
+
+def throughput_sweep(script, dataset, min_bs, lr, sweep_epochs, vram_safety=0.90,
+                     num_samples=0, hidden_size=0):
+    """Phase 1: double batch size until OOM or VRAM safety limit.
+
+    Starts at min_bs and keeps doubling.  Stops when:
+      - The trial OOMs / crashes, or
+      - Peak VRAM usage >= vram_safety fraction of total GPU memory.
 
     Returns dict: {batch_size: throughput, ...}.
     """
-    print("\n--- Phase 1: Throughput Sweep ---")
+    print("\n--- Phase 1: Throughput Sweep (dynamic doubling) ---")
     results = {}
-    for bs in batch_sizes:
+    monitor = _VRAMMonitor()
+    bs = min_bs
+
+    while True:
+        # Ensure num_samples >= 2*bs so batching is meaningful
+        effective_ns = max(num_samples, bs * 2) if num_samples > 0 else 0
         print(f"  bs={bs} ... ", end="", flush=True)
-        trial = _run_trial(script, dataset, bs, lr, sweep_epochs)
-        if trial:
-            results[bs] = trial["throughput"]
-            print(f"{trial['throughput']:.0f} samples/s")
-        else:
-            print("FAILED")
+        monitor.start()
+        trial = _run_trial(script, dataset, bs, lr, sweep_epochs,
+                           num_samples=effective_ns, hidden_size=hidden_size)
+        peak_used, total = monitor.stop()
+
+        if not trial:
+            print("FAILED (OOM)")
+            break
+
+        vram_pct = peak_used / total if total > 0 else 0
+        results[bs] = trial["throughput"]
+        print(f"{trial['throughput']:.0f} samples/s"
+              f"  (VRAM: {peak_used:.0f}/{total:.0f} MB, {vram_pct:.0%})")
+
+        if vram_pct >= vram_safety:
+            print(f"  => VRAM {vram_pct:.0%} >= {vram_safety:.0%} safety limit, stopping")
+            break
+
+        bs *= 2
+
     return results
 
 
-def lr_halving(script, dataset, batch_size, lr_candidates, optimizer, tune_epochs):
+def lr_halving(script, dataset, batch_size, lr_candidates, optimizer, tune_epochs,
+               num_samples=0, hidden_size=0):
     """Phase 2: successive halving over LR candidates.
 
     Starts all candidates at tune_epochs/4, drops bottom half by accuracy,
@@ -93,7 +172,8 @@ def lr_halving(script, dataset, batch_size, lr_candidates, optimizer, tune_epoch
         round_results = []
         for lr in survivors:
             print(f"  lr={lr}, epochs={current_epochs} ... ", end="", flush=True)
-            trial = _run_trial(script, dataset, batch_size, lr, current_epochs, optimizer)
+            trial = _run_trial(script, dataset, batch_size, lr, current_epochs, optimizer,
+                               num_samples=num_samples, hidden_size=hidden_size)
             if trial:
                 print(f"acc={trial['accuracy']:.2f}%")
                 round_results.append({"lr": lr, "epochs_run": current_epochs, **trial})
@@ -117,7 +197,8 @@ def lr_halving(script, dataset, batch_size, lr_candidates, optimizer, tune_epoch
         already_run = any(r["lr"] == lr and r["epochs_run"] == tune_epochs for r in all_results)
         if not already_run and current_epochs != tune_epochs:
             print(f"  lr={lr}, epochs={tune_epochs} (final) ... ", end="", flush=True)
-            trial = _run_trial(script, dataset, batch_size, lr, tune_epochs, optimizer)
+            trial = _run_trial(script, dataset, batch_size, lr, tune_epochs, optimizer,
+                               num_samples=num_samples, hidden_size=hidden_size)
             if trial:
                 print(f"acc={trial['accuracy']:.2f}%")
                 all_results.append({"lr": lr, "epochs_run": tune_epochs, **trial})
@@ -147,7 +228,8 @@ def run_tuning(config, model, cache_path):
     tuning = config.get("tuning", {})
     training = config.get("training", {})
 
-    batch_sizes = tuning.get("batch_sizes", [4096])
+    min_bs = tuning.get("min_batch_size", 32)
+    vram_safety = tuning.get("vram_safety", 0.90)
     sgd_lrs = tuning.get("sgd_lr_range", [0.02])
     adam_lrs = tuning.get("adam_lr_range", [0.001])
     acc_tolerance = tuning.get("acc_tolerance", 1.0)
@@ -158,8 +240,16 @@ def run_tuning(config, model, cache_path):
 
     script, dataset = _get_script(model)
 
-    # --- Phase 1: Throughput sweep ---
-    throughputs = throughput_sweep(script, dataset, batch_sizes, default_lr, sweep_epochs)
+    # For MLP on "generated" dataset, use enough samples for batch_size to matter
+    # CNN uses MNIST (60K samples) so num_samples is not needed
+    scaling = config.get("scaling", {})
+    hidden_size = training.get("hidden_size", 128)
+    num_samples = scaling.get("fixed_num_samples", 0) if model != "cnn" else 0
+
+    # --- Phase 1: Throughput sweep (double until OOM or VRAM limit) ---
+    throughputs = throughput_sweep(script, dataset, min_bs, default_lr,
+                                  sweep_epochs, vram_safety,
+                                  num_samples=num_samples, hidden_size=hidden_size)
     if not throughputs:
         print("Phase 1 failed — no successful batch size trials.")
         return {}
@@ -169,8 +259,10 @@ def run_tuning(config, model, cache_path):
           f"peak={max(throughputs.values()):.0f})")
 
     # --- Phase 2: LR halving (two tracks) ---
-    sgd_results = lr_halving(script, dataset, best_bs, sgd_lrs, "sgd", tune_epochs)
-    adam_results = lr_halving(script, dataset, best_bs, adam_lrs, "adam", tune_epochs)
+    sgd_results = lr_halving(script, dataset, best_bs, sgd_lrs, "sgd", tune_epochs,
+                             num_samples=num_samples, hidden_size=hidden_size)
+    adam_results = lr_halving(script, dataset, best_bs, adam_lrs, "adam", tune_epochs,
+                             num_samples=num_samples, hidden_size=hidden_size)
 
     # Combine and select: highest throughput within acc_tolerance of peak
     all_candidates = []
@@ -194,18 +286,24 @@ def run_tuning(config, model, cache_path):
     for sched in ["none", "cosine"]:
         print(f"  scheduler={sched} ... ", end="", flush=True)
         trial = _run_trial(script, dataset, best_bs, selected["lr"],
-                           tune_epochs, selected["optimizer"], sched)
+                           tune_epochs, selected["optimizer"], sched,
+                           num_samples=num_samples, hidden_size=hidden_size)
         if trial:
             print(f"acc={trial['accuracy']:.2f}%  {trial['throughput']:.0f} samples/s")
             scheduler_cmp[sched] = trial
         else:
             print("FAILED")
 
+    # Pick best scheduler by accuracy (throughput impact is negligible)
+    best_sched = "none"
+    if scheduler_cmp:
+        best_sched = max(scheduler_cmp, key=lambda s: scheduler_cmp[s]["accuracy"])
+
     best_params = {
         "batch_size": best_bs,
         "learning_rate": selected["lr"],
         "optimizer": selected["optimizer"],
-        "scheduler": "none",
+        "scheduler": best_sched,
     }
 
     # --- Save results ---

@@ -424,7 +424,9 @@ static void forward_batch(const CNN *cnn, const float *inputs, int bs,
 
 void cnn_train(CNN *cnn, float *inputs, int *targets, int num_samples,
                int batch_size, int num_epochs, float learning_rate,
-               OptimizerType optimizer, SchedulerType scheduler) {
+               OptimizerType optimizer, SchedulerType scheduler,
+               int use_cudnn) {
+    (void)use_cudnn; /* CPU only — cuDNN not available */
     int input_size = IN_C * IN_H * IN_W;
 
     /* Forward conv workspace (channel-major batched buffers) */
@@ -591,16 +593,16 @@ void cnn_train(CNN *cnn, float *inputs, int *targets, int num_samples,
             step++;
 
             if (optimizer == OPT_ADAM) {
-                nn_adam_update(cnn->conv1_weights, grad_conv1_w, &adam_states[0], lr_s, beta1, beta2, eps, step);
-                nn_adam_update(cnn->conv1_biases, grad_conv1_b, &adam_states[1], lr_s, beta1, beta2, eps, step);
-                nn_adam_update(cnn->conv2_weights, grad_conv2_w, &adam_states[2], lr_s, beta1, beta2, eps, step);
-                nn_adam_update(cnn->conv2_biases, grad_conv2_b, &adam_states[3], lr_s, beta1, beta2, eps, step);
-                nn_adam_update(cnn->fc1_weights, grad_fc1_w, &adam_states[4], lr_s, beta1, beta2, eps, step);
-                nn_adam_update(cnn->fc1_biases, grad_fc1_b, &adam_states[5], lr_s, beta1, beta2, eps, step);
-                nn_adam_update(cnn->fc2_weights, grad_fc2_w, &adam_states[6], lr_s, beta1, beta2, eps, step);
-                nn_adam_update(cnn->fc2_biases, grad_fc2_b, &adam_states[7], lr_s, beta1, beta2, eps, step);
-                nn_adam_update(cnn->out_weights, grad_out_w, &adam_states[8], lr_s, beta1, beta2, eps, step);
-                nn_adam_update(cnn->out_biases, grad_out_b, &adam_states[9], lr_s, beta1, beta2, eps, step);
+                nn_adam_update(cnn->conv1_weights, grad_conv1_w, &adam_states[0], lr, beta1, beta2, eps, step);
+                nn_adam_update(cnn->conv1_biases, grad_conv1_b, &adam_states[1], lr, beta1, beta2, eps, step);
+                nn_adam_update(cnn->conv2_weights, grad_conv2_w, &adam_states[2], lr, beta1, beta2, eps, step);
+                nn_adam_update(cnn->conv2_biases, grad_conv2_b, &adam_states[3], lr, beta1, beta2, eps, step);
+                nn_adam_update(cnn->fc1_weights, grad_fc1_w, &adam_states[4], lr, beta1, beta2, eps, step);
+                nn_adam_update(cnn->fc1_biases, grad_fc1_b, &adam_states[5], lr, beta1, beta2, eps, step);
+                nn_adam_update(cnn->fc2_weights, grad_fc2_w, &adam_states[6], lr, beta1, beta2, eps, step);
+                nn_adam_update(cnn->fc2_biases, grad_fc2_b, &adam_states[7], lr, beta1, beta2, eps, step);
+                nn_adam_update(cnn->out_weights, grad_out_w, &adam_states[8], lr, beta1, beta2, eps, step);
+                nn_adam_update(cnn->out_biases, grad_out_b, &adam_states[9], lr, beta1, beta2, eps, step);
             } else {
                 nn_sgd_update(cnn->out_weights, grad_out_w, lr_s, FC2_OUT * NUM_CLASSES);
                 nn_sgd_update(cnn->out_biases, grad_out_b, lr_s, NUM_CLASSES);
@@ -646,7 +648,8 @@ void cnn_train(CNN *cnn, float *inputs, int *targets, int num_samples,
 /* ------------------------------------------------------------------ */
 
 void cnn_evaluate(CNN *cnn, float *inputs, int *targets, int num_samples,
-                  float *loss, float *accuracy) {
+                  float *loss, float *accuracy, int use_cudnn) {
+    (void)use_cudnn; /* CPU only — cuDNN not available */
     int eval_bs = 256;
 
     float *col1_b  = (float *)malloc((size_t)C1_COL_ROWS * eval_bs * C1_COL_COLS * sizeof(float));

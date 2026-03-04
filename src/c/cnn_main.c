@@ -14,6 +14,7 @@ static void print_usage(const char *prog) {
     printf("  --learning-rate F Learning rate (default: 0.32)\n");
     printf("  --optimizer S     Optimizer: sgd, adam (default: sgd)\n");
     printf("  --scheduler S     LR scheduler: none, cosine (default: none)\n");
+    printf("  --backend S       Conv backend: custom, cudnn (default: custom)\n");
 }
 
 /* Fisher-Yates shuffle: randomly permute samples in-place. */
@@ -45,6 +46,7 @@ int main(int argc, char *argv[]) {
     float learning_rate = 0.32f;
     OptimizerType optimizer = OPT_SGD;
     SchedulerType scheduler = SCHED_NONE;
+    int use_cudnn = 0;
 
     for (int i = 1; i < argc; i++) {
         if ((strcmp(argv[i], "--dataset") == 0 || strcmp(argv[i], "-d") == 0) && i + 1 < argc) {
@@ -60,6 +62,9 @@ int main(int argc, char *argv[]) {
             i++;
         } else if (strcmp(argv[i], "--scheduler") == 0 && i + 1 < argc) {
             if (strcmp(argv[i+1], "cosine") == 0) scheduler = SCHED_COSINE;
+            i++;
+        } else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
+            if (strcmp(argv[i+1], "cudnn") == 0) use_cudnn = 1;
             i++;
         } else {
             print_usage(argv[0]);
@@ -114,12 +119,12 @@ int main(int argc, char *argv[]) {
            num_epochs, batch_size, learning_rate);
 
     double t_start = get_time_sec();
-    cnn_train(&cnn, train_inputs, train_labels, train_size, batch_size, num_epochs, learning_rate, optimizer, scheduler);
+    cnn_train(&cnn, train_inputs, train_labels, train_size, batch_size, num_epochs, learning_rate, optimizer, scheduler, use_cudnn);
     double t_train = get_time_sec() - t_start;
 
     float loss, accuracy;
     double t_eval_start = get_time_sec();
-    cnn_evaluate(&cnn, test_inputs, test_labels, test_size, &loss, &accuracy);
+    cnn_evaluate(&cnn, test_inputs, test_labels, test_size, &loss, &accuracy, use_cudnn);
     double t_eval = get_time_sec() - t_eval_start;
 
     /* Standardized output format -- parsed by benchmark.py */

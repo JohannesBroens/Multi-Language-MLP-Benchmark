@@ -169,32 +169,42 @@ __global__ void init_weights_kernel(float *weights, int size, float scale, unsig
 /*  Init / Free                                                       */
 /* ------------------------------------------------------------------ */
 
-void mlp_initialize(MLP *mlp, int input_size, int hidden_size, int output_size) {
+void mlp_initialize(MLP *mlp, int input_size, int hidden_size, int output_size,
+                    int num_hidden_layers) {
     mlp->input_size = input_size;
     mlp->hidden_size = hidden_size;
     mlp->output_size = output_size;
+    mlp->num_layers = num_hidden_layers + 1;
 
-    /* Unified memory for weights — accessible from host and device */
-    CUDA_CHECK(cudaMallocManaged(&mlp->input_weights,  input_size  * hidden_size * sizeof(float)));
-    CUDA_CHECK(cudaMallocManaged(&mlp->output_weights, hidden_size * output_size * sizeof(float)));
-    CUDA_CHECK(cudaMallocManaged(&mlp->hidden_biases,  hidden_size * sizeof(float)));
-    CUDA_CHECK(cudaMallocManaged(&mlp->output_biases,  output_size * sizeof(float)));
+    int nl = mlp->num_layers;
 
-    cudaMemset(mlp->hidden_biases, 0, hidden_size * sizeof(float));
-    cudaMemset(mlp->output_biases, 0, output_size * sizeof(float));
+    /* Build layer_sizes on host */
+    mlp->layer_sizes = (int *)malloc((nl + 1) * sizeof(int));
+    mlp->layer_sizes[0] = input_size;
+    for (int i = 1; i <= num_hidden_layers; ++i)
+        mlp->layer_sizes[i] = hidden_size;
+    mlp->layer_sizes[nl] = output_size;
+
+    /* Allocate weight and bias pointer arrays */
+    mlp->weights = (float **)malloc(nl * sizeof(float *));
+    mlp->biases  = (float **)malloc(nl * sizeof(float *));
 
     int threads = 256;
     unsigned long seed = (unsigned long)time(NULL);
 
-    float scale_ih = sqrtf(2.0f / (float)input_size);
-    int blocks_ih = (input_size * hidden_size + threads - 1) / threads;
-    init_weights_kernel<<<blocks_ih, threads>>>(mlp->input_weights,
-                                                 input_size * hidden_size, scale_ih, seed);
+    for (int i = 0; i < nl; ++i) {
+        int fan_in  = mlp->layer_sizes[i];
+        int fan_out = mlp->layer_sizes[i + 1];
 
-    float scale_ho = sqrtf(2.0f / (float)hidden_size);
-    int blocks_ho = (hidden_size * output_size + threads - 1) / threads;
-    init_weights_kernel<<<blocks_ho, threads>>>(mlp->output_weights,
-                                                 hidden_size * output_size, scale_ho, seed + 1);
+        CUDA_CHECK(cudaMallocManaged(&mlp->weights[i], fan_in * fan_out * sizeof(float)));
+        CUDA_CHECK(cudaMallocManaged(&mlp->biases[i],  fan_out * sizeof(float)));
+        cudaMemset(mlp->biases[i], 0, fan_out * sizeof(float));
+
+        float scale = sqrtf(2.0f / (float)fan_in);
+        int blocks = (fan_in * fan_out + threads - 1) / threads;
+        init_weights_kernel<<<blocks, threads>>>(mlp->weights[i],
+                                                  fan_in * fan_out, scale, seed + i);
+    }
 
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -204,10 +214,13 @@ void mlp_initialize(MLP *mlp, int input_size, int hidden_size, int output_size) 
 }
 
 void mlp_free(MLP *mlp) {
-    cudaFree(mlp->input_weights);
-    cudaFree(mlp->output_weights);
-    cudaFree(mlp->hidden_biases);
-    cudaFree(mlp->output_biases);
+    for (int i = 0; i < mlp->num_layers; ++i) {
+        cudaFree(mlp->weights[i]);
+        cudaFree(mlp->biases[i]);
+    }
+    free(mlp->weights);
+    free(mlp->biases);
+    free(mlp->layer_sizes);
 
     if (cublas_handle) {
         cublasDestroy(cublas_handle);
@@ -222,9 +235,11 @@ void mlp_free(MLP *mlp) {
 void mlp_train(MLP *mlp, float *inputs, int *targets, int num_samples,
                int batch_size, int num_epochs, float learning_rate,
                OptimizerType optimizer, SchedulerType scheduler) {
-    int in  = mlp->input_size;
+    int nl = mlp->num_layers;
+    int num_hidden = nl - 1;
     int hid = mlp->hidden_size;
     int out = mlp->output_size;
+    int in  = mlp->input_size;
 
     /* Copy training data to device */
     float *d_inputs;
@@ -234,31 +249,49 @@ void mlp_train(MLP *mlp, float *inputs, int *targets, int num_samples,
     CUDA_CHECK(cudaMemcpy(d_inputs,  inputs,  (size_t)num_samples * in * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_targets, targets, (size_t)num_samples * sizeof(int),        cudaMemcpyHostToDevice));
 
-    /* Workspace buffers on device */
-    float *d_hidden, *d_output, *d_d_output, *d_d_hidden;
-    float *d_grad_W1, *d_grad_W2, *d_grad_b1, *d_grad_b2;
-    float *d_losses, *d_loss_sum;
+    /* Hidden activation buffers (needed for backward) */
+    float **d_acts = (float **)malloc(num_hidden * sizeof(float *));
+    for (int i = 0; i < num_hidden; ++i)
+        CUDA_CHECK(cudaMalloc(&d_acts[i], (size_t)batch_size * hid * sizeof(float)));
 
-    CUDA_CHECK(cudaMalloc(&d_hidden,    (size_t)batch_size * hid * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_output,    (size_t)batch_size * out * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_d_output,  (size_t)batch_size * out * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_d_hidden,  (size_t)batch_size * hid * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_grad_W1,   (size_t)in  * hid * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_grad_W2,   (size_t)hid * out * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_grad_b1,   (size_t)hid * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_grad_b2,   (size_t)out * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_losses,    (size_t)batch_size * sizeof(float)));
+    /* Output + gradient buffers */
+    float *d_output, *d_d_output;
+    CUDA_CHECK(cudaMalloc(&d_output,   (size_t)batch_size * out * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_d_output, (size_t)batch_size * out * sizeof(float)));
+
+    /* Gradient propagation buffers (ping-pong) */
+    int max_dim = hid > out ? hid : out;
+    float *d_grad_cur, *d_grad_prev;
+    CUDA_CHECK(cudaMalloc(&d_grad_cur,  (size_t)batch_size * max_dim * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_grad_prev, (size_t)batch_size * max_dim * sizeof(float)));
+
+    /* Per-layer weight/bias gradient buffers */
+    float **d_grad_W = (float **)malloc(nl * sizeof(float *));
+    float **d_grad_b = (float **)malloc(nl * sizeof(float *));
+    for (int i = 0; i < nl; ++i) {
+        int fan_in  = mlp->layer_sizes[i];
+        int fan_out = mlp->layer_sizes[i + 1];
+        CUDA_CHECK(cudaMalloc(&d_grad_W[i], (size_t)fan_in * fan_out * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_grad_b[i], (size_t)fan_out * sizeof(float)));
+    }
+
+    float *d_losses, *d_loss_sum;
+    CUDA_CHECK(cudaMalloc(&d_losses, (size_t)batch_size * sizeof(float)));
     CUDA_CHECK(cudaMallocManaged(&d_loss_sum, sizeof(float)));
 
     /* Adam optimizer state */
-    AdamState adam_W1 = {0}, adam_W2 = {0}, adam_b1 = {0}, adam_b2 = {0};
+    AdamState *adam_W = NULL, *adam_b = NULL;
     int step = 0;
     float beta1 = 0.9f, beta2 = 0.999f, eps = 1e-8f;
     if (optimizer == OPT_ADAM) {
-        nn_adam_state_init(&adam_W1, in * hid);
-        nn_adam_state_init(&adam_W2, hid * out);
-        nn_adam_state_init(&adam_b1, hid);
-        nn_adam_state_init(&adam_b2, out);
+        adam_W = (AdamState *)calloc(nl, sizeof(AdamState));
+        adam_b = (AdamState *)calloc(nl, sizeof(AdamState));
+        for (int i = 0; i < nl; ++i) {
+            int fan_in  = mlp->layer_sizes[i];
+            int fan_out = mlp->layer_sizes[i + 1];
+            nn_adam_state_init(&adam_W[i], fan_in * fan_out);
+            nn_adam_state_init(&adam_b[i], fan_out);
+        }
     }
 
     int threads = 256;
@@ -280,68 +313,78 @@ void mlp_train(MLP *mlp, float *inputs, int *targets, int num_samples,
             float *X = d_inputs  + start * in;
             int   *Y = d_targets + start;
 
-            /* ---- Forward: hidden = ReLU(X @ W1 + b1) ---- */
-            sgemm_nn(bs, hid, in, X, mlp->input_weights, d_hidden);
-            int n_hid = bs * hid;
-            bias_relu_kernel<<<(n_hid + threads - 1) / threads, threads>>>(
-                d_hidden, mlp->hidden_biases, n_hid, hid);
+            /* ---- Forward ---- */
+            for (int i = 0; i < nl; ++i) {
+                int in_dim  = mlp->layer_sizes[i];
+                int out_dim = mlp->layer_sizes[i + 1];
+                const float *input_act = (i == 0) ? X : d_acts[i - 1];
+                float *out_act = (i < num_hidden) ? d_acts[i] : d_output;
 
-            /* ---- Forward: output = softmax(hidden @ W2 + b2) ---- */
-            sgemm_nn(bs, out, hid, d_hidden, mlp->output_weights, d_output);
-            bias_softmax_kernel<<<(bs + threads - 1) / threads, threads>>>(
-                d_output, mlp->output_biases, bs, out);
+                sgemm_nn(bs, out_dim, in_dim, input_act, mlp->weights[i], out_act);
+
+                if (i < num_hidden) {
+                    int n_elem = bs * out_dim;
+                    bias_relu_kernel<<<(n_elem + threads - 1) / threads, threads>>>(
+                        out_act, mlp->biases[i], n_elem, out_dim);
+                } else {
+                    bias_softmax_kernel<<<(bs + threads - 1) / threads, threads>>>(
+                        out_act, mlp->biases[i], bs, out_dim);
+                }
+            }
 
             /* ---- Loss + d_output gradient ---- */
             ce_grad_kernel<<<(bs + threads - 1) / threads, threads>>>(
                 d_output, Y, d_d_output, d_losses, bs, out);
 
-            /* Accumulate batch loss */
             reduce_sum_kernel<<<(bs + threads - 1) / threads, threads, threads * sizeof(float)>>>(
                 d_losses, d_loss_sum, bs);
 
-            /* ---- Backward: GEMM for gradients ---- */
+            /* ---- Backward ---- */
+            float *dcur = d_d_output;
 
-            /* grad_W2 = hidden^T @ d_output */
-            sgemm_tn(hid, out, bs, d_hidden, d_d_output, d_grad_W2);
+            for (int layer = nl - 1; layer >= 0; --layer) {
+                int fan_in  = mlp->layer_sizes[layer];
+                int fan_out = mlp->layer_sizes[layer + 1];
+                const float *input_act = (layer == 0) ? X : d_acts[layer - 1];
 
-            /* grad_b2 = colsum(d_output) */
-            col_sum_kernel<<<(out + threads - 1) / threads, threads>>>(
-                d_d_output, d_grad_b2, bs, out);
+                /* grad_W[layer] = input_act^T @ dcur */
+                sgemm_tn(fan_in, fan_out, bs, input_act, dcur, d_grad_W[layer]);
 
-            /* d_hidden = d_output @ W2^T */
-            sgemm_nt(bs, hid, out, d_d_output, mlp->output_weights, d_d_hidden);
+                /* grad_b[layer] = colsum(dcur) */
+                col_sum_kernel<<<(fan_out + threads - 1) / threads, threads>>>(
+                    dcur, d_grad_b[layer], bs, fan_out);
 
-            /* Apply ReLU mask */
-            relu_mask_kernel<<<(n_hid + threads - 1) / threads, threads>>>(
-                d_d_hidden, d_hidden, n_hid);
+                /* Propagate gradient to previous layer */
+                if (layer > 0) {
+                    float *dnext = (dcur == d_d_output) ? d_grad_cur :
+                                   (dcur == d_grad_cur) ? d_grad_prev : d_grad_cur;
+                    sgemm_nt(bs, fan_in, fan_out, dcur, mlp->weights[layer], dnext);
 
-            /* grad_W1 = X^T @ d_hidden */
-            sgemm_tn(in, hid, bs, X, d_d_hidden, d_grad_W1);
-
-            /* grad_b1 = colsum(d_hidden) */
-            col_sum_kernel<<<(hid + threads - 1) / threads, threads>>>(
-                d_d_hidden, d_grad_b1, bs, hid);
+                    int n_elem = bs * fan_in;
+                    relu_mask_kernel<<<(n_elem + threads - 1) / threads, threads>>>(
+                        dnext, d_acts[layer - 1], n_elem);
+                    dcur = dnext;
+                }
+            }
 
             /* ---- Parameter update ---- */
             float lr_s = lr / (float)bs;
             step++;
 
-            if (optimizer == OPT_ADAM) {
-                nn_adam_update(mlp->input_weights, d_grad_W1, &adam_W1, lr_s, beta1, beta2, eps, step);
-                nn_adam_update(mlp->output_weights, d_grad_W2, &adam_W2, lr_s, beta1, beta2, eps, step);
-                nn_adam_update(mlp->hidden_biases, d_grad_b1, &adam_b1, lr_s, beta1, beta2, eps, step);
-                nn_adam_update(mlp->output_biases, d_grad_b2, &adam_b2, lr_s, beta1, beta2, eps, step);
-            } else {
-                int n_iw = in * hid;
-                int n_ow = hid * out;
-                sgd_kernel<<<(n_iw + threads - 1) / threads, threads>>>(
-                    mlp->input_weights, d_grad_W1, lr_s, n_iw);
-                sgd_kernel<<<(n_ow + threads - 1) / threads, threads>>>(
-                    mlp->output_weights, d_grad_W2, lr_s, n_ow);
-                sgd_kernel<<<(hid + threads - 1) / threads, threads>>>(
-                    mlp->hidden_biases, d_grad_b1, lr_s, hid);
-                sgd_kernel<<<(out + threads - 1) / threads, threads>>>(
-                    mlp->output_biases, d_grad_b2, lr_s, out);
+            for (int i = 0; i < nl; ++i) {
+                int fan_in  = mlp->layer_sizes[i];
+                int fan_out = mlp->layer_sizes[i + 1];
+                int n_w = fan_in * fan_out;
+
+                if (optimizer == OPT_ADAM) {
+                    nn_adam_update(mlp->weights[i], d_grad_W[i], &adam_W[i], lr, beta1, beta2, eps, step);
+                    nn_adam_update(mlp->biases[i], d_grad_b[i], &adam_b[i], lr, beta1, beta2, eps, step);
+                } else {
+                    sgd_kernel<<<(n_w + threads - 1) / threads, threads>>>(
+                        mlp->weights[i], d_grad_W[i], lr_s, n_w);
+                    sgd_kernel<<<(fan_out + threads - 1) / threads, threads>>>(
+                        mlp->biases[i], d_grad_b[i], lr_s, fan_out);
+                }
             }
         }
 
@@ -354,17 +397,25 @@ void mlp_train(MLP *mlp, float *inputs, int *targets, int num_samples,
     CUDA_CHECK(cudaDeviceSynchronize());
 
     if (optimizer == OPT_ADAM) {
-        nn_adam_state_free(&adam_W1);
-        nn_adam_state_free(&adam_W2);
-        nn_adam_state_free(&adam_b1);
-        nn_adam_state_free(&adam_b2);
+        for (int i = 0; i < nl; ++i) {
+            nn_adam_state_free(&adam_W[i]);
+            nn_adam_state_free(&adam_b[i]);
+        }
+        free(adam_W);
+        free(adam_b);
     }
 
     cudaFree(d_inputs);   cudaFree(d_targets);
-    cudaFree(d_hidden);   cudaFree(d_output);
-    cudaFree(d_d_output); cudaFree(d_d_hidden);
-    cudaFree(d_grad_W1);  cudaFree(d_grad_W2);
-    cudaFree(d_grad_b1);  cudaFree(d_grad_b2);
+    for (int i = 0; i < num_hidden; ++i)
+        cudaFree(d_acts[i]);
+    free(d_acts);
+    cudaFree(d_output);   cudaFree(d_d_output);
+    cudaFree(d_grad_cur); cudaFree(d_grad_prev);
+    for (int i = 0; i < nl; ++i) {
+        cudaFree(d_grad_W[i]);
+        cudaFree(d_grad_b[i]);
+    }
+    free(d_grad_W);       free(d_grad_b);
     cudaFree(d_losses);   cudaFree(d_loss_sum);
 }
 
@@ -394,6 +445,8 @@ __global__ void eval_metrics_kernel(const float *output, const int *targets,
 
 void mlp_evaluate(MLP *mlp, float *inputs, int *targets, int num_samples,
                   float *loss, float *accuracy) {
+    int nl = mlp->num_layers;
+    int num_hidden = nl - 1;
     int in  = mlp->input_size;
     int hid = mlp->hidden_size;
     int out = mlp->output_size;
@@ -405,11 +458,50 @@ void mlp_evaluate(MLP *mlp, float *inputs, int *targets, int num_samples,
     CUDA_CHECK(cudaMemcpy(d_inputs,  inputs,  (size_t)num_samples * in * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_targets, targets, (size_t)num_samples * sizeof(int),        cudaMemcpyHostToDevice));
 
-    float *d_hidden, *d_output, *d_losses;
-    float *d_loss_sum;
-    int   *d_correct;
-    CUDA_CHECK(cudaMalloc(&d_hidden, (size_t)num_samples * hid * sizeof(float)));
+    /* Use ping-pong buffers for hidden activations (no backward needed) */
+    float *d_buf0 = NULL, *d_buf1 = NULL;
+    if (num_hidden > 0) {
+        CUDA_CHECK(cudaMalloc(&d_buf0, (size_t)num_samples * hid * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_buf1, (size_t)num_samples * hid * sizeof(float)));
+    }
+
+    float *d_output;
     CUDA_CHECK(cudaMalloc(&d_output, (size_t)num_samples * out * sizeof(float)));
+
+    int threads = 256;
+
+    /* Forward through all layers */
+    for (int i = 0; i < nl; ++i) {
+        int in_dim  = mlp->layer_sizes[i];
+        int out_dim = mlp->layer_sizes[i + 1];
+
+        const float *input_act;
+        if (i == 0)
+            input_act = d_inputs;
+        else
+            input_act = ((i - 1) % 2 == 0) ? d_buf0 : d_buf1;
+
+        float *out_act;
+        if (i < num_hidden)
+            out_act = (i % 2 == 0) ? d_buf0 : d_buf1;
+        else
+            out_act = d_output;
+
+        sgemm_nn(num_samples, out_dim, in_dim, input_act, mlp->weights[i], out_act);
+
+        if (i < num_hidden) {
+            int n_elem = num_samples * out_dim;
+            bias_relu_kernel<<<(n_elem + threads - 1) / threads, threads>>>(
+                out_act, mlp->biases[i], n_elem, out_dim);
+        } else {
+            bias_softmax_kernel<<<(num_samples + threads - 1) / threads, threads>>>(
+                out_act, mlp->biases[i], num_samples, out_dim);
+        }
+    }
+
+    /* Metrics */
+    float *d_losses, *d_loss_sum;
+    int   *d_correct;
     CUDA_CHECK(cudaMalloc(&d_losses, (size_t)num_samples * sizeof(float)));
     CUDA_CHECK(cudaMallocManaged(&d_loss_sum, sizeof(float)));
     CUDA_CHECK(cudaMallocManaged(&d_correct,  sizeof(int)));
@@ -417,20 +509,6 @@ void mlp_evaluate(MLP *mlp, float *inputs, int *targets, int num_samples,
     *d_loss_sum = 0.0f;
     *d_correct  = 0;
 
-    int threads = 256;
-
-    /* Forward: hidden = ReLU(X @ W1 + b1) */
-    sgemm_nn(num_samples, hid, in, d_inputs, mlp->input_weights, d_hidden);
-    int n_hid = num_samples * hid;
-    bias_relu_kernel<<<(n_hid + threads - 1) / threads, threads>>>(
-        d_hidden, mlp->hidden_biases, n_hid, hid);
-
-    /* Forward: output = softmax(hidden @ W2 + b2) */
-    sgemm_nn(num_samples, out, hid, d_hidden, mlp->output_weights, d_output);
-    bias_softmax_kernel<<<(num_samples + threads - 1) / threads, threads>>>(
-        d_output, mlp->output_biases, num_samples, out);
-
-    /* Metrics */
     eval_metrics_kernel<<<(num_samples + threads - 1) / threads, threads>>>(
         d_output, d_targets, d_losses, d_correct, num_samples, out);
 
@@ -444,7 +522,9 @@ void mlp_evaluate(MLP *mlp, float *inputs, int *targets, int num_samples,
     *accuracy = (float)(*d_correct) / num_samples * 100.0f;
 
     cudaFree(d_inputs);   cudaFree(d_targets);
-    cudaFree(d_hidden);   cudaFree(d_output);
+    if (d_buf0) cudaFree(d_buf0);
+    if (d_buf1) cudaFree(d_buf1);
+    cudaFree(d_output);
     cudaFree(d_losses);   cudaFree(d_loss_sum);
     cudaFree(d_correct);
 }
